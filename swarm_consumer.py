@@ -231,12 +231,9 @@ async def run_consumer():
                         f"({pnl:+6.2f}%) | Cash: ${agent.cash:>10,.2f} | Positions: [{holdings_summary}]"
                     )
 
-                # Darwinian Selection & Mutation
+                # Darwinian Selection & Mutation (Passes prices, risk_engine, and db for automated liquidation)
                 if tick_counter % EPOCH_TICK_THRESHOLD == 0:
-                    await swarm_mgr.run_culling_cycle()
-                    # Register new evolved agent accounts in PostgreSQL
-                    for agent in swarm_mgr.population:
-                        db.register_agent(agent.agent_id)
+                    await swarm_mgr.run_culling_cycle(prices=prices, risk_engine=risk_engine, db=db)
 
 if __name__ == "__main__":
     asyncio.run(run_consumer())
