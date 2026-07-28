@@ -4,12 +4,29 @@ import pandas as pd
 import yfinance as yf
 from typing import Dict, List, Tuple
 
-# Import your existing Risk Parity engine components
+# Import existing Risk Parity engine components
 from engine import RiskParityOptimizer
 
+# Matched 100 Liquid US Mega/Large-Cap Stocks
 UNIVERSE = [
-    "NVDA", "AMD", "AAPL", "MSFT", "TSLA", "META", "GOOGL", "AMZN",
-    "JPM", "V", "PG", "JNJ", "XOM", "COST", "KO", "WMT", "SPY"
+    # Tech & Semiconductors (30)
+    "NVDA", "AMD", "AAPL", "MSFT", "TSLA", "META", "GOOGL", "AMZN", "NFLX", "INTC",
+    "CRM", "ORCL", "ADBE", "AVGO", "TXN", "QCOM", "CSCO", "ACN", "IBM", "AMAT",
+    "MU", "LRCX", "NOW", "PANW", "SNPS", "CDNS", "KLAC", "MCHP", "ADI", "ROP",
+    # Financials & Payments (15)
+    "JPM", "V", "MA", "BAC", "WFC", "C", "GS", "MS", "AXP", "PYPL",
+    "BLK", "SCHW", "CB", "MMC", "PGR",
+    # Healthcare & Pharma (15)
+    "UNH", "JNJ", "PFE", "ABBV", "MRK", "TMO", "ABT", "AMGN", "LLY", "DHR",
+    "BMY", "GILD", "CVS", "CI", "ISRG",
+    # Consumer & Retail (15)
+    "PG", "HD", "DIS", "COST", "PEP", "KO", "WMT", "NKE", "MCD", "SBUX",
+    "LOW", "TJX", "TGT", "EL", "BKNG",
+    # Industrials & Aerospace (10)
+    "HON", "UNP", "GE", "CAT", "BA", "DE", "LMT", "RTX", "ADP", "MMM",
+    # Energy, Utilities, Real Estate & Telecom (15)
+    "XOM", "CVX", "COP", "SLB", "EOG", "NEE", "DUK", "SO", "T", "VZ",
+    "TMUS", "PLD", "AMT", "SPGI", "MDLZ", "SPY"
 ]
 
 class EventDrivenBacktester:
@@ -18,11 +35,12 @@ class EventDrivenBacktester:
         self.start_date = start_date
         self.end_date = end_date
         self.slippage = slippage
-        self.optimizer = RiskParityOptimizer(max_position_cap=0.15)
+        # Position cap set to 5% per stock given 100-stock diversification
+        self.optimizer = RiskParityOptimizer(max_position_cap=0.05)
         self.data: Dict[str, pd.DataFrame] = {}
 
     def fetch_historical_data(self):
-        print(f"📥 Downloading historical price data ({self.start_date} to {self.end_date})...")
+        print(f"📥 Downloading historical price data for {len(UNIVERSE)} assets ({self.start_date} to {self.end_date})...")
         raw_data = yf.download(UNIVERSE, start=self.start_date, end=self.end_date, interval="1d", progress=False)
         
         # Safely unpack MultiIndex columns per ticker
@@ -77,7 +95,7 @@ class EventDrivenBacktester:
         entry_prices: Dict[str, float] = {tk: 0.0 for tk in tradeable_universe}
         equity_curve: List[float] = []
 
-        print("🚀 Executing Point-in-Time Backtest Simulation...")
+        print(f"🚀 Executing Point-in-Time Backtest Simulation across {len(tradeable_universe)} stocks...")
 
         for t_idx, current_time in enumerate(timestamps):
             # 1. Update Portfolio Valuations
@@ -92,7 +110,7 @@ class EventDrivenBacktester:
             current_equity = cash + total_stock_value
             equity_curve.append(current_equity)
 
-            # 2. Hard Risk Overlays (Stop-Loss -2.5% | Take-Profit +5.0%)
+            # 2. Hard Risk Overlays (ATR Trailing Stop / Risk Management)
             for tk, shares in list(holdings.items()):
                 if shares > 0 and tk in current_prices and entry_prices[tk] > 0:
                     price = current_prices[tk]
@@ -141,7 +159,7 @@ class EventDrivenBacktester:
                     elif diff_dollars > 0:
                         buys.append((tk, diff_dollars, price))
 
-                # Step 4a: Execute Sells First
+                # Step 4a: Execute Sells First (Liquidate cash)
                 for tk, diff_dollars, price in sells:
                     sell_shares = diff_dollars / price
                     actual_sell_shares = min(holdings[tk], sell_shares)
@@ -172,6 +190,7 @@ class EventDrivenBacktester:
         max_drawdown = ((eq_series.cummax() - eq_series) / eq_series.cummax()).max()
 
         print("\n================ 📊 BACKTEST PERFORMANCE SUMMARY ================")
+        print(f"Universe Size:           {len(tradeable_universe)} Assets")
         print(f"Initial Capital:         ${self.initial_capital:,.2f}")
         print(f"Final Equity:            ${eq_series.iloc[-1]:,.2f}")
         print(f"Total Cumulative Return: {total_return * 100:+.2f}%")
