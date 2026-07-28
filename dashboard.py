@@ -1,4 +1,5 @@
 import os
+import time
 import pandas as pd
 import sqlalchemy
 import plotly.express as px
@@ -369,12 +370,13 @@ if st.sidebar.button("🔄 Manual Refresh", use_container_width=True):
 st.sidebar.markdown("<hr class='app-divider' style='margin:20px 0;'>", unsafe_allow_html=True)
 st.sidebar.markdown(f"<h3 style='color:{ACCENT} !important; font-size:1rem;'>🛡️ Active Guardrails</h3>", unsafe_allow_html=True)
 
+# Updated Max Position Cap display to 5.0% to match 100-stock universe configuration
 st.sidebar.markdown(f"""
 <div class="guardrail-card">
     <div class="guardrail-item"><span>Hard Stop-Loss</span> <span class="guardrail-value">-2.5%</span></div>
     <div class="guardrail-item"><span>Hard Take-Profit</span> <span class="guardrail-value">+5.0%</span></div>
     <div class="guardrail-item"><span>Slippage Friction</span> <span class="guardrail-value">ADV Impact</span></div>
-    <div class="guardrail-item"><span>Max Single Pos Cap</span> <span class="guardrail-value">15.0%</span></div>
+    <div class="guardrail-item"><span>Max Single Pos Cap</span> <span class="guardrail-value">5.0%</span></div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -617,3 +619,8 @@ if not df_trades.empty:
     )
 else:
     st.info("No trade logs recorded in `TimescaleDB` yet.")
+
+# --- 5-SECOND AUTO-REFRESH EXECUTION LOOP ---
+if auto_refresh:
+    time.sleep(5)
+    st.rerun()
