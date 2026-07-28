@@ -13,10 +13,11 @@ UNIVERSE = [
 ]
 
 class EventDrivenBacktester:
-    def __init__(self, initial_capital: float = 100000.0, start_date: str = "2024-01-01", end_date: str = "2026-01-01"):
+    def __init__(self, initial_capital: float = 100000.0, start_date: str = "2024-01-01", end_date: str = "2026-01-01", slippage: float = 0.0002):
         self.initial_capital = initial_capital
         self.start_date = start_date
         self.end_date = end_date
+        self.slippage = slippage
         self.optimizer = RiskParityOptimizer(max_position_cap=0.15)
         self.data: Dict[str, pd.DataFrame] = {}
 
@@ -24,21 +25,24 @@ class EventDrivenBacktester:
         print(f"📥 Downloading historical price data ({self.start_date} to {self.end_date})...")
         raw_data = yf.download(UNIVERSE, start=self.start_date, end=self.end_date, interval="1d", progress=False)
         
-        # Unpack MultiIndex columns into per-ticker DataFrames
+        # Safely unpack MultiIndex columns per ticker
         for tk in UNIVERSE:
-            df = pd.DataFrame({
-                'open': raw_data['Open'][tk],
-                'high': raw_data['High'][tk],
-                'low': raw_data['Low'][tk],
-                'close': raw_data['Close'][tk],
-                'volume': raw_data['Volume'][tk]
-            }).dropna()
-            self.data[tk] = df
+            try:
+                df = pd.DataFrame({
+                    'open': raw_data['Open'][tk],
+                    'high': raw_data['High'][tk],
+                    'low': raw_data['Low'][tk],
+                    'close': raw_data['Close'][tk],
+                    'volume': raw_data['Volume'][tk]
+                }).dropna()
+                self.data[tk] = df
+            except KeyError:
+                print(f"⚠️ Warning: Could not download data for {tk}")
         print("✅ Market data download complete.")
 
-    def calculate_technical_state(self, tk_data: pd.DataFrame, idx: int) -> dict:
-        """Point-in-Time Technical Analysis using strictly slice [:idx+1]."""
-        sub_df = tk_data.iloc[:idx+1]
+    def calculate_technical_state(self, tk_data: pd.DataFrame, current_time: pd.Timestamp) -> dict:
+        """Point-in-Time Technical Analysis using strictly label-based slicing [:current_time]."""
+        sub_df = tk_data.loc[:current_time]
         if len(sub_df) < 26:
             return {}
 
@@ -65,18 +69,17 @@ class EventDrivenBacktester:
 
     def run(self):
         self.fetch_historical_data()
+        tradeable_universe = [tk for tk in UNIVERSE if tk in self.data and tk != "SPY"]
         timestamps = self.data["SPY"].index[30:]  # Skip warm-up period
         
         cash = self.initial_capital
-        holdings: Dict[str, float] = {tk: 0.0 for tk in UNIVERSE if tk != "SPY"}
-        entry_prices: Dict[str, float] = {tk: 0.0 for tk in UNIVERSE if tk != "SPY"}
+        holdings: Dict[str, float] = {tk: 0.0 for tk in tradeable_universe}
+        entry_prices: Dict[str, float] = {tk: 0.0 for tk in tradeable_universe}
         equity_curve: List[float] = []
 
         print("🚀 Executing Point-in-Time Backtest Simulation...")
 
         for t_idx, current_time in enumerate(timestamps):
-            idx = self.data["SPY"].index.get_loc(current_time)
-            
             # 1. Update Portfolio Valuations
             current_prices = {}
             for tk in holdings:
@@ -91,13 +94,13 @@ class EventDrivenBacktester:
 
             # 2. Hard Risk Overlays (Stop-Loss -2.5% | Take-Profit +5.0%)
             for tk, shares in list(holdings.items()):
-                if shares > 0 and tk in current_prices:
+                if shares > 0 and tk in current_prices and entry_prices[tk] > 0:
                     price = current_prices[tk]
                     pnl_pct = (price - entry_prices[tk]) / entry_prices[tk]
                     
                     if pnl_pct <= -0.025 or pnl_pct >= 0.05:
-                        # Liquidate position
-                        cash += shares * price * (1 - 0.0002)  # Apply 0.02% slippage friction
+                        # Liquidate position with slippage friction
+                        cash += shares * price * (1 - self.slippage)
                         holdings[tk] = 0.0
                         entry_prices[tk] = 0.0
 
@@ -108,10 +111,9 @@ class EventDrivenBacktester:
 
                 for tk in holdings:
                     if current_time in self.data[tk].index:
-                        metrics = self.calculate_technical_state(self.data[tk], idx)
+                        metrics = self.calculate_technical_state(self.data[tk], current_time)
                         if metrics:
                             atrs[tk] = metrics["atr"]
-                            # Quant Rule: High Conviction on Oversold RSI (< 35) or Trend Momentum
                             if metrics["rsi"] < 35:
                                 convictions[tk] = 0.85
                             elif metrics["rsi"] > 65:
@@ -122,28 +124,44 @@ class EventDrivenBacktester:
                 # 4. Run Risk Parity Optimizer
                 target_weights = self.optimizer.optimize(convictions, atrs)
 
-                # Rebalance Portfolio
-                for tk, target_w in target_weights.items():
-                    target_alloc_dollars = current_equity * target_w
-                    price = current_prices[tk]
-                    if price <= 0:
-                        continue
+                # Separate into Sells first (free up cash), then Buys
+                sells = []
+                buys = []
 
+                for tk, target_w in target_weights.items():
+                    if tk not in holdings or current_prices.get(tk, 0) <= 0:
+                        continue
+                    price = current_prices[tk]
+                    target_alloc_dollars = current_equity * target_w
                     current_pos_dollars = holdings[tk] * price
                     diff_dollars = target_alloc_dollars - current_pos_dollars
 
-                    if diff_dollars > 0 and cash >= diff_dollars:
-                        # Buy
-                        new_shares = diff_dollars / price
+                    if diff_dollars < 0:
+                        sells.append((tk, abs(diff_dollars), price))
+                    elif diff_dollars > 0:
+                        buys.append((tk, diff_dollars, price))
+
+                # Step 4a: Execute Sells First
+                for tk, diff_dollars, price in sells:
+                    sell_shares = diff_dollars / price
+                    actual_sell_shares = min(holdings[tk], sell_shares)
+                    holdings[tk] -= actual_sell_shares
+                    cash += (actual_sell_shares * price) * (1 - self.slippage)
+                    if holdings[tk] <= 1e-6:
+                        holdings[tk] = 0.0
+                        entry_prices[tk] = 0.0
+
+                # Step 4b: Execute Buys Second
+                for tk, diff_dollars, price in buys:
+                    alloc_dollars = min(diff_dollars, cash)
+                    if alloc_dollars > 0:
+                        bought_dollars_after_slippage = alloc_dollars * (1 - self.slippage)
+                        new_shares = bought_dollars_after_slippage / price
                         total_shares = holdings[tk] + new_shares
-                        entry_prices[tk] = ((holdings[tk] * entry_prices[tk]) + diff_dollars) / total_shares if total_shares > 0 else price
+                        
+                        entry_prices[tk] = ((holdings[tk] * entry_prices[tk]) + bought_dollars_after_slippage) / total_shares if total_shares > 0 else price
                         holdings[tk] = total_shares
-                        cash -= diff_dollars
-                    elif diff_dollars < 0:
-                        # Sell
-                        sell_shares = abs(diff_dollars) / price
-                        holdings[tk] = max(0.0, holdings[tk] - sell_shares)
-                        cash += abs(diff_dollars)
+                        cash -= alloc_dollars
 
         # 5. Compute Final Performance Statistics
         eq_series = pd.Series(equity_curve)
@@ -163,7 +181,6 @@ class EventDrivenBacktester:
         print("==================================================================")
 
 if __name__ == "__main__":
-    # Dynamic 5-Year Rolling Historical Stress Test
     end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
     start_date = (pd.Timestamp.now() - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
 
