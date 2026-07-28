@@ -95,8 +95,14 @@ async def run_consumer():
                 spy_series = pd.Series(spy_returns_history).pct_change().dropna() if len(spy_returns_history) > 2 else pd.Series()
                 regime_scaler = risk_engine.calculate_regime_scaler(spy_series)
 
-                # Tier 1 Technical Normalization
-                shared_thesis = swarm.analyze_technical_state(market_state)
+                # Collect all active holdings across the entire swarm population
+                all_active_holdings = list({
+                    tk for agent in swarm_mgr.population 
+                    for tk, shares in agent.holdings.items() if shares > 0
+                })
+
+                # Tier 1 Technical Normalization (Top movers + active swarm holdings)
+                shared_thesis = swarm.analyze_technical_state(market_state, active_holdings=all_active_holdings)
 
                 # Iterate through swarm agents
                 for agent in swarm_mgr.population:
