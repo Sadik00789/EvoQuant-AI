@@ -1,6 +1,3 @@
-<img width="1535" height="781" alt="Screenshot 2026-07-29 034829" src="https://github.com/user-attachments/assets/d4724d55-5348-4841-ba7d-cf577c922ebe" />
-
-
 # ⚡ EvoQuant-AI: Evolutionary Swarm Analytics Engine
 
 > **Event-driven, multi-agent quantitative trading framework running convex risk parity allocations, news sentiment RAG, and LLM-driven strategy evolution over a TimescaleDB time-series backbone.**
@@ -214,6 +211,8 @@ docker compose down -v
 ## 🛡️ License
 
 Distributed under the MIT License. See `LICENSE` for more information.
+
+
 <img width="1916" height="787" alt="Screenshot 2026-07-29 034740" src="https://github.com/user-attachments/assets/a59cf0bd-f515-4bcc-acba-4f8ae8edc69e" />
 <img width="1522" height="652" alt="Screenshot 2026-07-29 034810" src="https://github.com/user-attachments/assets/d244ba83-6b72-4307-81c3-70ea9a1a72b3" />
 <img width="1535" height="781" alt="Screenshot 2026-07-29 034829" src="https://github.com/user-attachments/assets/d4724d55-5348-4841-ba7d-cf577c922ebe" />
