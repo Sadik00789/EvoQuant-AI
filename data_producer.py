@@ -17,12 +17,26 @@ TICK_INTERVAL_MINUTES = 15
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 broker = redis.Redis(host=REDIS_HOST, port=6379, db=0)
 
+# Curated 100 Liquid US Mega/Large-Cap Stocks
 UNIVERSE = [
+    # Tech & Semiconductors (30)
     "NVDA", "AMD", "AAPL", "MSFT", "TSLA", "META", "GOOGL", "AMZN", "NFLX", "INTC",
-    "JPM", "V", "MA", "UNH", "JNJ", "PG", "HD", "DIS", "PYPL", "BAC",
-    "XOM", "CVX", "PFE", "ABBV", "COST", "PEP", "KO", "WMT", "CSCO", "ACN",
-    "CRM", "ORCL", "ADBE", "NKE", "MCD", "TMO", "ABT", "MRK", "AVGO", "TXN",
-    "QCOM", "HON", "UNP", "LOW", "AMGN", "SBUX", "GE", "CAT", "IBM", "BA"
+    "CRM", "ORCL", "ADBE", "AVGO", "TXN", "QCOM", "CSCO", "ACN", "IBM", "AMAT",
+    "MU", "LRCX", "NOW", "PANW", "SNPS", "CDNS", "KLAC", "MCHP", "ADI", "ROP",
+    # Financials & Payments (15)
+    "JPM", "V", "MA", "BAC", "WFC", "C", "GS", "MS", "AXP", "PYPL",
+    "BLK", "SCHW", "CB", "MMC", "PGR",
+    # Healthcare & Pharma (15)
+    "UNH", "JNJ", "PFE", "ABBV", "MRK", "TMO", "ABT", "AMGN", "LLY", "DHR",
+    "BMY", "GILD", "CVS", "CI", "ISRG",
+    # Consumer & Retail (15)
+    "PG", "HD", "DIS", "COST", "PEP", "KO", "WMT", "NKE", "MCD", "SBUX",
+    "LOW", "TJX", "TGT", "EL", "BKNG",
+    # Industrials & Aerospace (10)
+    "HON", "UNP", "GE", "CAT", "BA", "DE", "LMT", "RTX", "ADP", "MMM",
+    # Energy, Utilities, Real Estate & Telecom (15)
+    "XOM", "CVX", "COP", "SLB", "EOG", "NEE", "DUK", "SO", "T", "VZ",
+    "TMUS", "PLD", "AMT", "SPGI", "MDLZ"
 ]
 
 ALL_SYMBOLS = UNIVERSE + ["SPY"]
@@ -114,7 +128,7 @@ async def on_bar(bar: Bar):
         if len(buffer) > 0:
             payload = json.dumps(buffer)
             broker.publish('market_events', payload)
-            print(f"📡 [PRODUCER] Clean 15m Close: Broadcasted full {len(buffer)}/50 stock matrix to Redis.")
+            print(f"📡 [PRODUCER] Clean 15m Close: Broadcasted full {len(buffer)}/100 stock matrix to Redis.")
             buffer.clear()
 
 if __name__ == "__main__":
