@@ -4,7 +4,7 @@ import logging
 import asyncio
 import httpx
 import pandas as pd
-from typing import Literal, Dict, Union, Any
+from typing import Literal, Dict, Union, Any, List
 from pydantic import BaseModel, Field, ValidationError
 from psycopg_pool import ConnectionPool
 from psycopg.rows import dict_row
@@ -55,10 +55,9 @@ class RiskParityOptimizer:
     Converts qualitative LLM conviction scores into volatility-adjusted weights
     using Inverse-Volatility Risk Parity.
     """
-    def __init__(self, max_position_cap: float = 0.15):
+    def __init__(self, max_position_cap: float = 0.05):  # Set to 5% for 100-stock universe
         self.max_position_cap = max_position_cap
 
-    # 1. Method for backtest.py and unit testing (Dictionary Schema)
     def optimize(self, convictions: dict, atrs: dict) -> dict:
         if not convictions:
             return {}
@@ -83,19 +82,17 @@ class RiskParityOptimizer:
             for k, v in raw_weights.items()
         }
 
-    # 2. Dual-Compatible Method for Live Swarm Consumer
     @staticmethod
     def optimize_allocations(
         signals: AgentSignalDecision, 
         theses: Union[dict, MultiTechnicalThesis], 
-        max_position_cap: float = 0.15
+        max_position_cap: float = 0.05  # Standardized 5% position cap
     ) -> CrossAssetRiskDecision:
         raw_decisions = {}
         buy_candidates = {}
 
         for ticker, sig in signals.signals.items():
             if sig.action == "BUY" and sig.conviction > 0.3:
-                # Safely extract ATR whether theses is a raw dict or Pydantic object
                 atr = 1.0
                 if isinstance(theses, dict) and ticker in theses:
                     item = theses[ticker]
@@ -106,13 +103,11 @@ class RiskParityOptimizer:
                 if atr <= 0 or atr is None:
                     atr = 1.0
 
-                # Risk Parity Score: Higher conviction + lower volatility = higher weight
                 risk_score = sig.conviction / max(atr, 0.1)
                 buy_candidates[ticker] = risk_score
             else:
                 raw_decisions[ticker] = PortfolioAllocation(ticker=ticker, action=sig.action, allocation_pct=0.0)
 
-        # Normalize weights across buy candidates
         total_risk_score = sum(buy_candidates.values())
         if total_risk_score > 0:
             for ticker, score in buy_candidates.items():
@@ -134,17 +129,17 @@ class DualModelTradingSwarm:
         filtered_thesis = {}
         active_holdings = active_holdings or []
 
-        # 1. Rank universe by momentum/divergence magnitude
+        # 1. Rank 100-stock universe by momentum/divergence magnitude
         ranked_stocks = sorted(
             market_state.items(),
             key=lambda x: abs(x[1].get("rel_strength_spy", 0.0)) + abs(x[1].get("rsi", 50.0) - 50.0),
             reverse=True
         )
 
-        # 2. Capture Top 10 market movers
-        top_candidates = [tk for tk, _ in ranked_stocks[:10]]
+        # 2. Select top 12 candidate market movers
+        top_candidates = [tk for tk, _ in ranked_stocks[:12]]
 
-        # 3. Always include currently held positions so agents can rebalance or exit
+        # 3. Union with active swarm holdings so agents can always evaluate exit/rebalance
         combined_tickers = set(top_candidates + active_holdings)
 
         for ticker in combined_tickers:
@@ -169,7 +164,6 @@ class DualModelTradingSwarm:
     ) -> CrossAssetRiskDecision:
         """Executes 70B strategy across a multi-provider free 70B fallback chain."""
         
-        # Dual-compatible thesis parsing
         if isinstance(thesis, dict):
             compact_theses = {
                 tk: f"P:{data.get('price')}|RSI:{data.get('rsi')}|MACD:{data.get('macd_hist')}|RS:{data.get('rel_strength')}|ATR:{data.get('atr')}"
@@ -241,7 +235,6 @@ class DualModelTradingSwarm:
             if not p["key"]:
                 continue
 
-            # Build default headers and merge custom provider headers
             headers = {
                 "Authorization": f"Bearer {p['key']}",
                 "Content-Type": "application/json"
@@ -260,15 +253,8 @@ class DualModelTradingSwarm:
             try:
                 resp = await client.post(p["url"], json=payload, headers=headers, timeout=12.0)
                 
-                # Handle Rate Limit
-                if resp.status_code == 429:
-                    logger.warning(f"⚠️ [{p['name']}] Rate limit hit (429). Routing to next free provider...")
-                    continue
-
-                # Handle OpenRouter 404 Endpoint Exhaustion cleanly
-                if resp.status_code == 404:
-                    err_msg = resp.json().get("error", {}).get("message", "Upstream capacity busy")
-                    logger.warning(f"⚠️ [{p['name']}] 404 ({err_msg}). Routing to next free provider...")
+                if resp.status_code in (429, 404):
+                    logger.warning(f"⚠️ [{p['name']}] Status {resp.status_code}. Routing to next provider...")
                     continue
 
                 resp.raise_for_status()
@@ -293,11 +279,6 @@ class DualModelTradingSwarm:
 # ==========================================
 
 class CrossAssetPortfolioManager:
-    """
-    Production-Grade TimescaleDB / PostgreSQL Ledger Manager.
-    Uses thread-safe connection pooling (Psycopg 3) and TimescaleDB Hypertables
-    for scalable time-series telemetry storage.
-    """
     def __init__(
         self,
         host: str = None,
@@ -308,7 +289,7 @@ class CrossAssetPortfolioManager:
         min_pool_size: int = 2,
         max_pool_size: int = 10,
         initial_capital: float = 100000.0,
-        db_path: str = None  # Backward-compatibility parameter ignored
+        db_path: str = None
     ):
         self.host = host or os.getenv("POSTGRES_HOST", "localhost")
         self.port = int(port or os.getenv("POSTGRES_PORT", 5432))
@@ -319,7 +300,6 @@ class CrossAssetPortfolioManager:
 
         conninfo = f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.dbname}"
         
-        # Initialize thread-safe connection pool
         self.pool = ConnectionPool(
             conninfo=conninfo,
             min_size=min_pool_size,
@@ -329,20 +309,16 @@ class CrossAssetPortfolioManager:
         self._init_db()
 
     def _get_connection(self):
-        """Backward-compatible connection accessor context manager."""
         return self.pool.connection()
 
     def _init_db(self):
-        """Initializes tables, indexes, and converts snapshots to a TimescaleDB Hypertable."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
-                # 1. Enable TimescaleDB extension
                 try:
                     cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
                 except Exception as e:
                     logger.warning(f"TimescaleDB extension load note: {e}")
 
-                # 2. Accounts Table
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_accounts (
                         agent_id VARCHAR(64) PRIMARY KEY,
@@ -351,7 +327,6 @@ class CrossAssetPortfolioManager:
                     );
                 """)
 
-                # 3. Holdings Table
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_holdings (
                         agent_id VARCHAR(64),
@@ -363,7 +338,6 @@ class CrossAssetPortfolioManager:
                     );
                 """)
 
-                # 4. Audit Trade Logs
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS trade_logs (
                         id BIGSERIAL PRIMARY KEY,
@@ -378,7 +352,6 @@ class CrossAssetPortfolioManager:
                     );
                 """)
 
-                # 5. Macro Sentiment Regime Log
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS macro_regime (
                         id BIGSERIAL PRIMARY KEY,
@@ -389,7 +362,6 @@ class CrossAssetPortfolioManager:
                     );
                 """)
 
-                # 6. Snapshots Table (Time-Series Data)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_snapshots (
                         timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -400,16 +372,14 @@ class CrossAssetPortfolioManager:
                     );
                 """)
 
-                # Convert snapshots to TimescaleDB Hypertable (chunked by time)
                 try:
                     cur.execute("""
                         SELECT create_hypertable('agent_snapshots', 'timestamp', if_not_exists => TRUE);
                     """)
                     logger.info("✅ TimescaleDB Hypertable active for [agent_snapshots]")
                 except Exception as e:
-                    logger.warning(f"Hypertable notice (using standard PG table fallback): {e}")
+                    logger.warning(f"Hypertable notice: {e}")
 
-                # Create analytical index on snapshots
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_snapshots_agent_time 
                     ON agent_snapshots (agent_id, timestamp DESC);
@@ -418,7 +388,6 @@ class CrossAssetPortfolioManager:
                 conn.commit()
 
     def register_agent(self, agent_id: str):
-        """Registers agent account if it doesn't already exist."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -429,7 +398,6 @@ class CrossAssetPortfolioManager:
                 conn.commit()
 
     def get_agent_cash(self, agent_id: str) -> float:
-        """Fetches current cash balance for an agent."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT cash FROM agent_accounts WHERE agent_id = %s;", (agent_id,))
@@ -437,7 +405,6 @@ class CrossAssetPortfolioManager:
                 return float(row['cash']) if row else self.initial_capital
 
     def update_agent_cash(self, agent_id: str, new_cash: float):
-        """Atomic UPSERT for agent cash."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -449,7 +416,6 @@ class CrossAssetPortfolioManager:
                 conn.commit()
 
     def get_agent_holdings(self, agent_id: str) -> Dict[str, float]:
-        """Fetches active non-zero holdings for an agent."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -460,7 +426,6 @@ class CrossAssetPortfolioManager:
                 return {row['ticker']: float(row['amount']) for row in rows}
 
     def update_agent_holding(self, agent_id: str, ticker: str, amount: float, entry_price: float = 0.0):
-        """Atomic UPSERT for stock holdings."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -475,7 +440,6 @@ class CrossAssetPortfolioManager:
                 conn.commit()
 
     def log_trade(self, agent_id: str, ticker: str, action: str, shares: float, price: float, pct: float, reason: str = 'ALLOCATION'):
-        """Logs trade execution event into audit ledger."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -485,7 +449,6 @@ class CrossAssetPortfolioManager:
                 conn.commit()
 
     def log_snapshot(self, agent_id: str, equity: float, cash: float, pnl_pct: float):
-        """Inserts telemetry snapshot into TimescaleDB hypertable."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -495,7 +458,6 @@ class CrossAssetPortfolioManager:
                 conn.commit()
 
     def log_macro_regime(self, sentiment_score: float, risk_multiplier: float, reasoning: str):
-        """Logs macro news sentiment and risk multiplier."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -505,10 +467,8 @@ class CrossAssetPortfolioManager:
                 conn.commit()
 
     def fetch_dataframe(self, query: str, params: tuple = None) -> pd.DataFrame:
-        """Executes query and returns results as a Pandas DataFrame."""
         with self.pool.connection() as conn:
             return pd.read_sql_query(query, conn, params=params)
 
     def close(self):
-        """Gracefully closes connection pool."""
         self.pool.close()
