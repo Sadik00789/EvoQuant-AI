@@ -1,0 +1,14 @@
+# Environment variables & secrets
+.env
+
+# Python Caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Databases (if any local sqlite leftovers exist)
+*.db
+*.sqlite3
+
+# IDE
+.vscode/

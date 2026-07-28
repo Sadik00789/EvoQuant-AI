@@ -1,0 +1,82 @@
+services:
+  redis:
+    platform: linux/amd64
+    image: redis:alpine
+    container_name: evoquant_redis
+    ports:
+      - "6379:6379"
+    restart: always
+
+  timescaledb:
+    platform: linux/amd64
+    image: timescale/timescaledb:latest-pg16
+    container_name: evoquant_timescaledb
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-evoquant}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-evoquant_secret_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-evoquant_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-evoquant} -d ${POSTGRES_DB:-evoquant_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  producer:
+    build: .
+    container_name: evoquant_producer
+    command: python data_producer.py
+    environment:
+      - REDIS_HOST=redis
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+    depends_on:
+      - redis
+    restart: always
+
+  consumer:
+    build: .
+    container_name: evoquant_consumer
+    command: python swarm_consumer.py
+    environment:
+      - REDIS_HOST=redis
+      - POSTGRES_HOST=timescaledb
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-evoquant_db}
+      - POSTGRES_USER=${POSTGRES_USER:-evoquant}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-evoquant_secret_pass}
+      # 70B Provider Fallback Keys
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - SAMBANOVA_API_KEY=${SAMBANOVA_API_KEY}
+    depends_on:
+      redis:
+        condition: service_started
+      timescaledb:
+        condition: service_healthy
+    restart: always
+
+  dashboard:
+    build: .
+    container_name: evoquant_dashboard
+    command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
+    ports:
+      - "8501:8501"
+    environment:
+      - POSTGRES_HOST=timescaledb
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DB:-evoquant_db}
+      - POSTGRES_USER=${POSTGRES_USER:-evoquant}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-evoquant_secret_pass}
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    restart: always
+
+volumes:
+  pgdata:

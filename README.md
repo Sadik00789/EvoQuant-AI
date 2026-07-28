@@ -1,0 +1,213 @@
+# ⚡ EvoQuant-AI: Evolutionary Swarm Analytics Engine
+
+> **Event-driven, multi-agent quantitative trading framework running convex risk parity allocations, news sentiment RAG, and LLM-driven strategy evolution over a TimescaleDB time-series backbone.**
+
+---
+
+## 📐 System Architecture
+
+EvoQuant-AI operates as a containerized microservice architecture using a decoupled **Producer-Consumer** pattern over Redis pub/sub messaging.
+
+```text
+                  ┌────────────────────────┐
+                  │  Alpaca Market Streams │
+                  └───────────┬────────────┘
+                              │ WebSockets
+                              ▼
+                   ┌──────────────────────┐
+                   │  data_producer.py    │
+                   │ (Calculates RSI/MACD)│
+                   └───────────┬──────────┘
+                              │
+                              │ Redis Pub/Sub
+                              ▼
+                    ┌───────────────────┐
+                    │  evoquant_redis   │
+                    └─────────┬─────────┘
+                              │
+                              │ Market Ticks
+                              ▼
+                   ┌──────────────────────┐
+                   │  swarm_consumer.py   │
+                   │  ┌─────────────────┐ │
+                   │  │ Risk Engine     │ │
+                   │  │ Sentiment RAG   │ │
+                   │  │ 70B LLM Swarm   │ │
+                   │  └─────────────────┘ │
+                   └───────────┬──────────┘
+                              │
+                              │ ACID State & Telemetry
+                              ▼
+                  ┌────────────────────────┐
+                  │  evoquant_timescaledb  │
+                  │  (PostgreSQL + Hypert) │
+                  └───────────┬────────────┘
+                              │
+                              │ SQLAlchemy ORM
+                              ▼
+                  ┌────────────────────────┐
+                  │      dashboard.py      │
+                  │  (Streamlit UI :8501)  │
+                  └────────────────────────┘
+```
+
+---
+
+## 🛠️ Microservices Breakdown
+
+| Service | Container Name | Description |
+|---|---|---|
+| Market Data Producer | `evoquant_producer` | Establishes WebSocket channels to Alpaca, calculates real-time technical indicators (RSI, MACD, ATR, relative strength), and publishes 15-minute bar matrices to Redis. |
+| Message Broker | `evoquant_redis` | In-memory Redis instance serving as the asynchronous pub/sub pipeline between the data engine and trade execution layer. |
+| Swarm Orchestrator | `evoquant_consumer` | Consumes bar events, evaluates macroeconomic news sentiment, triggers multi-provider 70B LLM fallback chains (Groq, OpenRouter, SambaNova, GitHub Models), executes risk parity scaling, and commits trades. |
+| Time-Series Storage | `evoquant_timescaledb` | PostgreSQL 16 database powered by TimescaleDB hypertables for persistent storage of trade history, agent equity telemetry, and macro regime snapshots. |
+| Analytics Dashboard | `evoquant_dashboard` | Dark-themed Streamlit analytics terminal providing real-time portfolio heatmaps, Darwinian agent leaderboards, and execution risk audit trails. |
+
+---
+
+## 🧰 Tech Stack
+
+- **Language & Runtime:** Python 3.10-slim
+- **Containerization:** Docker & Docker Compose V2
+- **Storage Layer:** PostgreSQL 16 / TimescaleDB (psycopg3, SQLAlchemy)
+- **In-Memory Messaging:** Redis (alpine)
+- **Quantitative Engine:** Pandas, NumPy, SciPy, Alpaca-Py
+- **LLM Orchestration:** Groq, OpenRouter, SambaNova, GitHub Models API
+- **Visualization:** Streamlit, Plotly
+
+---
+
+## 📂 Directory Structure
+
+```text
+EvoQuant-AI/
+├── .streamlit/
+│   └── config.toml           # Streamlit dark theme settings
+├── tests/
+│   └── test_swarm.py         # Unit & integration test suite
+├── .env.example               # Environment variables template
+├── .gitignore                 # Git exclusions (blocks .env and cache)
+├── Dockerfile                  # Multi-stage container build definition
+├── docker-compose.yml          # Orchestration spec for all 5 services
+├── requirements.txt            # Python dependency manifests
+├── data_producer.py            # Market WebSocket stream ingestion
+├── swarm_consumer.py           # Swarm trade decision & logging worker
+├── engine.py                   # Cross-asset portfolio manager & DB connector
+├── evolution_engine.py         # Darwinian strategy evolution & tournament logic
+├── risk_engine.py              # Convex risk parity & slippage calculator
+├── sentiment_agent.py          # RSS/News RAG sentiment evaluation agent
+├── dashboard.py                # Streamlit frontend terminal
+└── README.md                   # Project documentation
+```
+
+---
+
+## 🚀 Quickstart Guide
+
+### 1. Prerequisites
+
+Ensure you have the following installed on your machine or cloud server:
+
+- Docker Desktop (or Docker Engine on Linux) with Docker Compose V2
+- Git
+
+### 2. Clone the Repository
+
+```bash
+git clone https://github.com/YOUR_USERNAME/EvoQuant-AI.git
+cd EvoQuant-AI
+```
+
+### 3. Configure Environment Variables
+
+Copy the template file to `.env`:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and fill in your API credentials:
+
+```env
+# Database Credentials
+POSTGRES_USER=evoquant
+POSTGRES_PASSWORD=your_secure_password
+POSTGRES_DB=evoquant_db
+
+# Market Data API
+ALPACA_API_KEY=your_alpaca_api_key
+ALPACA_SECRET_KEY=your_alpaca_secret_key
+
+# LLM Swarm API Keys (Multi-Provider Fallback)
+GROQ_API_KEY=your_groq_api_key
+OPENROUTER_API_KEY=your_openrouter_api_key
+SAMBANOVA_API_KEY=your_sambanova_api_key
+GITHUB_TOKEN=your_github_token
+```
+
+### 4. Build and Launch the Stack
+
+Run Docker Compose in detached mode:
+
+```bash
+docker compose up --build -d
+```
+
+### 5. Access the Dashboard
+
+Open your web browser and navigate to:
+
+```text
+http://localhost:8501
+```
+
+*(If deployed on a remote cloud instance, replace `localhost` with your server's public IP address.)*
+
+---
+
+## 📊 Infrastructure Management
+
+**View Container Health & Status**
+
+```bash
+docker compose ps
+```
+
+**Monitor Live Logs**
+
+```bash
+# View all swarm trade execution logs
+docker compose logs -f consumer
+
+# View market data feed logs
+docker compose logs -f producer
+
+# View dashboard UI logs
+docker compose logs -f dashboard
+```
+
+**Restart Services**
+
+```bash
+docker compose restart
+```
+
+**Stop the System**
+
+Stop containers while preserving database volume data:
+
+```bash
+docker compose down
+```
+
+Reset the entire database volume and start fresh:
+
+```bash
+docker compose down -v
+```
+
+---
+
+## 🛡️ License
+
+Distributed under the MIT License. See `LICENSE` for more information.
