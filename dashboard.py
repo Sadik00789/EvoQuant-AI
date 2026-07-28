@@ -102,46 +102,40 @@ st.markdown(f"""
         opacity: 1;
     }}
 
-    /* Metric cards */
+    /* Metric cards - Optimized to prevent text truncation */
     div[data-testid="stMetric"] {{
         background: linear-gradient(160deg, {BG_PANEL_ALT} 0%, {BG_PANEL} 100%) !important;
         border: 1px solid {BORDER} !important;
         border-radius: 14px !important;
-        padding: 18px 20px !important;
+        padding: 16px 12px !important;
         box-shadow: 0 8px 24px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.03);
         transition: transform 0.15s ease, border-color 0.15s ease;
+        min-width: 0 !important;
     }}
     div[data-testid="stMetric"]:hover {{
         transform: translateY(-2px);
         border-color: rgba(94,234,212,0.4) !important;
     }}
-    div[data-testid="stMetricValue"] {{
+    div[data-testid="stMetricValue"],
+    div[data-testid="stMetricValue"] * {{
         color: {TEXT_PRIMARY} !important;
         font-family: 'JetBrains Mono', monospace !important;
         font-weight: 700 !important;
-        font-size: clamp(1.05rem, 1.7vw, 1.5rem) !important;
+        font-size: clamp(0.78rem, 1.05vw, 1.25rem) !important;
         white-space: normal !important;
         overflow: visible !important;
         text-overflow: unset !important;
         word-break: break-word !important;
-        line-height: 1.25 !important;
-    }}
-    div[data-testid="stMetricValue"] > div {{
-        white-space: normal !important;
-        overflow: visible !important;
-        text-overflow: unset !important;
+        line-height: 1.2 !important;
     }}
     div[data-testid="stMetricLabel"] {{
         color: {TEXT_MUTED} !important;
-        font-size: 0.7rem !important;
+        font-size: 0.68rem !important;
         font-weight: 700 !important;
-        letter-spacing: 0.6px;
+        letter-spacing: 0.5px;
         text-transform: uppercase;
         white-space: normal !important;
         overflow: visible !important;
-    }}
-    div[data-testid="stMetric"] {{
-        min-width: 0 !important;
     }}
     div[data-testid="stMetricDelta"] svg {{ display: none; }}
 
@@ -370,7 +364,6 @@ if st.sidebar.button("🔄 Manual Refresh", use_container_width=True):
 st.sidebar.markdown("<hr class='app-divider' style='margin:20px 0;'>", unsafe_allow_html=True)
 st.sidebar.markdown(f"<h3 style='color:{ACCENT} !important; font-size:1rem;'>🛡️ Active Guardrails</h3>", unsafe_allow_html=True)
 
-# Updated Max Position Cap display to 5.0% to match 100-stock universe configuration
 st.sidebar.markdown(f"""
 <div class="guardrail-card">
     <div class="guardrail-item"><span>Hard Stop-Loss</span> <span class="guardrail-value">-2.5%</span></div>
