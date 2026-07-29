@@ -7,13 +7,12 @@ redis==5.0.3
 alpaca-py==0.17.0
 feedparser==6.0.12
 python-dotenv==1.0.1
-websockets>=11.0.3,<12.0.0
 
 # Quantitative & Financial Math Engine
 pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.10.0
-yfinance>=0.2.30
+yfinance>=0.2.38
 
 # Database & Telemetry Ledger
 psycopg[binary,pool]>=3.1.0
