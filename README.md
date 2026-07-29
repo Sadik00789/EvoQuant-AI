@@ -60,9 +60,17 @@ EvoQuant-AI operates as a containerized microservice architecture using a decoup
 |---|---|---|
 | Market Data Producer | `evoquant_producer` | Establishes WebSocket channels to Alpaca, calculates real-time technical indicators (RSI, MACD, ATR, relative strength), and publishes 15-minute bar matrices to Redis. |
 | Message Broker | `evoquant_redis` | In-memory Redis instance serving as the asynchronous pub/sub pipeline between the data engine and trade execution layer. |
-| Swarm Orchestrator | `evoquant_consumer` | Consumes bar events via a resilient auto-reconnect loop, evaluates macro news sentiment, runs an Adversarial Debate Loop where bull/bear LLM agents contest each trade signal before consensus, triggers parallel asynchronous multi-provider Llama 3.3 70B fallback chains (Groq, OpenRouter, SambaNova, GitHub Models), executes risk parity scaling with the SPY 200 SMA Macro Trend Guard, and dispatches live paper orders to Alpaca. |
+| Swarm Orchestrator | `evoquant_consumer` | Consumes bar events via a resilient auto-reconnect loop, evaluates macro news sentiment, runs an Adversarial Debate Loop where bull/bear LLM agents contest each trade signal before consensus, triggers parallel asynchronous multi-provider Llama 3.3 70B fallback chains (Groq, OpenRouter, SambaNova, GitHub Models), executes risk parity scaling with the SPY 200 SMA Macro Trend Guard, manages long and short positions with dividend-aware cover execution, and dispatches live paper orders to Alpaca. |
 | Time-Series Storage | `evoquant_timescaledb` | PostgreSQL 16 database powered by TimescaleDB hypertables for persistent storage of trade history, agent equity telemetry, and macro regime snapshots. |
 | Analytics Dashboard | `evoquant_dashboard` | Dark-themed Streamlit analytics terminal providing real-time portfolio heatmaps, Darwinian agent leaderboards, and execution risk audit trails. |
+
+---
+
+## 💡 Key Trading Features
+
+- **Short Selling & Cover Execution:** Agents can open short positions when the swarm consensus and macro trend guard signal a bearish regime, with dedicated cover-order logic to close out shorts on reversal signals, stop-loss triggers, or risk-parity rebalancing.
+- **Dividend-Aware Trading:** The engine tracks each holding's ex-dividend date and applies dividend-adjustment rules automatically — flattening or hedging long positions ahead of ex-dividend dates where relevant, and applying a borrow-cost / dividend-liability check before opening or holding a short position through an ex-dividend date.
+- **Adversarial Debate Loop:** Bull/bear LLM agents contest each trade signal before consensus is reached (see Swarm Orchestrator above).
 
 ---
 
@@ -72,7 +80,7 @@ EvoQuant-AI operates as a containerized microservice architecture using a decoup
 - **Containerization:** Docker & Docker Compose V2
 - **Storage Layer:** PostgreSQL 16 / TimescaleDB (psycopg3, SQLAlchemy)
 - **In-Memory Messaging:** Redis (alpine)
-- **Quantitative Engine:** Pandas, NumPy, SciPy, Alpaca-Py, Requests
+- **Quantitative Engine:** Pandas, NumPy, SciPy, Alpaca-Py, Requests — includes short/cover execution logic and ex-dividend date tracking for dividend-aware position management
 - **LLM Orchestration:** Llama 3.3 70B across Groq, OpenRouter, SambaNova, and GitHub Models APIs, with an Adversarial Debate Loop (bull/bear agent contestation) for signal validation
 - **Visualization:** Streamlit, Plotly
 
@@ -93,9 +101,9 @@ EvoQuant-AI/
 ├── requirements.txt             # Python dependency manifests
 ├── data_producer.py             # Market WebSocket stream ingestion
 ├── swarm_consumer.py            # Swarm trade decision, Adversarial Debate Loop & logging worker
-├── engine.py                    # Cross-asset portfolio manager, Alpaca bridge & DB connector
+├── engine.py                    # Cross-asset portfolio manager, short/cover execution, dividend rules & Alpaca bridge & DB connector
 ├── evolution_engine.py          # Darwinian strategy evolution & tournament logic
-├── risk_engine.py               # Convex risk parity, downside semi-variance & macro guard
+├── risk_engine.py               # Convex risk parity, downside semi-variance, short-side exposure & macro guard
 ├── sentiment_agent.py           # RSS/News RAG sentiment evaluation agent
 ├── dashboard.py                 # Streamlit frontend terminal
 └── README.md                    # Project documentation
