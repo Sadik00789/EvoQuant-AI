@@ -15,7 +15,8 @@ class PostgresPortfolioManager:
     """
     Production-Grade TimescaleDB / PostgreSQL Ledger Manager.
     Uses thread-safe connection pooling (Psycopg 3) and TimescaleDB Hypertables
-    for scalable time-series telemetry storage.
+    for scalable time-series telemetry storage. Supports signed position accounting
+    (Long/Short) and automated dividend schedule & audit tracking.
     """
     def __init__(
         self,
@@ -65,7 +66,7 @@ class PostgresPortfolioManager:
                     );
                 """)
 
-                # 3. Holdings Table
+                # 3. Holdings Table (Supports positive for Longs, negative for Shorts)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_holdings (
                         agent_id VARCHAR(64),
@@ -92,7 +93,34 @@ class PostgresPortfolioManager:
                     );
                 """)
 
-                # 5. Macro Sentiment Regime Log
+                # 5. Dividend Schedule Table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS dividend_schedule (
+                        id BIGSERIAL PRIMARY KEY,
+                        ticker VARCHAR(16) NOT NULL,
+                        ex_date DATE NOT NULL,
+                        payment_date DATE NOT NULL,
+                        amount_per_share DOUBLE PRECISION NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        CONSTRAINT unique_ticker_ex_date UNIQUE (ticker, ex_date)
+                    );
+                """)
+
+                # 6. Dividend Audit Logs Table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS dividend_logs (
+                        id BIGSERIAL PRIMARY KEY,
+                        timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        agent_id VARCHAR(64) NOT NULL,
+                        ticker VARCHAR(16) NOT NULL,
+                        action VARCHAR(16) NOT NULL,
+                        shares DOUBLE PRECISION NOT NULL,
+                        amount_per_share DOUBLE PRECISION NOT NULL,
+                        total_amount DOUBLE PRECISION NOT NULL
+                    );
+                """)
+
+                # 7. Macro Sentiment Regime Log
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS macro_regime (
                         id BIGSERIAL PRIMARY KEY,
@@ -103,7 +131,7 @@ class PostgresPortfolioManager:
                     );
                 """)
 
-                # 6. Snapshots Table (Time-Series Data)
+                # 8. Snapshots Table (Time-Series Data)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_snapshots (
                         timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -123,10 +151,15 @@ class PostgresPortfolioManager:
                 except Exception as e:
                     logger.warning(f"Hypertable notice (using standard PG table fallback): {e}")
 
-                # Create analytical index on snapshots
+                # Create analytical indexes
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_snapshots_agent_time 
                     ON agent_snapshots (agent_id, timestamp DESC);
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_div_schedule_ex_date 
+                    ON dividend_schedule (ex_date);
                 """)
                 
                 conn.commit()
@@ -163,18 +196,18 @@ class PostgresPortfolioManager:
                 conn.commit()
 
     def get_agent_holdings(self, agent_id: str) -> Dict[str, float]:
-        """Fetches active non-zero holdings for an agent."""
+        """Fetches active non-zero holdings (Long > 0, Short < 0) for an agent."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT ticker, amount FROM agent_holdings 
-                    WHERE agent_id = %s AND amount > 0;
+                    WHERE agent_id = %s AND amount != 0;
                 """, (agent_id,))
                 rows = cur.fetchall()
                 return {row['ticker']: float(row['amount']) for row in rows}
 
     def update_agent_holding(self, agent_id: str, ticker: str, amount: float, entry_price: float = 0.0):
-        """Atomic UPSERT for stock holdings."""
+        """Atomic UPSERT for stock holdings (handles positive long and negative short quantities)."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -187,6 +220,73 @@ class PostgresPortfolioManager:
                         updated_at = CURRENT_TIMESTAMP;
                 """, (agent_id, ticker, amount, entry_price))
                 conn.commit()
+
+    def process_daily_dividends(self, current_date_str: str):
+        """
+        Scans dividend_schedule for events matching current_date_str (Ex-Dividend Date).
+        Credits long holders and debits short holders automatically.
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT ticker, amount_per_share 
+                    FROM dividend_schedule 
+                    WHERE ex_date = %s;
+                """, (current_date_str,))
+                events = cur.fetchall()
+
+                for event in events:
+                    ticker = event['ticker']
+                    div_per_share = float(event['amount_per_share'])
+
+                    cur.execute("""
+                        SELECT agent_id, amount FROM agent_holdings 
+                        WHERE ticker = %s AND amount != 0;
+                    """, (ticker,))
+                    active_positions = cur.fetchall()
+
+                    for pos in active_positions:
+                        agent_id = pos['agent_id']
+                        shares = float(pos['amount'])
+                        total_payout = abs(shares) * div_per_share
+
+                        if shares > 0:
+                            # LONG POSITION: Credit Cash
+                            action = "DIVIDEND_CREDIT"
+                            cur.execute("UPDATE agent_accounts SET cash = cash + %s WHERE agent_id = %s;", (total_payout, agent_id))
+                        else:
+                            # SHORT POSITION: Debit Cash (Short Obligation)
+                            action = "DIVIDEND_DEBIT"
+                            total_payout = -total_payout
+                            cur.execute("UPDATE agent_accounts SET cash = cash - %s WHERE agent_id = %s;", (abs(total_payout), agent_id))
+
+                        cur.execute("""
+                            INSERT INTO dividend_logs (agent_id, ticker, action, shares, amount_per_share, total_amount)
+                            VALUES (%s, %s, %s, %s, %s, %s);
+                        """, (agent_id, ticker, action, abs(shares), div_per_share, total_payout))
+
+                        logger.info(f"💰 [{action}] {agent_id} | {ticker} | Shares: {shares:.2f} | Payout: ${total_payout:+.2f}")
+
+                conn.commit()
+
+    def fetch_dividend_logs(self, agent_id: str = None, limit: int = 50) -> pd.DataFrame:
+        """Fetches recent dividend credits and debits for Streamlit UI analytics."""
+        query = "SELECT timestamp, agent_id, ticker, action, shares, amount_per_share, total_amount FROM dividend_logs"
+        if agent_id:
+            query += " WHERE agent_id = %s ORDER BY timestamp DESC LIMIT %s;"
+            return self.fetch_dataframe(query, (agent_id, limit))
+        query += " ORDER BY timestamp DESC LIMIT %s;"
+        return self.fetch_dataframe(query, (limit,))
+
+    def fetch_upcoming_dividends(self) -> pd.DataFrame:
+        """Fetches upcoming ex-dividend dates from dividend_schedule."""
+        query = """
+            SELECT ticker, ex_date, payment_date, amount_per_share 
+            FROM dividend_schedule 
+            WHERE ex_date >= CURRENT_DATE 
+            ORDER BY ex_date ASC;
+        """
+        return self.fetch_dataframe(query)
 
     def log_trade(self, agent_id: str, ticker: str, action: str, shares: float, price: float, pct: float, reason: str = 'ALLOCATION'):
         """Logs trade execution event into audit ledger."""
