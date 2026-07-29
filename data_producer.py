@@ -7,6 +7,7 @@ import requests
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from curl_cffi import requests as curl_requests  # Add this import at top
 from dotenv import load_dotenv
 from alpaca.data.live import StockDataStream
 from alpaca.data.models import Bar
@@ -51,12 +52,8 @@ buffer = {}
 current_window_minute = -1
 
 
+
 def sync_dividend_calendar():
-    """
-    Fetches upcoming ex-dividend dates and payout estimates for UNIVERSE stocks 
-    via yfinance and populates the TimescaleDB dividend_schedule table.
-    Uses custom browser session headers and backoff to prevent Yahoo 429 rate limits.
-    """
     POSTGRES_HOST = os.getenv("POSTGRES_HOST", "timescaledb" if REDIS_HOST == "redis" else "localhost")
     POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", 5432))
     POSTGRES_DB = os.getenv("POSTGRES_DB", "evoquant_db")
@@ -67,31 +64,19 @@ def sync_dividend_calendar():
     
     print("📅 Syncing dividend calendar with TimescaleDB...")
     
-    # Configure custom session with realistic browser User-Agent header
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    })
+    # Use curl_cffi Session with Chrome TLS fingerprinting to bypass Cloudflare/Yahoo blocks
+    session = curl_requests.Session(impersonate="chrome120")
 
     try:
         with ConnectionPool(conninfo=conninfo, min_size=1, max_size=2) as pool:
             with pool.connection() as conn:
                 with conn.cursor() as cur:
                     synced_count = 0
-                    consecutive_429s = 0
-
                     for tk in UNIVERSE:
-                        # Safety exit if Yahoo Finance has temporarily hard-locked the EC2 IP
-                        if consecutive_429s >= 5:
-                            print("⚠️ Yahoo Finance rate limit cool-down active. Pausing sync until next cycle.")
-                            break
-
                         try:
-                            time.sleep(1.0)  # 1-second delay between requests
-                            
+                            time.sleep(0.5)  # Brief delay
                             ticker_obj = yf.Ticker(tk, session=session)
                             info = ticker_obj.info
-                            
                             ex_date_ts = info.get("exDividendDate") or info.get("ex_dividend_date")
                             div_rate = info.get("dividendRate", 0.0) or 0.0
                             
@@ -105,17 +90,8 @@ def sync_dividend_calendar():
                                     ON CONFLICT (ticker, ex_date) DO NOTHING;
                                 """, (tk, ex_date_str, ex_date_str, quarterly_div))
                                 synced_count += 1
-                                
-                            consecutive_429s = 0  # Reset counter on successful response
-
-                        except Exception as e:
-                            err_msg = str(e)
-                            if "429" in err_msg or "Too Many Requests" in err_msg:
-                                consecutive_429s += 1
-                                print(f"⏳ Yahoo 429 rate limit encountered for {tk}. Backing off 5s...")
-                                time.sleep(5.0)
+                        except Exception:
                             continue
-
                     conn.commit()
                     print(f"✅ Dividend calendar synchronized ({synced_count} active schedules verified).")
     except Exception as e:
