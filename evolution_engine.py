@@ -57,10 +57,10 @@ class EvolutionarySwarmManager:
         """Initializes 5 baseline agent genomes aligned with the Risk Parity Optimizer."""
         baseline_personas = [
             ("Agent_Alpha", "You are an Aggressive Growth Trader. Focus on high-momentum breakouts, outperforming SPY, and strong MACD expansion. Output high conviction (0.8-1.0) on top technical setups."),
-            ("Agent_Beta", "You are a Conservative Risk Manager. Prioritize capital preservation, low volatility, and tight drawdown control. Only issue buy signals with high conviction on low ATR defensive value assets."),
-            ("Agent_Gamma", "You are a Mean-Reversion Trader. Exploit overbought (RSI>70) and oversold (RSI<30) extremes. Issue SELL or HOLD signals during range consolidation."),
-            ("Agent_Delta", "You are a Volatility Specialist. Exploit MACD trend divergences and sudden market regime shifts with dynamic conviction scaling."),
-            ("Agent_Epsilon", "You are a Macro Balanced Indexer. Maintain broad diversification across top market caps with steady, moderate conviction scores.")
+            ("Agent_Beta", "You are a Conservative Risk Manager. Prioritize capital preservation, low volatility, and tight drawdown control. Issue buy/short signals with high conviction on clear setups."),
+            ("Agent_Gamma", "You are a Mean-Reversion Trader. Exploit overbought (RSI>70) for short entries and oversold (RSI<30) extremes for buys."),
+            ("Agent_Delta", "You are a Volatility Specialist. Exploit MACD trend divergences, shorting weak breakdowns and buying strong regime shifts."),
+            ("Agent_Epsilon", "You are a Macro Balanced Indexer. Maintain broad multi-asset portfolio with long/short tactical overlays and moderate conviction scores.")
         ]
         
         return [
@@ -77,9 +77,9 @@ class EvolutionarySwarmManager:
     async def run_culling_cycle(self, prices: dict = None, risk_engine = None, db = None):
         """
         Executes Darwinian selection:
-        1. Recalculates exact equity state using current asset prices.
+        1. Recalculates exact equity state using current asset prices (handling long & short valuation).
         2. Ranks agents by risk-adjusted fitness score.
-        3. Liquidates open positions of bottom 2 agents in DB and memory.
+        3. Liquidates open positions (SELL for longs, COVER for shorts) of bottom 2 agents.
         4. Mutates top performer into 2 new offspring using multi-provider 70B models.
         """
         logger.info(f"🧬 --- EXECUTING EVOLUTIONARY CULLING (GEN {self.current_generation}) ---")
@@ -104,31 +104,35 @@ class EvolutionarySwarmManager:
         survivors = self.population[:3]
         culled = self.population[3:]
 
-        # 4. Liquidate open holdings for culled agents
+        # 4. Liquidate open holdings for culled agents (handles both Long & Short positions)
         for dead in culled:
             if prices:
                 for tk, shares in list(dead.holdings.items()):
-                    if shares > 0 and tk in prices:
+                    if shares != 0 and tk in prices:
                         current_price = prices[tk]
                         adv = 1000000.0
-                        exec_price = risk_engine.calculate_execution_price(current_price, shares, adv, "SELL") if risk_engine else current_price
-                        cash_gained = shares * exec_price
+                        action = "SELL" if shares > 0 else "COVER"
+                        exec_price = risk_engine.calculate_execution_price(current_price, abs(shares), adv, action) if risk_engine else current_price
                         
-                        dead.cash += cash_gained
+                        if shares > 0:
+                            dead.cash += shares * exec_price
+                        else:
+                            dead.cash -= abs(shares) * exec_price  # Pay cash to cover short position
+                            
                         dead.holdings[tk] = 0.0
                         dead.entry_prices[tk] = 0.0
 
                         if db:
                             db.update_agent_cash(dead.agent_id, dead.cash)
                             db.update_agent_holding(dead.agent_id, tk, 0.0, 0.0)
-                            db.log_trade(dead.agent_id, tk, "SELL", shares, exec_price, 0.0, reason="CULLED_LIQUIDATION")
+                            db.log_trade(dead.agent_id, tk, action, abs(shares), exec_price, 0.0, reason="CULLED_LIQUIDATION")
 
             logger.warning(f"  💀 CULLED & LIQUIDATED: {dead.agent_id} (Fitness: {dead.calculate_fitness()})")
 
         # 5. Generate 2 new mutated offspring from top performer
         parent = survivors[0]
         offspring_1 = await self._mutate_genome(parent, "Higher Risk Sensitivity & Volatility Protection", 1)
-        offspring_2 = await self._mutate_genome(parent, "Exploit Short-term Momentum Breakouts", 2)
+        offspring_2 = await self._mutate_genome(parent, "Exploit Short-term Momentum Breakouts & Breakdown Shorts", 2)
 
         self.current_generation += 1
         self.population = survivors + [offspring_1, offspring_2]
@@ -148,7 +152,7 @@ class EvolutionarySwarmManager:
         "{parent.persona_prompt}"
 
         Create a slightly mutated version of this strategy prompt that incorporates the trait: "{mutation_trait}".
-        Ensure the prompt instructs the agent to evaluate technical theses and output trade actions (BUY/SELL/HOLD) with conviction scores (0.0 to 1.0).
+        Ensure the prompt instructs the agent to evaluate technical theses and output trade actions (BUY, SELL, SHORT, COVER, or HOLD) with conviction scores (0.0 to 1.0).
         Return ONLY a JSON object with key "new_prompt": {{"new_prompt": "string"}}
         """
 
