@@ -11,8 +11,9 @@ class AdvancedRiskEngine:
     Features:
     1. Downside Deviation (Semi-Variance) & Inverse-Volatility Risk Parity Allocations.
     2. Parametric Conditional Value-at-Risk (CVaR / Expected Shortfall).
-    3. Square-Root Market Impact Slippage Model based on Average Daily Volume (ADV).
+    3. Square-Root Market Impact Slippage Model (BUY, SELL, SHORT, COVER) based on ADV.
     4. Volatility Regime Scaler with NaN Volatility Protection & Macro Trend Guarding (SPY 200 SMA).
+    5. Short Margin Collateral & Free Margin Health Evaluator.
     """
     def __init__(self, target_volatility: float = 0.15, max_position_pct: float = 0.05):
         self.target_volatility = target_volatility
@@ -119,7 +120,7 @@ class AdvancedRiskEngine:
 
     def calculate_execution_price(self, raw_price: float, shares: float, adv: float, side: str) -> float:
         """
-        Applies Square-Root Market Impact Slippage Model based on Average Daily Volume (ADV).
+        Applies Square-Root Market Impact Slippage Model across Long and Short actions based on ADV.
         
         Formula:
         $$P_{exec} = P_{raw} \\cdot \\left(1 \\pm \\gamma \\cdot \\sqrt{\\frac{\\text{Order Shares}}{\\text{ADV}}}\\right)$$
@@ -131,9 +132,37 @@ class AdvancedRiskEngine:
         slippage_pct = 0.10 * np.sqrt(participation_rate)  # 10% market impact factor
         slippage_pct = min(slippage_pct, 0.05)  # Cap maximum slippage friction at 5%
 
-        if side.upper() == "BUY":
+        action = side.upper()
+        if action in ("BUY", "COVER"):
             return round(raw_price * (1.0 + slippage_pct), 4)
-        elif side.upper() == "SELL":
+        elif action in ("SELL", "SHORT"):
             return round(raw_price * (1.0 - slippage_pct), 4)
             
         return raw_price
+
+    def evaluate_margin_health(
+        self, 
+        cash: float, 
+        holdings: Dict[str, float], 
+        prices: Dict[str, float], 
+        initial_margin_req: float = 1.50
+    ) -> Dict[str, Any]:
+        """
+        Calculates Net Equity, Long Valuation, Short Liability, and Free Margin.
+        Triggers margin call flag if Free Margin falls below zero.
+        """
+        long_val = sum(qty * prices.get(tk, 0.0) for tk, qty in holdings.items() if qty > 0)
+        short_liability = sum(abs(qty) * prices.get(tk, 0.0) for tk, qty in holdings.items() if qty < 0)
+
+        net_equity = cash + long_val - short_liability
+        required_margin = short_liability * initial_margin_req
+        free_margin = net_equity - required_margin
+
+        return {
+            "net_equity": round(net_equity, 2),
+            "long_val": round(long_val, 2),
+            "short_liability": round(short_liability, 2),
+            "required_margin": round(required_margin, 2),
+            "free_margin": round(free_margin, 2),
+            "margin_call_triggered": free_margin < 0.0
+        }
