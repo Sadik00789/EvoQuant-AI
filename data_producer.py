@@ -2,6 +2,7 @@ import os
 import json
 import asyncio  # Standard asyncio required for asyncio.sleep()
 import redis
+import time
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -47,6 +48,7 @@ history = {tk: pd.DataFrame(columns=["high", "low", "close", "volume"]) for tk i
 buffer = {}
 current_window_minute = -1
 
+
 def sync_dividend_calendar():
     """
     Fetches upcoming ex-dividend dates and payout estimates for UNIVERSE stocks 
@@ -68,6 +70,7 @@ def sync_dividend_calendar():
                     synced_count = 0
                     for tk in UNIVERSE:
                         try:
+                            time.sleep(0.25)  # 250ms throttle delay to respect Yahoo Finance API limits
                             ticker_obj = yf.Ticker(tk)
                             info = ticker_obj.info
                             ex_date_ts = info.get("exDividendDate") or info.get("ex_dividend_date")
