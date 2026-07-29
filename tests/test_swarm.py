@@ -85,3 +85,30 @@ def test_alpaca_bridge_inactive():
     bridge = AlpacaExecutionBridge(api_key=None, secret_key=None)
     assert bridge.is_active() is False
     assert bridge.submit_market_order("AAPL", 10.0, "BUY") is None
+
+
+def test_short_and_cover_slippage():
+    """Verify that short orders slip downward and cover orders slip upward."""
+    risk_engine = AdvancedRiskEngine()
+    raw_price = 100.0
+    
+    short_exec = risk_engine.calculate_execution_price(raw_price, shares=1000, adv=100000, side="SHORT")
+    cover_exec = risk_engine.calculate_execution_price(raw_price, shares=1000, adv=100000, side="COVER")
+    
+    assert short_exec < raw_price, "SHORT orders should slip price downwards!"
+    assert cover_exec > raw_price, "COVER orders should slip price upwards!"
+
+def test_margin_health_evaluation():
+    """Verify free margin calculation and margin call triggering."""
+    risk_engine = AdvancedRiskEngine()
+    cash = 130000.0
+    holdings = {"TSLA": -100.0}  # Short 100 TSLA @ $300 ($30,000 liability)
+    prices = {"TSLA": 300.0}
+    
+    margin_info = risk_engine.evaluate_margin_health(cash, holdings, prices, initial_margin_req=1.50)
+    
+    assert margin_info["net_equity"] == 100000.0
+    assert margin_info["short_liability"] == 30000.0
+    assert margin_info["required_margin"] == 45000.0
+    assert margin_info["free_margin"] == 55000.0
+    assert margin_info["margin_call_triggered"] is False
