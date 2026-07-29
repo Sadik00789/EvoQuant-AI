@@ -177,10 +177,12 @@ async def on_bar(bar: Bar):
             buffer.clear()
 
 if __name__ == "__main__":
-    # Sync dividend schedule into TimescaleDB on boot
-    sync_dividend_calendar()
-
     print(f"📡 Booting Alpaca WebSocket for {len(ALL_SYMBOLS)} assets (Interval: {TICK_INTERVAL_MINUTES}m)...")
+    
+    # Run dividend sync in the background so WebSocket boots immediately
+    import threading
+    threading.Thread(target=sync_dividend_calendar, daemon=True).start()
+
     stream = StockDataStream(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY"))
     stream.subscribe_bars(on_bar, *ALL_SYMBOLS)
     stream.run()
