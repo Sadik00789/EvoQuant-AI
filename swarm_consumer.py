@@ -214,79 +214,88 @@ async def run_consumer():
                                 effective_alloc = target.allocation_pct * macro_multiplier * regime_scaler
                                 target_val = current_equity * effective_alloc
                                 current_pos_qty = agent.holdings.get(ticker, 0.0)
-                                current_val = current_pos_qty * raw_price
-                                delta = target_val - current_val
 
-                                # 1. BUY Execution (Long Entry / Scale)
-                                if target.action == "BUY" and delta > 50.0 and agent.cash >= delta:
-                                    approx_shares = delta / raw_price
-                                    exec_price = risk_engine.calculate_execution_price(raw_price, approx_shares, adv, "BUY")
-                                    shares = delta / exec_price
-
-                                    old_shares = max(agent.holdings.get(ticker, 0.0), 0.0)
-                                    old_entry = agent.entry_prices.get(ticker, exec_price)
-                                    new_shares = old_shares + shares
-                                    weighted_entry = ((old_shares * old_entry) + (shares * exec_price)) / new_shares
-
-                                    agent.holdings[ticker] = new_shares
-                                    agent.entry_prices[ticker] = weighted_entry
-                                    agent.cash -= delta
-
-                                    db.update_agent_cash(agent.agent_id, agent.cash)
-                                    db.update_agent_holding(agent.agent_id, ticker, new_shares, weighted_entry)
-                                    db.log_trade(agent.agent_id, ticker, "BUY", shares, exec_price, effective_alloc, reason="RISK_PARITY_ALLOCATION")
-                                    logger.info(f"  📈 [{agent.agent_id}] BOUGHT {ticker}: +{shares:.2f}sh @ ${exec_price:.2f} (Avg Cost: ${weighted_entry:.2f})")
-
-                                    broker_bridge.submit_market_order(ticker, shares, "BUY")
-
-                                # 2. SELL Execution (Long Reduction / Exit)
-                                elif target.action == "SELL" and current_pos_qty > 0 and delta < -50.0:
-                                    sell_shares = min(abs(delta) / raw_price, current_pos_qty)
-                                    exec_price = risk_engine.calculate_execution_price(raw_price, sell_shares, adv, "SELL")
-                                    actual_cash_gained = sell_shares * exec_price
-
-                                    agent.holdings[ticker] -= sell_shares
-                                    agent.cash += actual_cash_gained
-
-                                    if agent.holdings[ticker] <= 0.0001:
-                                        agent.holdings[ticker] = 0.0
-                                        agent.entry_prices[ticker] = 0.0
-
-                                    db.update_agent_cash(agent.agent_id, agent.cash)
-                                    db.update_agent_holding(agent.agent_id, ticker, agent.holdings[ticker], agent.entry_prices.get(ticker, 0.0))
-                                    db.log_trade(agent.agent_id, ticker, "SELL", sell_shares, exec_price, effective_alloc, reason="RISK_PARITY_REBALANCE")
-                                    logger.info(f"  📉 [{agent.agent_id}] SOLD {ticker}: -{sell_shares:.2f}sh @ ${exec_price:.2f}")
-
-                                    broker_bridge.submit_market_order(ticker, sell_shares, "SELL")
-
-                                # 3. SHORT Execution (Short Entry / Scale)
-                                elif target.action == "SHORT" and delta > 50.0:
-                                    margin_info = risk_engine.evaluate_margin_health(agent.cash, agent.holdings, prices)
-                                    if margin_info["free_margin"] >= delta:
+                                # 1. BUY Execution (Long Entry / Scale Up)
+                                if target.action == "BUY":
+                                    current_long_val = max(current_pos_qty, 0.0) * raw_price
+                                    delta = target_val - current_long_val
+                                    if delta > 50.0 and agent.cash >= delta:
                                         approx_shares = delta / raw_price
-                                        exec_price = risk_engine.calculate_execution_price(raw_price, approx_shares, adv, "SHORT")
-                                        actual_short_shares = delta / exec_price
+                                        exec_price = risk_engine.calculate_execution_price(raw_price, approx_shares, adv, "BUY")
+                                        shares = delta / exec_price
 
-                                        old_short_shares = abs(min(agent.holdings.get(ticker, 0.0), 0.0))
+                                        old_shares = max(current_pos_qty, 0.0)
                                         old_entry = agent.entry_prices.get(ticker, exec_price)
-                                        new_short_shares = old_short_shares + actual_short_shares
-                                        weighted_entry = ((old_short_shares * old_entry) + (actual_short_shares * exec_price)) / new_short_shares
+                                        new_shares = old_shares + shares
+                                        weighted_entry = ((old_shares * old_entry) + (shares * exec_price)) / new_shares
 
-                                        agent.holdings[ticker] = -new_short_shares  # Negative quantity
+                                        agent.holdings[ticker] = new_shares
                                         agent.entry_prices[ticker] = weighted_entry
-                                        agent.cash += actual_short_shares * exec_price  # Add short sale proceeds
+                                        agent.cash -= delta
 
                                         db.update_agent_cash(agent.agent_id, agent.cash)
-                                        db.update_agent_holding(agent.agent_id, ticker, -new_short_shares, weighted_entry)
-                                        db.log_trade(agent.agent_id, ticker, "SHORT", actual_short_shares, exec_price, effective_alloc, reason="RISK_PARITY_SHORT")
-                                        logger.info(f"  📉 [{agent.agent_id}] SHORTED {ticker}: -{actual_short_shares:.2f}sh @ ${exec_price:.2f}")
+                                        db.update_agent_holding(agent.agent_id, ticker, new_shares, weighted_entry)
+                                        db.log_trade(agent.agent_id, ticker, "BUY", shares, exec_price, effective_alloc, reason="RISK_PARITY_ALLOCATION")
+                                        logger.info(f"  📈 [{agent.agent_id}] BOUGHT {ticker}: +{shares:.2f}sh @ ${exec_price:.2f} (Avg Cost: ${weighted_entry:.2f})")
 
-                                        broker_bridge.submit_market_order(ticker, actual_short_shares, "SHORT")
+                                        broker_bridge.submit_market_order(ticker, shares, "BUY")
+
+                                # 2. SELL Execution (Long Reduction / Exit)
+                                elif target.action == "SELL" and current_pos_qty > 0:
+                                    current_long_val = current_pos_qty * raw_price
+                                    delta = target_val - current_long_val
+                                    if delta < -50.0:
+                                        sell_shares = min(abs(delta) / raw_price, current_pos_qty)
+                                        exec_price = risk_engine.calculate_execution_price(raw_price, sell_shares, adv, "SELL")
+                                        actual_cash_gained = sell_shares * exec_price
+
+                                        agent.holdings[ticker] -= sell_shares
+                                        agent.cash += actual_cash_gained
+
+                                        if agent.holdings[ticker] <= 0.0001:
+                                            agent.holdings[ticker] = 0.0
+                                            agent.entry_prices[ticker] = 0.0
+
+                                        db.update_agent_cash(agent.agent_id, agent.cash)
+                                        db.update_agent_holding(agent.agent_id, ticker, agent.holdings[ticker], agent.entry_prices.get(ticker, 0.0))
+                                        db.log_trade(agent.agent_id, ticker, "SELL", sell_shares, exec_price, effective_alloc, reason="RISK_PARITY_REBALANCE")
+                                        logger.info(f"  📉 [{agent.agent_id}] SOLD {ticker}: -{sell_shares:.2f}sh @ ${exec_price:.2f}")
+
+                                        broker_bridge.submit_market_order(ticker, sell_shares, "SELL")
+
+                                # 3. SHORT Execution (Short Entry / Scale Up)
+                                elif target.action == "SHORT":
+                                    current_short_val = abs(min(current_pos_qty, 0.0)) * raw_price
+                                    short_delta = target_val - current_short_val
+                                    if short_delta > 50.0:
+                                        margin_info = risk_engine.evaluate_margin_health(agent.cash, agent.holdings, prices)
+                                        if margin_info["free_margin"] >= short_delta:
+                                            approx_shares = short_delta / raw_price
+                                            exec_price = risk_engine.calculate_execution_price(raw_price, approx_shares, adv, "SHORT")
+                                            actual_short_shares = short_delta / exec_price
+
+                                            old_short_shares = abs(min(current_pos_qty, 0.0))
+                                            old_entry = agent.entry_prices.get(ticker, exec_price)
+                                            new_short_shares = old_short_shares + actual_short_shares
+                                            weighted_entry = ((old_short_shares * old_entry) + (actual_short_shares * exec_price)) / new_short_shares
+
+                                            agent.holdings[ticker] = -new_short_shares  # Negative quantity
+                                            agent.entry_prices[ticker] = weighted_entry
+                                            agent.cash += actual_short_shares * exec_price  # Add short sale proceeds
+
+                                            db.update_agent_cash(agent.agent_id, agent.cash)
+                                            db.update_agent_holding(agent.agent_id, ticker, -new_short_shares, weighted_entry)
+                                            db.log_trade(agent.agent_id, ticker, "SHORT", actual_short_shares, exec_price, effective_alloc, reason="RISK_PARITY_SHORT")
+                                            logger.info(f"  📉 [{agent.agent_id}] SHORTED {ticker}: -{actual_short_shares:.2f}sh @ ${exec_price:.2f}")
+
+                                            broker_bridge.submit_market_order(ticker, actual_short_shares, "SHORT")
 
                                 # 4. COVER Execution (Short Reduction / Exit)
                                 elif target.action == "COVER" and current_pos_qty < 0:
                                     current_short_shares = abs(current_pos_qty)
-                                    cover_shares = min(abs(delta) / raw_price, current_short_shares) if delta < -50.0 else current_short_shares
+                                    current_short_val = current_short_shares * raw_price
+                                    short_delta = target_val - current_short_val
+                                    cover_shares = min(abs(short_delta) / raw_price, current_short_shares) if short_delta < -50.0 else current_short_shares
                                     exec_price = risk_engine.calculate_execution_price(raw_price, cover_shares, adv, "COVER")
                                     cost = cover_shares * exec_price
 
