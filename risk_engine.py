@@ -8,22 +8,33 @@ class AdvancedRiskEngine:
         self.base_spread = base_spread              # 0.01% Base Spread
         self.impact_gamma = impact_gamma            # Market impact coefficient
 
-    def calculate_regime_scaler(self, spy_returns: pd.Series) -> float:
+    def calculate_regime_scaler(self, spy_returns: pd.Series, spy_prices: pd.Series = None) -> float:
         """
-        Dynamic Volatility Regime Scaling.
-        Calculates annualized volatility of SPY and returns exposure scaling factor [0.1, 1.0].
+        Computes the market regime multiplier.
+        Dampens portfolio leverage during high volatility or when SPY breaks below
+        its 200-period Simple Moving Average (Macro Trend Guard).
         """
-        if len(spy_returns) < 14:
-            return 1.0
-        
-        # Annualized Volatility calculation
-        annual_vol = float(spy_returns.tail(20).std() * math.sqrt(252))
-        if annual_vol <= 0 or np.isnan(annual_vol):
+        if len(spy_returns) < 5:
             return 1.0
 
-        # Scale capital exposure downwards if market volatility spikes above target
-        scaling_factor = self.target_volatility / annual_vol
-        return float(np.clip(scaling_factor, 0.20, 1.0))
+        annualized_vol = spy_returns.std() * np.sqrt(252 * 26)  # ~15m interval scaling
+        if annualized_vol <= 0:
+            scaler = 1.0
+        else:
+            scaler = self.target_volatility / max(annualized_vol, 0.05)
+
+        # Macro Trend Guard: Cut risk target by 50% if SPY trades below its 200-period SMA
+        if spy_prices is not None and len(spy_prices) >= 200:
+            sma_200 = spy_prices.rolling(window=200).mean().iloc[-1]
+            current_spy = spy_prices.iloc[-1]
+            if current_spy < sma_200:
+                scaler *= 0.5
+                logger.warning(
+                    f"📉 MACRO TREND GUARD TRIGGERED: SPY (${current_spy:.2f}) < 200 SMA (${sma_200:.2f}). "
+                    f"Scaling risk target to {scaler:.2f}x"
+                )
+
+        return float(np.clip(scaler, 0.25, 1.5))
 
     def calculate_execution_price(self, mid_price: float, shares: float, adv: float, action: str) -> float:
         """
