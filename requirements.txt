@@ -1,29 +1,30 @@
 # API & Network Clients
-groq==0.4.1
-pydantic==2.6.4
-httpx==0.27.0
-requests>=2.31.0
-redis==5.0.3
-alpaca-py==0.17.0
-feedparser==6.0.12
-python-dotenv==1.0.1
-websockets>=11.0.3,<12.0.0
-sseclient-py>=1.7.2
-msgpack>=1.0.3
+groq>=0.9.0
+pydantic>=2.7.0
+httpx>=0.27.0
+requests>=2.32.0
+redis>=5.0.0
+alpaca-py>=0.25.0
+feedparser>=6.0.11
+python-dotenv>=1.0.1
+websockets>=13.0
+sseclient-py>=1.8.0
+msgpack>=1.0.8
 
 # Quantitative & Financial Math Engine
-pandas>=2.0.0
-numpy>=1.24.0
-scipy>=1.10.0
-yfinance==0.2.54
+pandas>=2.2.0
+numpy>=2.0.0
+scipy>=1.13.0
+yfinance>=0.2.50
+curl-cffi>=0.7.0
 
 # Database & Telemetry Ledger
-psycopg[binary,pool]>=3.1.0
-sqlalchemy>=2.0.0
+psycopg[binary,pool]>=3.2.0
+sqlalchemy>=2.0.30
 
 # UI Terminal & Analytics Dashboard
-streamlit>=1.30.0
-plotly>=5.18.0
+streamlit>=1.35.0
+plotly>=5.22.0
 
 # Testing Suite
-pytest>=8.0.0
+pytest>=8.2.0
