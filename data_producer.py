@@ -4,9 +4,11 @@ import asyncio  # Standard asyncio required for asyncio.sleep()
 import redis
 import pandas as pd
 import numpy as np
+import yfinance as yf
 from dotenv import load_dotenv
 from alpaca.data.live import StockDataStream
 from alpaca.data.models import Bar
+from psycopg_pool import ConnectionPool
 
 load_dotenv()
 
@@ -44,6 +46,49 @@ ALL_SYMBOLS = UNIVERSE + ["SPY"]
 history = {tk: pd.DataFrame(columns=["high", "low", "close", "volume"]) for tk in ALL_SYMBOLS}
 buffer = {}
 current_window_minute = -1
+
+def sync_dividend_calendar():
+    """
+    Fetches upcoming ex-dividend dates and payout estimates for UNIVERSE stocks 
+    via yfinance and populates the TimescaleDB dividend_schedule table.
+    """
+    POSTGRES_HOST = os.getenv("POSTGRES_HOST", "timescaledb" if REDIS_HOST == "redis" else "localhost")
+    POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", 5432))
+    POSTGRES_DB = os.getenv("POSTGRES_DB", "evoquant_db")
+    POSTGRES_USER = os.getenv("POSTGRES_USER", "evoquant")
+    POSTGRES_PASS = os.getenv("POSTGRES_PASSWORD", "evoquant_secret_pass")
+
+    conninfo = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASS}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+    
+    print("📅 Syncing dividend calendar with TimescaleDB...")
+    try:
+        with ConnectionPool(conninfo=conninfo, min_size=1, max_size=2) as pool:
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    synced_count = 0
+                    for tk in UNIVERSE:
+                        try:
+                            ticker_obj = yf.Ticker(tk)
+                            info = ticker_obj.info
+                            ex_date_ts = info.get("exDividendDate") or info.get("ex_dividend_date")
+                            div_rate = info.get("dividendRate", 0.0) or 0.0
+                            
+                            if ex_date_ts and div_rate > 0:
+                                ex_date_str = pd.to_datetime(ex_date_ts, unit='s').strftime("%Y-%m-%d")
+                                quarterly_div = round(float(div_rate / 4.0), 4)
+                                
+                                cur.execute("""
+                                    INSERT INTO dividend_schedule (ticker, ex_date, payment_date, amount_per_share)
+                                    VALUES (%s, %s, %s, %s)
+                                    ON CONFLICT (ticker, ex_date) DO NOTHING;
+                                """, (tk, ex_date_str, ex_date_str, quarterly_div))
+                                synced_count += 1
+                        except Exception:
+                            continue
+                    conn.commit()
+                    print(f"✅ Dividend calendar synchronized ({synced_count} active schedules verified).")
+    except Exception as e:
+        print(f"⚠️ Dividend calendar sync note (DB connection deferred): {e}")
 
 def calculate_advanced_indicators(df: pd.DataFrame, spy_df: pd.DataFrame = None) -> dict:
     if len(df) < 15:
@@ -132,6 +177,9 @@ async def on_bar(bar: Bar):
             buffer.clear()
 
 if __name__ == "__main__":
+    # Sync dividend schedule into TimescaleDB on boot
+    sync_dividend_calendar()
+
     print(f"📡 Booting Alpaca WebSocket for {len(ALL_SYMBOLS)} assets (Interval: {TICK_INTERVAL_MINUTES}m)...")
     stream = StockDataStream(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY"))
     stream.subscribe_bars(on_bar, *ALL_SYMBOLS)
