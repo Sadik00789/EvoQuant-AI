@@ -33,15 +33,24 @@ class AlpacaExecutionBridge:
     def is_active(self) -> bool:
         return bool(self.api_key and self.secret_key)
 
-    def submit_market_order(self, symbol: str, qty: float, side: str) -> Optional[Dict[str, Any]]:
+    def submit_market_order(self, symbol: str, qty: float, action: str) -> Optional[Dict[str, Any]]:
         if not self.is_active() or qty <= 0:
             return None
-            
+
+        # Map agent actions to Alpaca REST API order side
+        side_map = {
+            "BUY": "buy",
+            "COVER": "buy",
+            "SELL": "sell",
+            "SHORT": "sell"
+        }
+        side = side_map.get(action.upper(), action.lower())
+
         url = f"{self.base_url}/v2/orders"
         payload = {
             "symbol": symbol.upper(),
             "qty": str(round(qty, 4)),
-            "side": side.lower(),
+            "side": side,
             "type": "market",
             "time_in_force": "gtc"
         }
@@ -49,10 +58,10 @@ class AlpacaExecutionBridge:
             resp = requests.post(url, json=payload, headers=self.headers, timeout=10.0)
             resp.raise_for_status()
             order_data = resp.json()
-            logger.info(f"⚡ [ALPACA BROKER EXECUTED] {side.upper()} {qty:.2f} {symbol} | Order ID: {order_data.get('id')}")
+            logger.info(f"⚡ [ALPACA BROKER EXECUTED] {action.upper()} {qty:.2f} {symbol} | Order ID: {order_data.get('id')}")
             return order_data
         except Exception as e:
-            logger.error(f"❌ [ALPACA BROKER ERROR] Failed to submit order for {symbol}: {e}")
+            logger.error(f"❌ [ALPACA BROKER ERROR] Failed to submit order for {symbol} ({action}): {e}")
             return None
 
 class AssetThesis(BaseModel):
@@ -79,7 +88,7 @@ class AgentDebateCase(BaseModel):
 
 class QualitativeSignal(BaseModel):
     ticker: str
-    action: Literal["BUY", "SELL", "HOLD"]
+    action: Literal["BUY", "SELL", "SHORT", "COVER", "HOLD"]
     conviction: float = Field(..., ge=0.0, le=1.0)
 
 class AgentSignalDecision(BaseModel):
@@ -88,7 +97,7 @@ class AgentSignalDecision(BaseModel):
 
 class PortfolioAllocation(BaseModel):
     ticker: str
-    action: Literal["BUY", "SELL", "HOLD"]
+    action: Literal["BUY", "SELL", "SHORT", "COVER", "HOLD"]
     allocation_pct: float
 
 class CrossAssetRiskDecision(BaseModel):
@@ -139,10 +148,10 @@ class RiskParityOptimizer:
         max_position_cap: float = 0.05
     ) -> CrossAssetRiskDecision:
         raw_decisions = {}
-        buy_candidates = {}
+        active_candidates = {}
 
         for ticker, sig in signals.signals.items():
-            if sig.action == "BUY" and sig.conviction > 0.3:
+            if sig.action in ("BUY", "SHORT") and sig.conviction > 0.3:
                 atr = 1.0
                 if isinstance(theses, dict) and ticker in theses:
                     item = theses[ticker]
@@ -154,16 +163,16 @@ class RiskParityOptimizer:
                     atr = 1.0
 
                 risk_score = sig.conviction / max(atr, 0.1)
-                buy_candidates[ticker] = risk_score
+                active_candidates[ticker] = (sig.action, risk_score)
             else:
                 raw_decisions[ticker] = PortfolioAllocation(ticker=ticker, action=sig.action, allocation_pct=0.0)
 
-        total_risk_score = sum(buy_candidates.values())
+        total_risk_score = sum(score for _, score in active_candidates.values())
         if total_risk_score > 0:
-            for ticker, score in buy_candidates.items():
+            for ticker, (action, score) in active_candidates.items():
                 unclamped_weight = score / total_risk_score
                 clamped_weight = round(float(min(max_position_cap, unclamped_weight)), 4)
-                raw_decisions[ticker] = PortfolioAllocation(ticker=ticker, action="BUY", allocation_pct=clamped_weight)
+                raw_decisions[ticker] = PortfolioAllocation(ticker=ticker, action=action, allocation_pct=clamped_weight)
 
         return CrossAssetRiskDecision(decisions=raw_decisions, macro_reasoning=signals.macro_reasoning)
 
@@ -344,7 +353,6 @@ class DualModelTradingSwarm:
 
         bull_res, bear_res = await asyncio.gather(bull_task, bear_task, return_exceptions=True)
 
-        # Fallback handling if one researcher encounters API failures
         if isinstance(bull_res, Exception):
             logger.warning(f"⚠️ Bull Researcher failed: {bull_res}. Falling back to default bullish case.")
             bull_case_data = "Bullish case unavailable due to API rate limit."
@@ -368,7 +376,8 @@ class DualModelTradingSwarm:
             f"{custom_persona}\n"
             "ROLE: Chief Investment Officer / Impartial Judge.\n"
             "TASK: Evaluate the Bull Case and Bear Case side-by-side against market data. Detect bull traps, "
-            "cross-examine arguments, weigh data points, and issue final trade actions (BUY/SELL/HOLD) with conviction scores (0.0 to 1.0).\n"
+            "cross-examine arguments, weigh data points, and issue final trade actions with conviction scores (0.0 to 1.0).\n"
+            "Allowed Actions: BUY (long), SELL (close long), SHORT (open short), COVER (close short), HOLD.\n"
             'Format MUST be JSON: {"signals": {"TICKER": {"ticker": "TICKER", "action": "BUY", "conviction": 0.8}}, "macro_reasoning": "Synthesized reasoning"}'
         )
 
@@ -400,7 +409,7 @@ class DualModelTradingSwarm:
             current_equity = round(agent.cash + asset_val, 2)
             port_state = {
                 "cash": round(agent.cash, 2),
-                "holdings": {k: round(v, 4) for k, v in agent.holdings.items() if v > 0},
+                "holdings": {k: round(v, 4) for k, v in agent.holdings.items() if v != 0},
                 "equity": current_equity
             }
             tasks.append(self.execute_agent_strategy(client, shared_thesis, port_state, agent.persona_prompt))
@@ -493,6 +502,31 @@ class CrossAssetPortfolioManager:
                 """)
 
                 cur.execute("""
+                    CREATE TABLE IF NOT EXISTS dividend_schedule (
+                        id BIGSERIAL PRIMARY KEY,
+                        ticker VARCHAR(16) NOT NULL,
+                        ex_date DATE NOT NULL,
+                        payment_date DATE NOT NULL,
+                        amount_per_share DOUBLE PRECISION NOT NULL,
+                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        CONSTRAINT unique_ticker_ex_date UNIQUE (ticker, ex_date)
+                    );
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS dividend_logs (
+                        id BIGSERIAL PRIMARY KEY,
+                        timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        agent_id VARCHAR(64) NOT NULL,
+                        ticker VARCHAR(16) NOT NULL,
+                        action VARCHAR(16) NOT NULL,
+                        shares DOUBLE PRECISION NOT NULL,
+                        amount_per_share DOUBLE PRECISION NOT NULL,
+                        total_amount DOUBLE PRECISION NOT NULL
+                    );
+                """)
+
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS macro_regime (
                         id BIGSERIAL PRIMARY KEY,
                         timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
@@ -523,6 +557,11 @@ class CrossAssetPortfolioManager:
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_snapshots_agent_time 
                     ON agent_snapshots (agent_id, timestamp DESC);
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_div_schedule_ex_date 
+                    ON dividend_schedule (ex_date);
                 """)
                 
                 conn.commit()
@@ -556,11 +595,12 @@ class CrossAssetPortfolioManager:
                 conn.commit()
 
     def get_agent_holdings(self, agent_id: str) -> Dict[str, float]:
+        """Fetches active non-zero holdings (Long > 0, Short < 0) for an agent."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT ticker, amount FROM agent_holdings 
-                    WHERE agent_id = %s AND amount > 0;
+                    WHERE agent_id = %s AND amount != 0;
                 """, (agent_id,))
                 rows = cur.fetchall()
                 return {row['ticker']: float(row['amount']) for row in rows}
@@ -578,6 +618,66 @@ class CrossAssetPortfolioManager:
                         updated_at = CURRENT_TIMESTAMP;
                 """, (agent_id, ticker, amount, entry_price))
                 conn.commit()
+
+    def process_daily_dividends(self, current_date_str: str):
+        """Scans dividend_schedule for ex-dates matching current_date_str and applies payouts/debits."""
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT ticker, amount_per_share 
+                    FROM dividend_schedule 
+                    WHERE ex_date = %s;
+                """, (current_date_str,))
+                events = cur.fetchall()
+
+                for event in events:
+                    ticker = event['ticker']
+                    div_per_share = float(event['amount_per_share'])
+
+                    cur.execute("""
+                        SELECT agent_id, amount FROM agent_holdings 
+                        WHERE ticker = %s AND amount != 0;
+                    """, (ticker,))
+                    active_positions = cur.fetchall()
+
+                    for pos in active_positions:
+                        agent_id = pos['agent_id']
+                        shares = float(pos['amount'])
+                        total_payout = abs(shares) * div_per_share
+
+                        if shares > 0:
+                            action = "DIVIDEND_CREDIT"
+                            cur.execute("UPDATE agent_accounts SET cash = cash + %s WHERE agent_id = %s;", (total_payout, agent_id))
+                        else:
+                            action = "DIVIDEND_DEBIT"
+                            total_payout = -total_payout
+                            cur.execute("UPDATE agent_accounts SET cash = cash - %s WHERE agent_id = %s;", (abs(total_payout), agent_id))
+
+                        cur.execute("""
+                            INSERT INTO dividend_logs (agent_id, ticker, action, shares, amount_per_share, total_amount)
+                            VALUES (%s, %s, %s, %s, %s, %s);
+                        """, (agent_id, ticker, action, abs(shares), div_per_share, total_payout))
+
+                        logger.info(f"💰 [{action}] {agent_id} | {ticker} | Shares: {shares:.2f} | Payout: ${total_payout:+.2f}")
+
+                conn.commit()
+
+    def fetch_dividend_logs(self, agent_id: str = None, limit: int = 50) -> pd.DataFrame:
+        query = "SELECT timestamp, agent_id, ticker, action, shares, amount_per_share, total_amount FROM dividend_logs"
+        if agent_id:
+            query += " WHERE agent_id = %s ORDER BY timestamp DESC LIMIT %s;"
+            return self.fetch_dataframe(query, (agent_id, limit))
+        query += " ORDER BY timestamp DESC LIMIT %s;"
+        return self.fetch_dataframe(query, (limit,))
+
+    def fetch_upcoming_dividends(self) -> pd.DataFrame:
+        query = """
+            SELECT ticker, ex_date, payment_date, amount_per_share 
+            FROM dividend_schedule 
+            WHERE ex_date >= CURRENT_DATE 
+            ORDER BY ex_date ASC;
+        """
+        return self.fetch_dataframe(query)
 
     def log_trade(self, agent_id: str, ticker: str, action: str, shares: float, price: float, pct: float, reason: str = 'ALLOCATION'):
         with self.pool.connection() as conn:
