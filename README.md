@@ -9,46 +9,46 @@
 EvoQuant-AI operates as a containerized microservice architecture using a decoupled **Producer-Consumer** pattern over Redis pub/sub messaging.
 
 ```text
-                  ┌────────────────────────┐
-                  │  Alpaca Market Streams │
-                  └───────────┬────────────┘
-                              │ WebSockets
-                              ▼
-                   ┌──────────────────────┐
-                   │  data_producer.py    │
-                   │ (Calculates RSI/MACD)│
-                   └───────────┬──────────┘
-                              │
-                              │ Redis Pub/Sub
-                              ▼
-                    ┌───────────────────┐
-                    │  evoquant_redis   │
-                    └─────────┬─────────┘
-                              │
-                              │ Market Ticks
-                              ▼
-                   ┌──────────────────────┐
-                   │  swarm_consumer.py   │
-                   │  ┌─────────────────┐ │
-                   │  │ Risk Engine     │ │
-                   │  │ Sentiment RAG   │ │
-                   │  │ 70B LLM Swarm   │ │
-                   │  └─────────────────┘ │
-                   └───────────┬──────────┘
-                              │
-                              │ ACID State & Telemetry
-                              ▼
-                  ┌────────────────────────┐
-                  │  evoquant_timescaledb  │
-                  │  (PostgreSQL + Hypert) │
-                  └───────────┬────────────┘
-                              │
-                              │ SQLAlchemy ORM
-                              ▼
-                  ┌────────────────────────┐
-                  │      dashboard.py      │
-                  │  (Streamlit UI :8501)  │
-                  └────────────────────────┘
+                 ┌────────────────────────┐
+                 │  Alpaca Market Streams │
+                 └───────────┬────────────┘
+                             │ WebSockets
+                             ▼
+                    ┌──────────────────┐
+                    │ data_producer.py │
+                    │(Calculates RSI/MA)│
+                    └────────┬─────────┘
+                             │
+                             │ Redis Pub/Sub
+                             ▼
+                    ┌──────────────────┐
+                    │  evoquant_redis  │
+                    └────────┬─────────┘
+                             │
+                             │ Market Ticks
+                             ▼
+                    ┌──────────────────┐
+                    │ swarm_consumer.py│
+                    │ ┌──────────────┐ │
+                    │ │ Risk Engine  │ │
+                    │ │ Sentiment RAG│ │
+                    │ │ Llama 3.3 70B│ │
+                    │ └──────────────┘ │
+                    └────────┬─────────┘
+                             │
+                             │ ACID State & Telemetry
+                             ▼
+                 ┌────────────────────────┐
+                 │  evoquant_timescaledb  │
+                 │ (PostgreSQL + Hypert)  │
+                 └───────────┬────────────┘
+                             │
+                             │ SQLAlchemy ORM
+                             ▼
+                 ┌────────────────────────┐
+                 │      dashboard.py      │
+                 │  (Streamlit UI :8501)  │
+                 └────────────────────────┘
 ```
 
 ---
@@ -59,7 +59,7 @@ EvoQuant-AI operates as a containerized microservice architecture using a decoup
 |---|---|---|
 | Market Data Producer | `evoquant_producer` | Establishes WebSocket channels to Alpaca, calculates real-time technical indicators (RSI, MACD, ATR, relative strength), and publishes 15-minute bar matrices to Redis. |
 | Message Broker | `evoquant_redis` | In-memory Redis instance serving as the asynchronous pub/sub pipeline between the data engine and trade execution layer. |
-| Swarm Orchestrator | `evoquant_consumer` | Consumes bar events, evaluates macroeconomic news sentiment, triggers multi-provider 70B LLM fallback chains (Groq, OpenRouter, SambaNova, GitHub Models), executes risk parity scaling, and commits trades. |
+| Swarm Orchestrator | `evoquant_consumer` | Consumes bar events via a resilient auto-reconnect loop, evaluates macro news sentiment, triggers parallel asynchronous multi-provider Llama 3.3 70B fallback chains (Groq, OpenRouter, SambaNova, GitHub Models), executes risk parity scaling with the SPY 200 SMA Macro Trend Guard, and dispatches live paper orders to Alpaca. |
 | Time-Series Storage | `evoquant_timescaledb` | PostgreSQL 16 database powered by TimescaleDB hypertables for persistent storage of trade history, agent equity telemetry, and macro regime snapshots. |
 | Analytics Dashboard | `evoquant_dashboard` | Dark-themed Streamlit analytics terminal providing real-time portfolio heatmaps, Darwinian agent leaderboards, and execution risk audit trails. |
 
@@ -71,8 +71,8 @@ EvoQuant-AI operates as a containerized microservice architecture using a decoup
 - **Containerization:** Docker & Docker Compose V2
 - **Storage Layer:** PostgreSQL 16 / TimescaleDB (psycopg3, SQLAlchemy)
 - **In-Memory Messaging:** Redis (alpine)
-- **Quantitative Engine:** Pandas, NumPy, SciPy, Alpaca-Py
-- **LLM Orchestration:** Groq, OpenRouter, SambaNova, GitHub Models API
+- **Quantitative Engine:** Pandas, NumPy, SciPy, Alpaca-Py, Requests
+- **LLM Orchestration:** Llama 3.3 70B across Groq, OpenRouter, SambaNova, and GitHub Models APIs
 - **Visualization:** Streamlit, Plotly
 
 ---
@@ -82,22 +82,22 @@ EvoQuant-AI operates as a containerized microservice architecture using a decoup
 ```text
 EvoQuant-AI/
 ├── .streamlit/
-│   └── config.toml           # Streamlit dark theme settings
+│   └── config.toml             # Streamlit dark theme settings
 ├── tests/
-│   └── test_swarm.py         # Unit & integration test suite
-├── .env.example               # Environment variables template
-├── .gitignore                 # Git exclusions (blocks .env and cache)
-├── Dockerfile                  # Multi-stage container build definition
-├── docker-compose.yml          # Orchestration spec for all 5 services
-├── requirements.txt            # Python dependency manifests
-├── data_producer.py            # Market WebSocket stream ingestion
-├── swarm_consumer.py           # Swarm trade decision & logging worker
-├── engine.py                   # Cross-asset portfolio manager & DB connector
-├── evolution_engine.py         # Darwinian strategy evolution & tournament logic
-├── risk_engine.py              # Convex risk parity & slippage calculator
-├── sentiment_agent.py          # RSS/News RAG sentiment evaluation agent
-├── dashboard.py                # Streamlit frontend terminal
-└── README.md                   # Project documentation
+│   └── test_swarm.py           # Unit & integration test suite
+├── .env.example                 # Environment variables template
+├── .gitignore                   # Git exclusions (blocks .env and cache)
+├── Dockerfile                   # Multi-stage container build definition
+├── docker-compose.yml           # Orchestration spec for all 5 services
+├── requirements.txt             # Python dependency manifests
+├── data_producer.py             # Market WebSocket stream ingestion
+├── swarm_consumer.py            # Swarm trade decision & logging worker
+├── engine.py                    # Cross-asset portfolio manager, Alpaca bridge & DB connector
+├── evolution_engine.py          # Darwinian strategy evolution & tournament logic
+├── risk_engine.py               # Convex risk parity, downside semi-variance & macro guard
+├── sentiment_agent.py           # RSS/News RAG sentiment evaluation agent
+├── dashboard.py                 # Streamlit frontend terminal
+└── README.md                    # Project documentation
 ```
 
 ---
@@ -134,11 +134,12 @@ POSTGRES_USER=evoquant
 POSTGRES_PASSWORD=your_secure_password
 POSTGRES_DB=evoquant_db
 
-# Market Data API
+# Market Data API & Alpaca Paper Trading Bridge
 ALPACA_API_KEY=your_alpaca_api_key
 ALPACA_SECRET_KEY=your_alpaca_secret_key
+ALPACA_BASE_URL=https://paper-api.alpaca.markets
 
-# LLM Swarm API Keys (Multi-Provider Fallback)
+# LLM Swarm API Keys (Multi-Provider Llama 3.3 70B Fallback)
 GROQ_API_KEY=your_groq_api_key
 OPENROUTER_API_KEY=your_openrouter_api_key
 SAMBANOVA_API_KEY=your_sambanova_api_key
@@ -212,7 +213,12 @@ docker compose down -v
 
 Distributed under the MIT License. See `LICENSE` for more information.
 
+---
 
-<img width="1916" height="787" alt="Screenshot 2026-07-29 034740" src="https://github.com/user-attachments/assets/a59cf0bd-f515-4bcc-acba-4f8ae8edc69e" />
-<img width="1522" height="652" alt="Screenshot 2026-07-29 034810" src="https://github.com/user-attachments/assets/d244ba83-6b72-4307-81c3-70ea9a1a72b3" />
-<img width="1535" height="781" alt="Screenshot 2026-07-29 034829" src="https://github.com/user-attachments/assets/d4724d55-5348-4841-ba7d-cf577c922ebe" />
+## 📸 Screenshots
+
+<img width="1916" height="787" alt="EvoQuant-AI Dashboard Screenshot 1" src="https://github.com/user-attachments/assets/a59cf0bd-f515-4bcc-acba-4f8ae8edc69e" />
+
+<img width="1522" height="652" alt="EvoQuant-AI Dashboard Screenshot 2" src="https://github.com/user-attachments/assets/d244ba83-6b72-4307-81c3-70ea9a1a72b3" />
+
+<img width="1535" height="781" alt="EvoQuant-AI Dashboard Screenshot 3" src="https://github.com/user-attachments/assets/d4724d55-5348-4841-ba7d-cf577c922ebe" />
