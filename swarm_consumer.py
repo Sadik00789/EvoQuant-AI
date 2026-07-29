@@ -56,7 +56,7 @@ async def run_consumer():
 
     # Initial Macro Sentiment Fetch & Database Log
     try:
-        macro_news = sentiment_agent.analyze_macro_sentiment()
+        macro_news = await sentiment_agent.analyze_macro_sentiment_async()
         macro_multiplier = macro_news.get("risk_multiplier", 1.0)
         db.log_macro_regime(
             sentiment_score=macro_news.get("sentiment_score", 0.0),
@@ -95,7 +95,7 @@ async def run_consumer():
                         # Refresh news sentiment every 8 market ticks (~2 hours)
                         if tick_counter % 8 == 0:
                             try:
-                                macro_news = sentiment_agent.analyze_macro_sentiment()
+                                macro_news = await sentiment_agent.analyze_macro_sentiment_async()
                                 macro_multiplier = macro_news.get("risk_multiplier", 1.0)
                                 db.log_macro_regime(
                                     sentiment_score=macro_news.get("sentiment_score", 0.0),
