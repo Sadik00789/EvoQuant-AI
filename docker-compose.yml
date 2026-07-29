@@ -6,6 +6,11 @@ services:
     ports:
       - "6379:6379"
     restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   timescaledb:
     platform: linux/amd64
@@ -25,6 +30,11 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   producer:
     build: .
@@ -37,6 +47,11 @@ services:
     depends_on:
       - redis
     restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   consumer:
     build: .
@@ -60,6 +75,11 @@ services:
       timescaledb:
         condition: service_healthy
     restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   dashboard:
     build: .
@@ -77,6 +97,11 @@ services:
       timescaledb:
         condition: service_healthy
     restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   pgdata:
