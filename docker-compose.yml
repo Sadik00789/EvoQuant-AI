@@ -41,6 +41,7 @@ services:
     container_name: evoquant_producer
     command: python data_producer.py
     environment:
+      - PYTHONUNBUFFERED=1
       - REDIS_HOST=redis
       - POSTGRES_HOST=timescaledb
       - POSTGRES_PORT=5432
@@ -66,12 +67,16 @@ services:
     container_name: evoquant_consumer
     command: python swarm_consumer.py
     environment:
+      - PYTHONUNBUFFERED=1
       - REDIS_HOST=redis
       - POSTGRES_HOST=timescaledb
       - POSTGRES_PORT=5432
       - POSTGRES_DB=${POSTGRES_DB:-evoquant_db}
       - POSTGRES_USER=${POSTGRES_USER:-evoquant}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-evoquant_secret_pass}
+      - ALPACA_API_KEY=${ALPACA_API_KEY}
+      - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+      - ALPACA_BASE_URL=${ALPACA_BASE_URL:-https://paper-api.alpaca.markets}
       # 70B Provider Fallback Keys
       - GROQ_API_KEY=${GROQ_API_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
@@ -96,6 +101,7 @@ services:
     ports:
       - "8501:8501"
     environment:
+      - PYTHONUNBUFFERED=1
       - POSTGRES_HOST=timescaledb
       - POSTGRES_PORT=5432
       - POSTGRES_DB=${POSTGRES_DB:-evoquant_db}
