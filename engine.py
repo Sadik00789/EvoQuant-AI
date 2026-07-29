@@ -66,6 +66,17 @@ class MultiTechnicalThesis(BaseModel):
     analyses: Dict[str, AssetThesis]
     correlation_risk: str
 
+# --- Adversarial Debate Schemas ---
+class DebateArgument(BaseModel):
+    ticker: str
+    thesis_summary: str
+    key_factors: List[str]
+    strength_score: float = Field(..., ge=0.0, le=1.0)
+
+class AgentDebateCase(BaseModel):
+    arguments: Dict[str, DebateArgument]
+    overall_perspective: str
+
 class QualitativeSignal(BaseModel):
     ticker: str
     action: Literal["BUY", "SELL", "HOLD"]
@@ -157,7 +168,7 @@ class RiskParityOptimizer:
         return CrossAssetRiskDecision(decisions=raw_decisions, macro_reasoning=signals.macro_reasoning)
 
 # ==========================================
-# 3. HYBRID AI SWARM ENGINE
+# 3. HYBRID AI SWARM ENGINE WITH DEBATE LOOP
 # ==========================================
 
 class DualModelTradingSwarm:
@@ -190,39 +201,15 @@ class DualModelTradingSwarm:
 
         return filtered_thesis
 
-    async def execute_agent_strategy(
-        self, 
-        client: httpx.AsyncClient, 
-        thesis: Union[dict, MultiTechnicalThesis], 
-        portfolio_state: dict, 
-        custom_persona: str
-    ) -> CrossAssetRiskDecision:
-        """Executes 70B strategy across a multi-provider free 70B fallback chain."""
-        if isinstance(thesis, dict):
-            compact_theses = {
-                tk: f"P:{data.get('price')}|RSI:{data.get('rsi')}|MACD:{data.get('macd_hist')}|RS:{data.get('rel_strength')}|ATR:{data.get('atr')}"
-                for tk, data in thesis.items()
-            }
-        elif hasattr(thesis, "analyses"):
-            compact_theses = {
-                tk: f"{a.market_regime}|Conf:{a.confidence_score}|ATR:{a.atr}"
-                for tk, a in thesis.analyses.items()
-            }
-        else:
-            compact_theses = {}
-
-        strategy_input = json.dumps({"theses": compact_theses, "liquidity": portfolio_state})
-        
-        sys_prompt = (
-            f"{custom_persona}\n"
-            "Analyze theses and return trade actions (BUY/SELL/HOLD) with conviction (0.0 to 1.0).\n"
-            'Format MUST be JSON: {"signals": {"TICKER": {"ticker": "TICKER", "action": "BUY", "conviction": 0.8}}, "macro_reasoning": "reason"}'
-        )
-        base_messages = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": strategy_input}
-        ]
-
+    async def _call_llm_provider_chain(
+        self,
+        client: httpx.AsyncClient,
+        sys_prompt: str,
+        user_input: str,
+        model_class: Any,
+        role_tag: str = "LLM"
+    ) -> Any:
+        """Helper executing multi-provider LLM calls with automated schema validation."""
         providers = [
             {
                 "name": "Groq",
@@ -254,6 +241,11 @@ class DualModelTradingSwarm:
             }
         ]
 
+        base_messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_input}
+        ]
+
         for p in providers:
             if not p["key"]:
                 continue
@@ -269,33 +261,125 @@ class DualModelTradingSwarm:
                 "model": p["model"],
                 "messages": list(base_messages),
                 "temperature": 0.1,
-                "max_tokens": 500,
+                "max_tokens": 600,
                 "response_format": {"type": "json_object"}
             }
 
             try:
                 resp = await client.post(p["url"], json=payload, headers=headers, timeout=12.0)
-                
                 if resp.status_code in (429, 404):
-                    logger.warning(f"⚠️ [{p['name']}] Status {resp.status_code}. Routing to next provider...")
+                    logger.warning(f"⚠️ [{p['name']} - {role_tag}] Status {resp.status_code}. Routing to next provider...")
                     continue
 
                 resp.raise_for_status()
-                qualitative_signals = AgentSignalDecision.model_validate_json(
-                    resp.json()['choices'][0]['message']['content']
-                )
-                
-                logger.info(f"✅ Strategy evaluated successfully via [{p['name']}]")
-                return RiskParityOptimizer.optimize_allocations(qualitative_signals, thesis)
+                content = resp.json()['choices'][0]['message']['content']
+                validated_output = model_class.model_validate_json(content)
+                logger.info(f"✅ [{role_tag}] Evaluated successfully via [{p['name']}]")
+                return validated_output
 
-            except ValidationError:
-                logger.warning(f"Validation error on [{p['name']}]. Trying next provider...")
+            except ValidationError as ve:
+                logger.warning(f"⚠️ Validation error on [{p['name']} - {role_tag}]: {ve}. Trying next...")
                 continue
             except Exception as e:
-                logger.warning(f"⚠️ [{p['name']}] Provider failed: {e}. Trying next provider...")
+                logger.warning(f"⚠️ [{p['name']} - {role_tag}] Provider failed: {e}. Trying next...")
                 continue
 
-        raise RuntimeError("All free 70B providers failed or rate-limited.")
+        raise RuntimeError(f"All free 70B providers failed or rate-limited for [{role_tag}].")
+
+    async def _generate_bull_case(
+        self, client: httpx.AsyncClient, strategy_input: str, persona: str
+    ) -> AgentDebateCase:
+        sys_prompt = (
+            f"{persona}\n"
+            "ROLE: Bull Researcher Agent.\n"
+            "TASK: Build the strongest possible BULLISH thesis for each asset. Focus on asymmetric upside, "
+            "MACD bullish momentum, oversold RSI bounces, key support levels, and positive relative strength.\n"
+            'Format MUST be JSON matching schema: {"arguments": {"TICKER": {"ticker": "TICKER", "thesis_summary": "summary", "key_factors": ["f1"], "strength_score": 0.85}}, "overall_perspective": "perspective"}'
+        )
+        return await self._call_llm_provider_chain(client, sys_prompt, strategy_input, AgentDebateCase, "BullResearcher")
+
+    async def _generate_bear_case(
+        self, client: httpx.AsyncClient, strategy_input: str, persona: str
+    ) -> AgentDebateCase:
+        sys_prompt = (
+            f"{persona}\n"
+            "ROLE: Bear Researcher Agent (Adversary).\n"
+            "TASK: Hunt for flaws, Bull Traps, weak breakout volume, RSI bearish divergence, overhead resistance, "
+            "and broader macro tail-risk for each asset. Build an aggressive BEARISH counter-case.\n"
+            'Format MUST be JSON matching schema: {"arguments": {"TICKER": {"ticker": "TICKER", "thesis_summary": "summary", "key_factors": ["f1"], "strength_score": 0.75}}, "overall_perspective": "perspective"}'
+        )
+        return await self._call_llm_provider_chain(client, sys_prompt, strategy_input, AgentDebateCase, "BearResearcher")
+
+    async def execute_agent_strategy(
+        self, 
+        client: httpx.AsyncClient, 
+        thesis: Union[dict, MultiTechnicalThesis], 
+        portfolio_state: dict, 
+        custom_persona: str
+    ) -> CrossAssetRiskDecision:
+        """
+        Executes Adversarial Debate Loop:
+        1. Runs Bull & Bear Research agents in PARALLEL via asyncio.gather.
+        2. Passes both cases to Synthesizer/Judge agent to filter out confirmation bias.
+        3. Optimizes allocations using Inverse-Volatility Risk Parity.
+        """
+        if isinstance(thesis, dict):
+            compact_theses = {
+                tk: f"P:{data.get('price')}|RSI:{data.get('rsi')}|MACD:{data.get('macd_hist')}|RS:{data.get('rel_strength')}|ATR:{data.get('atr')}"
+                for tk, data in thesis.items()
+            }
+        elif hasattr(thesis, "analyses"):
+            compact_theses = {
+                tk: f"{a.market_regime}|Conf:{a.confidence_score}|ATR:{a.atr}"
+                for tk, a in thesis.analyses.items()
+            }
+        else:
+            compact_theses = {}
+
+        strategy_input = json.dumps({"theses": compact_theses, "liquidity": portfolio_state})
+
+        # --- STEP 1: PARALLEL ADVERSARIAL DEBATE GENERATION ---
+        bull_task = self._generate_bull_case(client, strategy_input, custom_persona)
+        bear_task = self._generate_bear_case(client, strategy_input, custom_persona)
+
+        bull_res, bear_res = await asyncio.gather(bull_task, bear_task, return_exceptions=True)
+
+        # Fallback handling if one researcher encounters API failures
+        if isinstance(bull_res, Exception):
+            logger.warning(f"⚠️ Bull Researcher failed: {bull_res}. Falling back to default bullish case.")
+            bull_case_data = "Bullish case unavailable due to API rate limit."
+        else:
+            bull_case_data = bull_res.model_dump_json()
+
+        if isinstance(bear_res, Exception):
+            logger.warning(f"⚠️ Bear Researcher failed: {bear_res}. Falling back to default bearish case.")
+            bear_case_data = "Bearish case unavailable due to API rate limit."
+        else:
+            bear_case_data = bear_res.model_dump_json()
+
+        # --- STEP 2: SYNTHESIZER / PORTFOLIO MANAGER JUDGMENT ---
+        synth_input = json.dumps({
+            "market_data_and_liquidity": strategy_input,
+            "bull_researcher_case": bull_case_data,
+            "bear_researcher_case": bear_case_data
+        })
+
+        synth_sys_prompt = (
+            f"{custom_persona}\n"
+            "ROLE: Chief Investment Officer / Impartial Judge.\n"
+            "TASK: Evaluate the Bull Case and Bear Case side-by-side against market data. Detect bull traps, "
+            "cross-examine arguments, weigh data points, and issue final trade actions (BUY/SELL/HOLD) with conviction scores (0.0 to 1.0).\n"
+            'Format MUST be JSON: {"signals": {"TICKER": {"ticker": "TICKER", "action": "BUY", "conviction": 0.8}}, "macro_reasoning": "Synthesized reasoning"}'
+        )
+
+        try:
+            qualitative_signals = await self._call_llm_provider_chain(
+                client, synth_sys_prompt, synth_input, AgentSignalDecision, "SynthesizerJudge"
+            )
+            return RiskParityOptimizer.optimize_allocations(qualitative_signals, thesis)
+        except Exception as e:
+            logger.error(f"❌ Synthesizer Judge failed: {e}. Executing hold-safe default.")
+            return CrossAssetRiskDecision(decisions={}, macro_reasoning="Adversarial debate failed to reach consensus.")
 
     async def execute_swarm_strategies_concurrently(
         self,
