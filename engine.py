@@ -378,7 +378,11 @@ class DualModelTradingSwarm:
             "TASK: Evaluate the Bull Case and Bear Case side-by-side against market data. Detect bull traps, "
             "cross-examine arguments, weigh data points, and issue final trade actions with conviction scores (0.0 to 1.0).\n"
             "Allowed Actions: BUY (long), SELL (close long), SHORT (open short), COVER (close short), HOLD.\n"
-            'Format MUST be JSON: {"signals": {"TICKER": {"ticker": "TICKER", "action": "BUY", "conviction": 0.8}}, "macro_reasoning": "Synthesized reasoning"}'
+            "DECISION RULES FOR SHORTING:\n"
+            "- If Bear Case argument strength > Bull Case strength OR asset RSI > 68 OR relative strength vs SPY < -1.5, issue SHORT with conviction > 0.5.\n"
+            "- If holding a SHORT position and stock rebounds significantly, issue COVER.\n"
+            'Format MUST be JSON showing both BUY and SHORT setups: '
+            '{"signals": {"AAPL": {"ticker": "AAPL", "action": "BUY", "conviction": 0.8}, "NVDA": {"ticker": "NVDA", "action": "SHORT", "conviction": 0.85}}, "macro_reasoning": "Synthesized reasoning"}'
         )
 
         try:
