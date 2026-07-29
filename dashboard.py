@@ -102,7 +102,7 @@ st.markdown(f"""
         opacity: 1;
     }}
 
-    /* Metric cards - Optimized to prevent text truncation */
+    /* Metric cards */
     div[data-testid="stMetric"] {{
         background: linear-gradient(160deg, {BG_PANEL_ALT} 0%, {BG_PANEL} 100%) !important;
         border: 1px solid {BORDER} !important;
@@ -320,7 +320,7 @@ def load_trades() -> pd.DataFrame:
 def load_holdings() -> pd.DataFrame:
     try:
         engine = get_db_engine()
-        df = pd.read_sql_query("SELECT * FROM agent_holdings WHERE amount > 0", engine)
+        df = pd.read_sql_query("SELECT * FROM agent_holdings WHERE amount != 0", engine)
         return df
     except Exception:
         return pd.DataFrame()
@@ -330,6 +330,25 @@ def load_macro_regime() -> pd.DataFrame:
     try:
         engine = get_db_engine()
         return pd.read_sql_query("SELECT * FROM macro_regime ORDER BY id DESC LIMIT 1", engine)
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=5)
+def load_dividends() -> pd.DataFrame:
+    try:
+        engine = get_db_engine()
+        df = pd.read_sql_query("SELECT * FROM dividend_logs ORDER BY id DESC LIMIT 50", engine)
+        if not df.empty and "timestamp" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=10)
+def load_dividend_schedule() -> pd.DataFrame:
+    try:
+        engine = get_db_engine()
+        return pd.read_sql_query("SELECT * FROM dividend_schedule ORDER BY ex_date ASC", engine)
     except Exception:
         return pd.DataFrame()
 
@@ -380,7 +399,7 @@ st.sidebar.markdown(f"""
 st.markdown("""
 <div class="hero-banner">
     <p class="hero-title">📊 Evolutionary Swarm Analytics</p>
-    <p class="hero-sub">Real-time Darwinian performance tracking, convex risk parity allocations, and execution risk audits.</p>
+    <p class="hero-sub">Real-time Darwinian performance tracking, convex risk parity allocations, short selling, and dividend audits.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -388,6 +407,8 @@ df_snapshots = load_snapshots()
 df_trades = load_trades()
 df_holdings = load_holdings()
 df_macro = load_macro_regime()
+df_divs = load_dividends()
+df_div_sched = load_dividend_schedule()
 
 if df_snapshots.empty:
     st.warning("⏳ Waiting for `TimescaleDB` telemetry. Ensure `swarm_consumer.py` has processed at least one market tick!")
@@ -479,9 +500,9 @@ with col_leaderboard:
 
 st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
 
-# --- ROW 2: AGENT PORTFOLIO INSPECTOR ---
+# --- ROW 2: AGENT PORTFOLIO INSPECTOR (LONG & SHORT SUPPORT) ---
 st.markdown("<p class='section-title'>🔍 Agent Position & Allocation Inspector</p>", unsafe_allow_html=True)
-st.markdown("<p class='section-subtitle'>Drill into any agent's live book</p>", unsafe_allow_html=True)
+st.markdown("<p class='section-subtitle'>Drill into any agent's live book (Long & Short Positions)</p>", unsafe_allow_html=True)
 
 agents_list = latest_snapshots['agent_id'].unique().tolist()
 selected_agent = st.selectbox("Select Agent Persona to Inspect:", agents_list)
@@ -492,21 +513,21 @@ if not df_holdings.empty:
     agent_pos = df_holdings[df_holdings['agent_id'] == selected_agent].copy()
 
     if not agent_pos.empty:
-        if 'entry_price' in agent_pos.columns and 'amount' in agent_pos.columns:
-            agent_pos['pos_value'] = agent_pos['amount'] * agent_pos['entry_price']
-        else:
-            agent_pos['pos_value'] = agent_pos['amount']
+        agent_pos['position_type'] = agent_pos['amount'].apply(lambda x: "LONG" if x > 0 else "SHORT")
+        agent_pos['shares_abs'] = agent_pos['amount'].abs()
+        agent_pos['pos_value'] = agent_pos['shares_abs'] * agent_pos['entry_price']
 
     with col_positions:
         if not agent_pos.empty:
-            st.markdown(f"**Active Stock Positions for `{selected_agent}`:**")
+            st.markdown(f"**Active Positions for `{selected_agent}`:**")
             st.dataframe(
-                agent_pos[['ticker', 'amount', 'entry_price', 'pos_value']],
+                agent_pos[['ticker', 'position_type', 'shares_abs', 'entry_price', 'pos_value']],
                 column_config={
                     "ticker": st.column_config.TextColumn("Ticker"),
-                    "amount": st.column_config.NumberColumn("Shares Held", format="%.2f"),
+                    "position_type": st.column_config.TextColumn("Side"),
+                    "shares_abs": st.column_config.NumberColumn("Shares", format="%.2f"),
                     "entry_price": st.column_config.NumberColumn("Avg Entry Price", format="$%.2f"),
-                    "pos_value": st.column_config.NumberColumn("Position Value", format="$%.2f"),
+                    "pos_value": st.column_config.NumberColumn("Notional Value", format="$%.2f"),
                 },
                 hide_index=True,
                 use_container_width=True
@@ -517,10 +538,11 @@ if not df_holdings.empty:
     with col_pie:
         if not agent_pos.empty and (agent_pos['pos_value'] > 0).any():
             pie_df = agent_pos[agent_pos['pos_value'] > 0].copy()
+            pie_df['display_name'] = pie_df['ticker'] + " (" + pie_df['position_type'] + ")"
 
             fig_donut = px.pie(
                 pie_df,
-                names="ticker",
+                names="display_name",
                 values="pos_value",
                 hole=0.55,
                 color_discrete_sequence=[ACCENT, ACCENT_2, ACCENT_WARN, "#F472B6", ACCENT_UP, "#60A5FA"]
@@ -559,7 +581,51 @@ else:
 
 st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
 
-# --- ROW 3: MASTER TRADE AUDIT LOG ---
+# --- ROW 3: DIVIDEND ACTIVITY & SCHEDULE LEDGER ---
+st.markdown("<p class='section-title'>💰 Dividend Activity & Schedule Ledger</p>", unsafe_allow_html=True)
+st.markdown("<p class='section-subtitle'>Real-time ex-dividend payouts (Long Credits / Short Obligations) and calendar schedule</p>", unsafe_allow_html=True)
+
+col_div_logs, col_div_sched = st.columns([3, 2])
+
+with col_div_logs:
+    st.markdown("**Recent Dividend Transactions:**")
+    if not df_divs.empty:
+        st.dataframe(
+            df_divs[['timestamp', 'agent_id', 'ticker', 'action', 'shares', 'amount_per_share', 'total_amount']],
+            column_config={
+                "timestamp": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm"),
+                "agent_id": st.column_config.TextColumn("Agent"),
+                "ticker": st.column_config.TextColumn("Ticker"),
+                "action": st.column_config.TextColumn("Action"),
+                "shares": st.column_config.NumberColumn("Shares", format="%.2f"),
+                "amount_per_share": st.column_config.NumberColumn("Div/Share", format="$%.2f"),
+                "total_amount": st.column_config.NumberColumn("Total Cash Impact", format="$%+.2f"),
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+    else:
+        st.info("No ex-dividend payout/debit transactions logged yet.")
+
+with col_div_sched:
+    st.markdown("**Ex-Dividend Calendar Schedule:**")
+    if not df_div_sched.empty:
+        st.dataframe(
+            df_div_sched[['ticker', 'ex_date', 'amount_per_share']],
+            column_config={
+                "ticker": st.column_config.TextColumn("Ticker"),
+                "ex_date": st.column_config.DateColumn("Ex-Dividend Date", format="YYYY-MM-DD"),
+                "amount_per_share": st.column_config.NumberColumn("Est. Div/Share", format="$%.2f"),
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+    else:
+        st.info("No upcoming ex-dividend dates registered.")
+
+st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
+
+# --- ROW 4: MASTER TRADE AUDIT LOG ---
 st.markdown("<p class='section-title'>📜 Master Execution Trade Audit Log</p>", unsafe_allow_html=True)
 st.markdown("<p class='section-subtitle'>Full execution history across the swarm, filterable by agent, action, and reason</p>", unsafe_allow_html=True)
 
