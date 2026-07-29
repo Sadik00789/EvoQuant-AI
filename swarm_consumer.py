@@ -4,6 +4,7 @@ import asyncio
 import httpx
 import redis.asyncio as redis
 import pandas as pd
+from datetime import datetime
 from dotenv import load_dotenv
 
 from engine import (
@@ -42,7 +43,7 @@ async def run_consumer():
     REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 
     logger.info("🤖 QUANT-UPGRADED EVOLUTIONARY SWARM ONLINE (POSTGRESQL / TIMESCALEDB ACTIVE).")
-    logger.info("🛡️ Hard Risk Overlay Active: Stop-Loss (-2.5%) | Take-Profit (+5.0%)")
+    logger.info("🛡️ Hard Risk Overlay Active: Stop-Loss (-2.5%) | Take-Profit (+5.0%) [LONG & SHORT]")
     logger.info("📰 News RAG Sentiment & Dynamic Market Impact Slippage Engines Active.")
     if broker_bridge.is_active():
         logger.info("⚡ ALPACA PAPER TRADING BROKER BRIDGE ACTIVE.")
@@ -51,6 +52,7 @@ async def run_consumer():
     macro_multiplier = 1.0
     spy_returns_history = []
     spy_prices_history = []
+    last_processed_date = ""
 
     # Initial Macro Sentiment Fetch & Database Log
     try:
@@ -81,6 +83,15 @@ async def run_consumer():
 
                         logger.info(f"\n==================== 🔔 MARKET TICK #{tick_counter} ====================")
 
+                        # Daily Ex-Dividend Payout / Debit Engine Trigger
+                        today_date_str = datetime.utcnow().strftime("%Y-%m-%d")
+                        if today_date_str != last_processed_date:
+                            try:
+                                db.process_daily_dividends(today_date_str)
+                                last_processed_date = today_date_str
+                            except Exception as e:
+                                logger.warning(f"⚠️ Daily dividend processing note: {e}")
+
                         # Refresh news sentiment every 8 market ticks (~2 hours)
                         if tick_counter % 8 == 0:
                             try:
@@ -110,54 +121,68 @@ async def run_consumer():
 
                         all_active_holdings = list({
                             tk for agent in swarm_mgr.population 
-                            for tk, shares in agent.holdings.items() if shares > 0
+                            for tk, shares in agent.holdings.items() if shares != 0
                         })
 
                         shared_thesis = swarm.analyze_technical_state(market_state, active_holdings=all_active_holdings)
 
                         # -------------------------------------------------------------
-                        # PHASE A: HARD DETERMINISTIC RISK GUARD CHECK
+                        # PHASE A: DUAL-SIDED HARD RISK GUARD CHECK (LONG & SHORT)
                         # -------------------------------------------------------------
                         for agent in swarm_mgr.population:
                             if not hasattr(agent, 'entry_prices'):
                                 agent.entry_prices = {}
 
                             for tk, shares in list(agent.holdings.items()):
-                                if shares > 0 and tk in prices:
+                                if shares != 0 and tk in prices:
                                     current_price = prices[tk]
                                     entry_price = agent.entry_prices.get(tk, current_price)
-                                    pos_pnl = (current_price - entry_price) / entry_price
                                     adv = market_state.get(tk, {}).get("adv", 1000000.0)
+
+                                    if shares > 0:
+                                        pos_pnl = (current_price - entry_price) / entry_price
+                                    else:
+                                        pos_pnl = (entry_price - current_price) / entry_price  # Inverted PnL for Short
 
                                     # Hard Stop-Loss Liquidation
                                     if pos_pnl <= STOP_LOSS_PCT:
-                                        exec_price = risk_engine.calculate_execution_price(current_price, shares, adv, "SELL")
-                                        cash_returned = shares * exec_price
-                                        agent.cash += cash_returned
+                                        action = "SELL" if shares > 0 else "COVER"
+                                        exec_price = risk_engine.calculate_execution_price(current_price, abs(shares), adv, action)
+
+                                        if shares > 0:
+                                            agent.cash += shares * exec_price
+                                        else:
+                                            agent.cash -= abs(shares) * exec_price  # Pay cash to cover short liability
+
                                         agent.holdings[tk] = 0.0
                                         agent.entry_prices[tk] = 0.0
 
                                         db.update_agent_cash(agent.agent_id, agent.cash)
                                         db.update_agent_holding(agent.agent_id, tk, 0.0, 0.0)
-                                        db.log_trade(agent.agent_id, tk, "SELL", shares, exec_price, 0.0, reason="HARD_STOP_LOSS")
-                                        logger.warning(f"  🚨 [{agent.agent_id}] HARD STOP-LOSS TRIGGERED on {tk}: Liquidation @ ${exec_price:.2f} ({pos_pnl*100:.2f}%)")
+                                        db.log_trade(agent.agent_id, tk, action, abs(shares), exec_price, 0.0, reason="HARD_STOP_LOSS")
+                                        logger.warning(f"  🚨 [{agent.agent_id}] HARD STOP-LOSS on {tk} ({action}): Exec @ ${exec_price:.2f} ({pos_pnl*100:.2f}%)")
 
-                                        broker_bridge.submit_market_order(tk, shares, "SELL")
+                                        broker_bridge.submit_market_order(tk, abs(shares), action)
 
                                     # Hard Take-Profit Liquidation
                                     elif pos_pnl >= TAKE_PROFIT_PCT:
-                                        exec_price = risk_engine.calculate_execution_price(current_price, shares, adv, "SELL")
-                                        cash_returned = shares * exec_price
-                                        agent.cash += cash_returned
+                                        action = "SELL" if shares > 0 else "COVER"
+                                        exec_price = risk_engine.calculate_execution_price(current_price, abs(shares), adv, action)
+
+                                        if shares > 0:
+                                            agent.cash += shares * exec_price
+                                        else:
+                                            agent.cash -= abs(shares) * exec_price
+
                                         agent.holdings[tk] = 0.0
                                         agent.entry_prices[tk] = 0.0
 
                                         db.update_agent_cash(agent.agent_id, agent.cash)
                                         db.update_agent_holding(agent.agent_id, tk, 0.0, 0.0)
-                                        db.log_trade(agent.agent_id, tk, "SELL", shares, exec_price, 0.0, reason="HARD_TAKE_PROFIT")
-                                        logger.info(f"  🎯 [{agent.agent_id}] HARD TAKE-PROFIT TRIGGERED on {tk}: Liquidation @ ${exec_price:.2f} (+{pos_pnl*100:.2f}%)")
+                                        db.log_trade(agent.agent_id, tk, action, abs(shares), exec_price, 0.0, reason="HARD_TAKE_PROFIT")
+                                        logger.info(f"  🎯 [{agent.agent_id}] HARD TAKE-PROFIT on {tk} ({action}): Exec @ ${exec_price:.2f} (+{pos_pnl*100:.2f}%)")
 
-                                        broker_bridge.submit_market_order(tk, shares, "SELL")
+                                        broker_bridge.submit_market_order(tk, abs(shares), action)
 
                         # -------------------------------------------------------------
                         # PHASE B: CONCURRENT ASYNC STRATEGY EXECUTION
@@ -170,8 +195,9 @@ async def run_consumer():
                         )
 
                         for agent in swarm_mgr.population:
-                            asset_val = sum(agent.holdings.get(tk, 0.0) * prices[tk] for tk in agent.holdings if tk in prices)
-                            current_equity = round(agent.cash + asset_val, 2)
+                            long_val = sum(qty * prices[tk] for tk, qty in agent.holdings.items() if qty > 0 and tk in prices)
+                            short_liability = sum(abs(qty) * prices[tk] for tk, qty in agent.holdings.items() if qty < 0 and tk in prices)
+                            current_equity = round(agent.cash + long_val - short_liability, 2)
                             agent.equity_history.append(current_equity)
 
                             decision = decisions_map.get(agent.agent_id)
@@ -187,16 +213,17 @@ async def run_consumer():
 
                                 effective_alloc = target.allocation_pct * macro_multiplier * regime_scaler
                                 target_val = current_equity * effective_alloc
-                                current_val = agent.holdings.get(ticker, 0.0) * raw_price
+                                current_pos_qty = agent.holdings.get(ticker, 0.0)
+                                current_val = current_pos_qty * raw_price
                                 delta = target_val - current_val
 
-                                # BUY Execution with Weighted Average Entry Price
-                                if delta > 50.0 and target.action == "BUY" and agent.cash >= delta:
+                                # 1. BUY Execution (Long Entry / Scale)
+                                if target.action == "BUY" and delta > 50.0 and agent.cash >= delta:
                                     approx_shares = delta / raw_price
                                     exec_price = risk_engine.calculate_execution_price(raw_price, approx_shares, adv, "BUY")
                                     shares = delta / exec_price
 
-                                    old_shares = agent.holdings.get(ticker, 0.0)
+                                    old_shares = max(agent.holdings.get(ticker, 0.0), 0.0)
                                     old_entry = agent.entry_prices.get(ticker, exec_price)
                                     new_shares = old_shares + shares
                                     weighted_entry = ((old_shares * old_entry) + (shares * exec_price)) / new_shares
@@ -206,16 +233,15 @@ async def run_consumer():
                                     agent.cash -= delta
 
                                     db.update_agent_cash(agent.agent_id, agent.cash)
-                                    db.update_agent_holding(agent.agent_id, ticker, agent.holdings[ticker], weighted_entry)
+                                    db.update_agent_holding(agent.agent_id, ticker, new_shares, weighted_entry)
                                     db.log_trade(agent.agent_id, ticker, "BUY", shares, exec_price, effective_alloc, reason="RISK_PARITY_ALLOCATION")
                                     logger.info(f"  📈 [{agent.agent_id}] BOUGHT {ticker}: +{shares:.2f}sh @ ${exec_price:.2f} (Avg Cost: ${weighted_entry:.2f})")
 
                                     broker_bridge.submit_market_order(ticker, shares, "BUY")
 
-                                # SELL Execution Clamped to Available Holdings
-                                current_qty = agent.holdings.get(ticker, 0.0)
-                                if delta < -50.0 and target.action == "SELL" and current_qty > 0:
-                                    sell_shares = min(abs(delta) / raw_price, current_qty)
+                                # 2. SELL Execution (Long Reduction / Exit)
+                                elif target.action == "SELL" and current_pos_qty > 0 and delta < -50.0:
+                                    sell_shares = min(abs(delta) / raw_price, current_pos_qty)
                                     exec_price = risk_engine.calculate_execution_price(raw_price, sell_shares, adv, "SELL")
                                     actual_cash_gained = sell_shares * exec_price
 
@@ -233,6 +259,52 @@ async def run_consumer():
 
                                     broker_bridge.submit_market_order(ticker, sell_shares, "SELL")
 
+                                # 3. SHORT Execution (Short Entry / Scale)
+                                elif target.action == "SHORT" and delta > 50.0:
+                                    margin_info = risk_engine.evaluate_margin_health(agent.cash, agent.holdings, prices)
+                                    if margin_info["free_margin"] >= delta:
+                                        approx_shares = delta / raw_price
+                                        exec_price = risk_engine.calculate_execution_price(raw_price, approx_shares, adv, "SHORT")
+                                        actual_short_shares = delta / exec_price
+
+                                        old_short_shares = abs(min(agent.holdings.get(ticker, 0.0), 0.0))
+                                        old_entry = agent.entry_prices.get(ticker, exec_price)
+                                        new_short_shares = old_short_shares + actual_short_shares
+                                        weighted_entry = ((old_short_shares * old_entry) + (actual_short_shares * exec_price)) / new_short_shares
+
+                                        agent.holdings[ticker] = -new_short_shares  # Negative quantity
+                                        agent.entry_prices[ticker] = weighted_entry
+                                        agent.cash += actual_short_shares * exec_price  # Add short sale proceeds
+
+                                        db.update_agent_cash(agent.agent_id, agent.cash)
+                                        db.update_agent_holding(agent.agent_id, ticker, -new_short_shares, weighted_entry)
+                                        db.log_trade(agent.agent_id, ticker, "SHORT", actual_short_shares, exec_price, effective_alloc, reason="RISK_PARITY_SHORT")
+                                        logger.info(f"  📉 [{agent.agent_id}] SHORTED {ticker}: -{actual_short_shares:.2f}sh @ ${exec_price:.2f}")
+
+                                        broker_bridge.submit_market_order(ticker, actual_short_shares, "SHORT")
+
+                                # 4. COVER Execution (Short Reduction / Exit)
+                                elif target.action == "COVER" and current_pos_qty < 0:
+                                    current_short_shares = abs(current_pos_qty)
+                                    cover_shares = min(abs(delta) / raw_price, current_short_shares) if delta < -50.0 else current_short_shares
+                                    exec_price = risk_engine.calculate_execution_price(raw_price, cover_shares, adv, "COVER")
+                                    cost = cover_shares * exec_price
+
+                                    if agent.cash >= cost:
+                                        agent.holdings[ticker] += cover_shares
+                                        agent.cash -= cost
+
+                                        if abs(agent.holdings[ticker]) <= 0.0001:
+                                            agent.holdings[ticker] = 0.0
+                                            agent.entry_prices[ticker] = 0.0
+
+                                        db.update_agent_cash(agent.agent_id, agent.cash)
+                                        db.update_agent_holding(agent.agent_id, ticker, agent.holdings[ticker], agent.entry_prices.get(ticker, 0.0))
+                                        db.log_trade(agent.agent_id, ticker, "COVER", cover_shares, exec_price, effective_alloc, reason="RISK_PARITY_COVER")
+                                        logger.info(f"  📈 [{agent.agent_id}] COVERED {ticker}: +{cover_shares:.2f}sh @ ${exec_price:.2f}")
+
+                                        broker_bridge.submit_market_order(ticker, cover_shares, "COVER")
+
                         # Print Competing Leaderboard & Log Snapshots
                         logger.info("\n🏆 --- COMPETING AGENT LEADERBOARD ---")
                         sorted_swarm = sorted(swarm_mgr.population, key=lambda a: a.equity_history[-1], reverse=True)
@@ -240,7 +312,10 @@ async def run_consumer():
                             pnl = ((agent.equity_history[-1] - 100000.0) / 100000.0) * 100
                             db.log_snapshot(agent.agent_id, agent.equity_history[-1], agent.cash, pnl)
 
-                            active_holdings = [f"{tk}: {shares:.1f}sh" for tk, shares in agent.holdings.items() if shares > 0]
+                            active_holdings = [
+                                f"{tk}: {'LONG' if shares > 0 else 'SHORT'} {abs(shares):.1f}sh" 
+                                for tk, shares in agent.holdings.items() if shares != 0
+                            ]
                             holdings_summary = ", ".join(active_holdings[:4]) if active_holdings else "100% Cash"
 
                             logger.info(
