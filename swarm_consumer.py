@@ -92,8 +92,8 @@ async def run_consumer():
                             except Exception as e:
                                 logger.warning(f"⚠️ Daily dividend processing note: {e}")
 
-                        # Refresh news sentiment every 8 market ticks (~2 hours)
-                        if tick_counter % 8 == 0:
+                        # Refresh news sentiment every 4 market ticks (~1 hour)
+                        if tick_counter % 4 == 0:
                             try:
                                 macro_news = await sentiment_agent.analyze_macro_sentiment_async()
                                 macro_multiplier = macro_news.get("risk_multiplier", 1.0)
