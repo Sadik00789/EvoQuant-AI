@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 import asyncio
@@ -12,6 +13,12 @@ from psycopg.rows import dict_row
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SwarmEngine")
+
+# Helper utility to strip markdown fences from LLM responses
+def clean_llm_json_string(raw_content: str) -> str:
+    """Strips ```json ... ``` markdown wrappers and leading/trailing whitespace."""
+    cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", raw_content).strip()
+    return cleaned
 
 # ==========================================
 # 1. EXECUTION BRIDGE & PYDANTIC SCHEMAS
@@ -84,7 +91,7 @@ class DebateArgument(BaseModel):
 
 class AgentDebateCase(BaseModel):
     arguments: Dict[str, DebateArgument]
-    overall_perspective: str
+    overall_perspective: str = Field(default="Balanced market perspective across selected assets.")
 
 class QualitativeSignal(BaseModel):
     ticker: str
@@ -93,7 +100,7 @@ class QualitativeSignal(BaseModel):
 
 class AgentSignalDecision(BaseModel):
     signals: Dict[str, QualitativeSignal]
-    macro_reasoning: str
+    macro_reasoning: str = Field(default="Synthesized multi-asset debate logic.")
 
 class PortfolioAllocation(BaseModel):
     ticker: str
@@ -224,29 +231,33 @@ class DualModelTradingSwarm:
                 "name": "Groq",
                 "url": "https://api.groq.com/openai/v1/chat/completions",
                 "key": self.primary_api_key or os.getenv("GROQ_API_KEY"),
-                "model": "llama-3.3-70b-versatile"
+                "model": "llama-3.3-70b-versatile",
+                "use_json_format": True
             },
             {
                 "name": "OpenRouter (70B)",
                 "url": "https://openrouter.ai/api/v1/chat/completions",
                 "key": os.getenv("OPENROUTER_API_KEY"),
-                "model": "meta-llama/llama-3.3-70b-instruct",
+                "model": "meta-llama/llama-3.3-70b-instruct:free",
                 "headers": {
                     "HTTP-Referer": "https://github.com/EvoQuant-AI",
                     "X-Title": "EvoQuant Trading Swarm"
-                }
+                },
+                "use_json_format": True
             },
             {
                 "name": "GitHub Models",
                 "url": "https://models.inference.ai.azure.com/chat/completions",
                 "key": os.getenv("GITHUB_TOKEN"),
-                "model": "Llama-3.3-70B-Instruct"
+                "model": "Llama-3.3-70B-Instruct",
+                "use_json_format": True
             },
             {
                 "name": "SambaNova",
                 "url": "https://api.sambanova.ai/v1/chat/completions",
                 "key": os.getenv("SAMBANOVA_API_KEY"),
-                "model": "Meta-Llama-3.3-70B-Instruct"
+                "model": "Meta-Llama-3.3-70B-Instruct",
+                "use_json_format": False
             }
         ]
 
@@ -270,19 +281,22 @@ class DualModelTradingSwarm:
                 "model": p["model"],
                 "messages": list(base_messages),
                 "temperature": 0.1,
-                "max_tokens": 600,
-                "response_format": {"type": "json_object"}
+                "max_tokens": 2048
             }
+            if p.get("use_json_format"):
+                payload["response_format"] = {"type": "json_object"}
 
             try:
-                resp = await client.post(p["url"], json=payload, headers=headers, timeout=12.0)
-                if resp.status_code in (429, 404):
+                resp = await client.post(p["url"], json=payload, headers=headers, timeout=15.0)
+                if resp.status_code in (400, 402, 404, 429):
                     logger.warning(f"⚠️ [{p['name']} - {role_tag}] Status {resp.status_code}. Routing to next provider...")
                     continue
 
                 resp.raise_for_status()
-                content = resp.json()['choices'][0]['message']['content']
-                validated_output = model_class.model_validate_json(content)
+                raw_content = resp.json()['choices'][0]['message']['content']
+                cleaned_content = clean_llm_json_string(raw_content)
+                
+                validated_output = model_class.model_validate_json(cleaned_content)
                 logger.info(f"✅ [{role_tag}] Evaluated successfully via [{p['name']}]")
                 return validated_output
 
@@ -303,6 +317,7 @@ class DualModelTradingSwarm:
             "ROLE: Bull Researcher Agent.\n"
             "TASK: Build the strongest possible BULLISH thesis for each asset. Focus on asymmetric upside, "
             "MACD bullish momentum, oversold RSI bounces, key support levels, and positive relative strength.\n"
+            "MUST INCLUDE BOTH `arguments` and `overall_perspective` in JSON output.\n"
             'Format MUST be JSON matching schema: {"arguments": {"TICKER": {"ticker": "TICKER", "thesis_summary": "summary", "key_factors": ["f1"], "strength_score": 0.85}}, "overall_perspective": "perspective"}'
         )
         return await self._call_llm_provider_chain(client, sys_prompt, strategy_input, AgentDebateCase, "BullResearcher")
@@ -315,6 +330,7 @@ class DualModelTradingSwarm:
             "ROLE: Bear Researcher Agent (Adversary).\n"
             "TASK: Hunt for flaws, Bull Traps, weak breakout volume, RSI bearish divergence, overhead resistance, "
             "and broader macro tail-risk for each asset. Build an aggressive BEARISH counter-case.\n"
+            "MUST INCLUDE BOTH `arguments` and `overall_perspective` in JSON output.\n"
             'Format MUST be JSON matching schema: {"arguments": {"TICKER": {"ticker": "TICKER", "thesis_summary": "summary", "key_factors": ["f1"], "strength_score": 0.75}}, "overall_perspective": "perspective"}'
         )
         return await self._call_llm_provider_chain(client, sys_prompt, strategy_input, AgentDebateCase, "BearResearcher")
@@ -381,6 +397,7 @@ class DualModelTradingSwarm:
             "DECISION RULES FOR SHORTING:\n"
             "- If Bear Case argument strength > Bull Case strength OR asset RSI > 68 OR relative strength vs SPY < -1.5, issue SHORT with conviction > 0.5.\n"
             "- If holding a SHORT position and stock rebounds significantly, issue COVER.\n"
+            "MUST INCLUDE BOTH `signals` and `macro_reasoning` in JSON output.\n"
             'Format MUST be JSON showing both BUY and SHORT setups: '
             '{"signals": {"AAPL": {"ticker": "AAPL", "action": "BUY", "conviction": 0.8}, "NVDA": {"ticker": "NVDA", "action": "SHORT", "conviction": 0.85}}, "macro_reasoning": "Synthesized reasoning"}'
         )
