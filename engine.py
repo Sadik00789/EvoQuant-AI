@@ -4,6 +4,7 @@ import json
 import logging
 import asyncio
 import httpx
+import boto3
 import pandas as pd
 import requests
 from typing import Literal, Dict, Union, Any, List, Optional
@@ -189,7 +190,7 @@ class RiskParityOptimizer:
 
 class DualModelTradingSwarm:
     def __init__(self, api_key: str = None):
-        self.primary_api_key = api_key or os.getenv("GROQ_API_KEY")
+        self.primary_api_key = api_key or os.getenv("GROQ_API_KEY2")
 
     def analyze_technical_state(self, market_state: dict, active_holdings: list = None) -> dict:
         filtered_thesis = {}
@@ -217,6 +218,45 @@ class DualModelTradingSwarm:
 
         return filtered_thesis
 
+    def _call_aws_bedrock_llama(self, sys_prompt: str, user_input: str) -> str:
+        """
+        Synchronous AWS Bedrock Converse API invocation for Llama 3.3 70B Instruct.
+        Executed inside an async thread executor to prevent blocking the event loop.
+        """
+        aws_key = os.getenv("AWS_ACCESS_KEY_ID")
+        aws_secret = os.getenv("AWS_SECRET_ACCESS_KEY")
+        region = os.getenv("AWS_REGION", "us-east-1")
+
+        if not aws_key or not aws_secret:
+            raise ValueError("AWS credentials not set in environment.")
+
+        bedrock_client = boto3.client(
+            service_name="bedrock-runtime",
+            region_name=region,
+            aws_access_key_id=aws_key,
+            aws_secret_access_key=aws_secret
+        )
+
+        model_id = "us.meta.llama3-3-70b-instruct-v1:0"
+
+        response = bedrock_client.converse(
+            modelId=model_id,
+            system=[{"text": sys_prompt}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"text": user_input}]
+                }
+            ],
+            inferenceConfig={
+                "temperature": 0.1,
+                "maxTokens": 2048
+            }
+        )
+
+        output_message = response["output"]["message"]["content"][0]["text"]
+        return output_message
+
     async def _call_llm_provider_chain(
         self,
         client: httpx.AsyncClient,
@@ -229,6 +269,7 @@ class DualModelTradingSwarm:
         providers = [
             {
                 "name": "Groq",
+                "type": "http",
                 "url": "https://api.groq.com/openai/v1/chat/completions",
                 "key": self.primary_api_key or os.getenv("GROQ_API_KEY"),
                 "model": "llama-3.3-70b-versatile",
@@ -236,6 +277,7 @@ class DualModelTradingSwarm:
             },
             {
                 "name": "OpenRouter (70B)",
+                "type": "http",
                 "url": "https://openrouter.ai/api/v1/chat/completions",
                 "key": os.getenv("OPENROUTER_API_KEY"),
                 "model": "meta-llama/llama-3.3-70b-instruct:free",
@@ -247,6 +289,7 @@ class DualModelTradingSwarm:
             },
             {
                 "name": "GitHub Models",
+                "type": "http",
                 "url": "https://models.inference.ai.azure.com/chat/completions",
                 "key": os.getenv("GITHUB_TOKEN"),
                 "model": "Llama-3.3-70B-Instruct",
@@ -254,10 +297,16 @@ class DualModelTradingSwarm:
             },
             {
                 "name": "SambaNova",
+                "type": "http",
                 "url": "https://api.sambanova.ai/v1/chat/completions",
                 "key": os.getenv("SAMBANOVA_API_KEY"),
                 "model": "Meta-Llama-3.3-70B-Instruct",
                 "use_json_format": False
+            },
+            {
+                "name": "AWS Bedrock (Llama 3.3 70B)",
+                "type": "bedrock",
+                "key": os.getenv("AWS_ACCESS_KEY_ID")
             }
         ]
 
@@ -270,6 +319,24 @@ class DualModelTradingSwarm:
             if not p["key"]:
                 continue
 
+            # -------------------------------------------------------------
+            # BEDROCK FALLBACK EXECUTION (BOTTOM OF CHAIN)
+            # -------------------------------------------------------------
+            if p["type"] == "bedrock":
+                try:
+                    logger.info(f"🛡️ Free tiers exhausted or rate-limited for [{role_tag}]. Routing request to AWS Bedrock...")
+                    raw_content = await asyncio.to_thread(self._call_aws_bedrock_llama, sys_prompt, user_input)
+                    cleaned_content = clean_llm_json_string(raw_content)
+                    validated_output = model_class.model_validate_json(cleaned_content)
+                    logger.info(f"✅ [{role_tag}] Evaluated successfully via [AWS Bedrock]")
+                    return validated_output
+                except Exception as e:
+                    logger.warning(f"⚠️ AWS Bedrock execution failed for [{role_tag}]: {e}")
+                    continue
+
+            # -------------------------------------------------------------
+            # STANDARD HTTP PROVIDER EXECUTION (FREE TIERS)
+            # -------------------------------------------------------------
             headers = {
                 "Authorization": f"Bearer {p['key']}",
                 "Content-Type": "application/json"
@@ -288,7 +355,7 @@ class DualModelTradingSwarm:
 
             try:
                 resp = await client.post(p["url"], json=payload, headers=headers, timeout=15.0)
-                if resp.status_code in (400, 402, 404, 429):
+                if resp.status_code in (400, 401, 402, 404, 410, 429):
                     logger.warning(f"⚠️ [{p['name']} - {role_tag}] Status {resp.status_code}. Routing to next provider...")
                     continue
 
@@ -307,7 +374,7 @@ class DualModelTradingSwarm:
                 logger.warning(f"⚠️ [{p['name']} - {role_tag}] Provider failed: {e}. Trying next...")
                 continue
 
-        raise RuntimeError(f"All free 70B providers failed or rate-limited for [{role_tag}].")
+        raise RuntimeError(f"All providers (including AWS Bedrock) failed or rate-limited for [{role_tag}].")
 
     async def _generate_bull_case(
         self, client: httpx.AsyncClient, strategy_input: str, persona: str
