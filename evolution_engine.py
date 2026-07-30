@@ -161,25 +161,33 @@ class EvolutionarySwarmManager:
                 "name": "Groq",
                 "url": "https://api.groq.com/openai/v1/chat/completions",
                 "key": self.api_key or os.getenv("GROQ_API_KEY"),
-                "model": "llama-3.3-70b-versatile"
+                "model": "llama-3.3-70b-versatile",
+                "use_json_format": True
             },
             {
                 "name": "OpenRouter",
                 "url": "https://openrouter.ai/api/v1/chat/completions",
                 "key": os.getenv("OPENROUTER_API_KEY"),
-                "model": "meta-llama/llama-3.3-70b-instruct"
+                "model": "meta-llama/llama-3.3-70b-instruct:free",
+                "headers": {
+                    "HTTP-Referer": "https://github.com/EvoQuant-AI",
+                    "X-Title": "EvoQuant Trading Swarm"
+                },
+                "use_json_format": True
             },
             {
                 "name": "GitHub Models",
                 "url": "https://models.inference.ai.azure.com/chat/completions",
                 "key": os.getenv("GITHUB_TOKEN"),
-                "model": "Llama-3.3-70B-Instruct"
+                "model": "Llama-3.3-70B-Instruct",
+                "use_json_format": True
             },
             {
                 "name": "SambaNova",
                 "url": "https://api.sambanova.ai/v1/chat/completions",
                 "key": os.getenv("SAMBANOVA_API_KEY"),
-                "model": "Meta-Llama-3.3-70B-Instruct"
+                "model": "Meta-Llama-3.3-70B-Instruct",
+                "use_json_format": False
             }
         ]
 
@@ -194,26 +202,30 @@ class EvolutionarySwarmManager:
                     "Authorization": f"Bearer {p['key']}",
                     "Content-Type": "application/json"
                 }
+                if "headers" in p:
+                    headers.update(p["headers"])
 
                 payload = {
                     "model": p["model"],
                     "messages": [{"role": "user", "content": prompt}],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.3
+                    "temperature": 0.3,
+                    "max_tokens": 1024
                 }
+                if p.get("use_json_format"):
+                    payload["response_format"] = {"type": "json_object"}
 
                 try:
-                    resp = await client.post(p["url"], json=payload, headers=headers, timeout=20.0)
-                    if resp.status_code in (429, 404):
+                    resp = await client.post(p["url"], json=payload, headers=headers, timeout=15.0)
+                    if resp.status_code in (400, 402, 404, 429):
                         logger.warning(f"⚠️ [{p['name']}] Mutation failed ({resp.status_code}). Trying next provider...")
                         continue
 
                     resp.raise_for_status()
                     content = resp.json()['choices'][0]['message']['content']
-                    cleaned = re.sub(r'```json\s*|\s*```', '', content).strip()
+                    cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", content).strip()
                     parsed = json.loads(cleaned)
                     
-                    if "new_prompt" in parsed:
+                    if "new_prompt" in parsed and parsed["new_prompt"]:
                         mutated_prompt = parsed["new_prompt"]
                         logger.info(f"✅ Genome successfully mutated via [{p['name']}]")
                         break
