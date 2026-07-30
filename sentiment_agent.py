@@ -132,39 +132,39 @@ INSTRUCTIONS:
 """
 
             providers = [
-                {
-                    "name": "Groq",
-                    "url": "https://api.groq.com/openai/v1/chat/completions",
-                    "key": self.api_key or os.getenv("GROQ_API_KEY"),
-                    "model": "qwen-2.5-72b",
-                    "use_json_format": True
-                },
-                {
-                    "name": "OpenRouter",
-                    "url": "https://openrouter.ai/api/v1/chat/completions",
-                    "key": os.getenv("OPENROUTER_API_KEY"),
-                    "model": "qwen/qwen-2.5-72b-instruct:free",
-                    "headers": {
-                        "HTTP-Referer": "https://github.com/EvoQuant-AI",
-                        "X-Title": "EvoQuant Trading Swarm"
-                    },
-                    "use_json_format": True
-                },
-                {
-                    "name": "GitHub Models",
-                    "url": "https://models.inference.ai.azure.com/chat/completions",
-                    "key": os.getenv("GITHUB_TOKEN"),
-                    "model": "Qwen-2.5-72B-Instruct",
-                    "use_json_format": True
-                },
-                {
-                    "name": "SambaNova",
-                    "url": "https://api.sambanova.ai/v1/chat/completions",
-                    "key": os.getenv("SAMBANOVA_API_KEY"),
-                    "model": "Qwen2.5-72B-Instruct",
-                    "use_json_format": False
-                }
-            ]
+    {
+        "name": "Groq",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "key": self.api_key or os.getenv("GROQ_API_KEY2"),
+        "model": "llama-3.3-70b-versatile",
+        "use_json_format": True
+    },
+    {
+        "name": "OpenRouter",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "key": os.getenv("OPENROUTER_API_KEY2"),
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+        "headers": {
+            "HTTP-Referer": "https://github.com/EvoQuant-AI",
+            "X-Title": "EvoQuant Trading Swarm"
+        },
+        "use_json_format": True
+    },
+    {
+        "name": "GitHub Models",
+        "url": "https://models.inference.ai.azure.com/chat/completions",
+        "key": os.getenv("GITHUB_TOKEN2"),
+        "model": "Llama-3.3-70B-Instruct",
+        "use_json_format": True
+    },
+    {
+        "name": "SambaNova",
+        "url": "https://api.sambanova.ai/v1/chat/completions",
+        "key": os.getenv("SAMBANOVA_API_KEY2"),
+        "model": "Meta-Llama-3.3-70B-Instruct",
+        "use_json_format": False  # Keeps SambaNova from throwing 400 Bad Request
+    }
+]
 
             for p in providers:
                 if not p["key"]:
