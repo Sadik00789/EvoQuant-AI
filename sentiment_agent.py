@@ -16,14 +16,15 @@ logger = logging.getLogger("NewsSentimentAgent")
 class NewsSentimentAgent:
     """
     RAG Macro News Sentiment & Regime Scaler Agent.
-    Fetches real-time financial headlines from RSS feeds and uses 70B models
+    Fetches real-time financial headlines from RSS feeds and uses Qwen 2.5 72B models
     to output a strictly bounded risk multiplier [0.5x, 1.5x].
     """
     def __init__(self, api_key: str = None):
         self.api_key = api_key or os.getenv("GROQ_API_KEY")
         self.rss_feeds = [
-            "https://search.cnbc.com/rs/search/combinedrender?source=cnbcnews&titles=true&displayonly=true&type=news&mincount=10&id=10000664",
-            "https://finance.yahoo.com/news/rssindex"
+            "https://finance.yahoo.com/news/rssindex",
+            "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+            "https://news.google.com/rss/search?q=stock+market+economy&hl=en-US&gl=US&ceid=US:en"
         ]
 
     async def _fetch_rss_headlines_async(self, client: httpx.AsyncClient, max_headlines: int = 8) -> str:
@@ -108,7 +109,7 @@ class NewsSentimentAgent:
 
     async def analyze_macro_sentiment_async(self) -> Dict[str, Any]:
         """
-        Queries multi-provider LLMs asynchronously to evaluate current financial headlines.
+        Queries multi-provider Qwen 2.5 72B models asynchronously to evaluate current financial headlines.
         """
         async with httpx.AsyncClient() as client:
             headlines_text = await self._fetch_rss_headlines_async(client)
@@ -135,14 +136,14 @@ INSTRUCTIONS:
                     "name": "Groq",
                     "url": "https://api.groq.com/openai/v1/chat/completions",
                     "key": self.api_key or os.getenv("GROQ_API_KEY"),
-                    "model": "llama-3.3-70b-versatile",
+                    "model": "qwen-2.5-72b",
                     "use_json_format": True
                 },
                 {
                     "name": "OpenRouter",
                     "url": "https://openrouter.ai/api/v1/chat/completions",
                     "key": os.getenv("OPENROUTER_API_KEY"),
-                    "model": "meta-llama/llama-3.3-70b-instruct:free",
+                    "model": "qwen/qwen-2.5-72b-instruct:free",
                     "headers": {
                         "HTTP-Referer": "https://github.com/EvoQuant-AI",
                         "X-Title": "EvoQuant Trading Swarm"
@@ -153,14 +154,14 @@ INSTRUCTIONS:
                     "name": "GitHub Models",
                     "url": "https://models.inference.ai.azure.com/chat/completions",
                     "key": os.getenv("GITHUB_TOKEN"),
-                    "model": "Llama-3.3-70B-Instruct",
+                    "model": "Qwen-2.5-72B-Instruct",
                     "use_json_format": True
                 },
                 {
                     "name": "SambaNova",
                     "url": "https://api.sambanova.ai/v1/chat/completions",
                     "key": os.getenv("SAMBANOVA_API_KEY"),
-                    "model": "Meta-Llama-3.3-70B-Instruct",
+                    "model": "Qwen2.5-72B-Instruct",
                     "use_json_format": False
                 }
             ]
