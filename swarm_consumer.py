@@ -296,17 +296,10 @@ async def run_consumer():
                                 raw_price = prices[ticker]
                                 adv = market_state.get(ticker, {}).get("adv", 1000000.0)
 
-                                # SWARM POSITION CAP GUARDRAIL ENFORCEMENT
-                                current_swarm_alloc = db.get_active_swarm_ticker_allocation(ticker) if hasattr(db, 'get_active_swarm_ticker_allocation') else 0.0
-                                remaining_headroom = max(0.0, MAX_SINGLE_POS_CAP - current_swarm_alloc)
-
-                                if target.action in ["BUY", "SHORT"] and remaining_headroom <= 0.001:
-                                    logger.warning(f"  🛡️ [GUARDRAIL BLOCKED] Swarm capacity maxed out for {ticker} ({current_swarm_alloc*100:.1f}% >= {MAX_SINGLE_POS_CAP*100:.1f}%). Rejecting {target.action} by {agent.agent_id}.")
-                                    continue
-
+                                # USE THIS INSTEAD:
                                 raw_effective_alloc = target.allocation_pct * macro_multiplier * regime_scaler
-                                # Enforce per-agent allocation clamping to remaining headroom & max cap
-                                effective_alloc = min(raw_effective_alloc, remaining_headroom, MAX_SINGLE_POS_CAP)
+                                # Enforce strict 5.0% max cap per agent
+                                effective_alloc = min(raw_effective_alloc, MAX_SINGLE_POS_CAP)
                                 target_val = current_equity * effective_alloc
                                 current_pos_qty = agent.holdings.get(ticker, 0.0)
 
