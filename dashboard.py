@@ -1,5 +1,4 @@
 import os
-import time
 import pandas as pd
 import sqlalchemy
 import plotly.express as px
@@ -27,8 +26,8 @@ BG_PANEL_ALT = "#171D2B"
 BORDER = "#242C3D"
 TEXT_PRIMARY = "#F3F6FC"
 TEXT_MUTED = "#8B96AC"
-ACCENT = "#5EEAD4"       # teal
-ACCENT_2 = "#818CF8"     # indigo
+ACCENT = "#5EEAD4"        # teal
+ACCENT_2 = "#818CF8"      # indigo
 ACCENT_WARN = "#FBBF24"
 ACCENT_DOWN = "#FB7185"
 ACCENT_UP = "#34D399"
@@ -370,6 +369,8 @@ st.sidebar.markdown(
 st.sidebar.markdown("<hr class='app-divider' style='margin:16px 0;'>", unsafe_allow_html=True)
 
 auto_refresh = st.sidebar.checkbox("Auto-Refresh Terminal (5s)", value=True)
+refresh_interval = "5s" if auto_refresh else None
+
 if auto_refresh:
     st.sidebar.markdown(
         f"<span class='pill'>● Live</span> "
@@ -403,225 +404,248 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-df_snapshots = load_snapshots()
-df_trades = load_trades()
-df_holdings = load_holdings()
-df_macro = load_macro_regime()
-df_divs = load_dividends()
-df_div_sched = load_dividend_schedule()
+# --- TOP KPI METRICS FRAGMENT ---
+@st.fragment(run_every=refresh_interval)
+def render_kpi_metrics():
+    df_snapshots = load_snapshots()
+    df_trades = load_trades()
+    df_macro = load_macro_regime()
 
-if df_snapshots.empty:
-    st.warning("⏳ Waiting for `TimescaleDB` telemetry. Ensure `swarm_consumer.py` has processed at least one market tick!")
-    st.stop()
+    if df_snapshots.empty:
+        st.warning("⏳ Waiting for `TimescaleDB` telemetry. Ensure `swarm_consumer.py` has processed at least one market tick!")
+        return
 
-# --- TOP KPI METRICS ---
-latest_snapshots = df_snapshots.sort_values('timestamp').groupby('agent_id').last().reset_index()
-total_capital = latest_snapshots['equity'].sum()
-top_agent = latest_snapshots.sort_values('equity', ascending=False).iloc[0]
+    latest_snapshots = df_snapshots.sort_values('timestamp').groupby('agent_id').last().reset_index()
+    total_capital = latest_snapshots['equity'].sum()
+    top_agent = latest_snapshots.sort_values('equity', ascending=False).iloc[0]
 
-risk_events_count = 0
-if not df_trades.empty and "reason" in df_trades.columns:
-    risk_events_count = len(df_trades[df_trades["reason"].str.contains("HARD_STOP|HARD_TAKE", na=False)])
+    risk_events_count = 0
+    if not df_trades.empty and "reason" in df_trades.columns:
+        risk_events_count = len(df_trades[df_trades["reason"].str.contains("HARD_STOP|HARD_TAKE", na=False)])
 
-kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-kpi1.metric("Total Swarm Capital", f"${total_capital:,.2f}")
-kpi2.metric("Leader Agent", top_agent['agent_id'])
-kpi3.metric("Leader Equity", f"${top_agent['equity']:,.2f}", f"{top_agent['pnl_pct']:+.2f}%")
-kpi4.metric("Risk Guard Triggers", f"{risk_events_count} Events", delta_color="inverse")
+    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+    kpi1.metric("Total Swarm Capital", f"${total_capital:,.2f}")
+    kpi2.metric("Leader Agent", top_agent['agent_id'])
+    kpi3.metric("Leader Equity", f"${top_agent['equity']:,.2f}", f"{top_agent['pnl_pct']:+.2f}%")
+    kpi4.metric("Risk Guard Triggers", f"{risk_events_count} Events", delta_color="inverse")
 
-if not df_macro.empty:
-    macro_mult = df_macro['risk_multiplier'].iloc[0]
-    kpi5.metric("Macro Risk Scale", f"{macro_mult:.2f}x")
-else:
-    kpi5.metric("Macro Risk Scale", "1.00x")
+    if not df_macro.empty:
+        macro_mult = df_macro['risk_multiplier'].iloc[0]
+        kpi5.metric("Macro Risk Scale", f"{macro_mult:.2f}x")
+    else:
+        kpi5.metric("Macro Risk Scale", "1.00x")
 
-if not df_macro.empty:
-    st.info(f"📰 **Latest News RAG Reasoning:** {df_macro['summary_reasoning'].iloc[0]}")
+    if not df_macro.empty:
+        st.info(f"📰 **Latest News RAG Reasoning:** {df_macro['summary_reasoning'].iloc[0]}")
 
-st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
-
-# --- ROW 1: EQUITY CURVES & LIVE LEADERBOARD ---
-col_chart, col_leaderboard = st.columns([3, 2])
-
-with col_chart:
-    st.markdown("<p class='section-title'>📈 Real-Time Agent Equity Growth</p>", unsafe_allow_html=True)
-    st.markdown("<p class='section-subtitle'>Equity trajectory across all live swarm agents</p>", unsafe_allow_html=True)
-
-    fig_equity = px.line(
-        df_snapshots,
-        x="timestamp",
-        y="equity",
-        color="agent_id",
-        color_discrete_map=AGENT_COLORS,
-        labels={"equity": "Equity ($)", "timestamp": "Timestamp", "agent_id": "Agent"}
-    )
-
-    fig_equity.update_traces(line=dict(width=2.75), marker=dict(size=6))
-    fig_equity.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor=BG_PANEL_ALT,
-        font=PLOT_FONT,
-        height=380,
-        margin=dict(l=20, r=20, t=20, b=20),
-        hovermode="x unified",
-        xaxis=dict(gridcolor=BORDER, showline=True, linecolor=BORDER, zeroline=False),
-        yaxis=dict(gridcolor=BORDER, showline=True, linecolor=BORDER, tickprefix="$", zeroline=False),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1,
-            font=dict(color=TEXT_PRIMARY, size=11),
-            bgcolor="rgba(0,0,0,0)"
-        ),
-        hoverlabel=dict(bgcolor=BG_PANEL, font_color=TEXT_PRIMARY, bordercolor=BORDER)
-    )
-    st.plotly_chart(fig_equity, use_container_width=True)
-
-with col_leaderboard:
-    st.markdown("<p class='section-title'>🏆 Swarm Leaderboard</p>", unsafe_allow_html=True)
-    st.markdown("<p class='section-subtitle'>Ranked by total equity</p>", unsafe_allow_html=True)
-
-    leaderboard_df = latest_snapshots[['agent_id', 'equity', 'cash', 'pnl_pct']].sort_values('equity', ascending=False)
-
-    st.dataframe(
-        leaderboard_df,
-        column_config={
-            "agent_id": st.column_config.TextColumn("Agent ID"),
-            "equity": st.column_config.NumberColumn("Total Equity", format="$%.2f"),
-            "cash": st.column_config.NumberColumn("Available Cash", format="$%.2f"),
-            "pnl_pct": st.column_config.NumberColumn("PnL %", format="%+.2f%%"),
-        },
-        use_container_width=True,
-        hide_index=True,
-        height=350
-    )
+render_kpi_metrics()
 
 st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
 
-# --- ROW 2: AGENT PORTFOLIO INSPECTOR (LONG & SHORT SUPPORT) ---
+# --- ROW 1: EQUITY CURVES & LIVE LEADERBOARD FRAGMENT ---
+@st.fragment(run_every=refresh_interval)
+def render_row_1():
+    df_snapshots = load_snapshots()
+    if df_snapshots.empty:
+        return
+
+    latest_snapshots = df_snapshots.sort_values('timestamp').groupby('agent_id').last().reset_index()
+    col_chart, col_leaderboard = st.columns([3, 2])
+
+    with col_chart:
+        st.markdown("<p class='section-title'>📈 Real-Time Agent Equity Growth</p>", unsafe_allow_html=True)
+        st.markdown("<p class='section-subtitle'>Equity trajectory across all live swarm agents</p>", unsafe_allow_html=True)
+
+        fig_equity = px.line(
+            df_snapshots,
+            x="timestamp",
+            y="equity",
+            color="agent_id",
+            color_discrete_map=AGENT_COLORS,
+            labels={"equity": "Equity ($)", "timestamp": "Timestamp", "agent_id": "Agent"}
+        )
+
+        fig_equity.update_traces(line=dict(width=2.75), marker=dict(size=6))
+        fig_equity.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor=BG_PANEL_ALT,
+            font=PLOT_FONT,
+            height=380,
+            margin=dict(l=20, r=20, t=20, b=20),
+            hovermode="x unified",
+            xaxis=dict(gridcolor=BORDER, showline=True, linecolor=BORDER, zeroline=False),
+            yaxis=dict(gridcolor=BORDER, showline=True, linecolor=BORDER, tickprefix="$", zeroline=False),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1,
+                font=dict(color=TEXT_PRIMARY, size=11),
+                bgcolor="rgba(0,0,0,0)"
+            ),
+            hoverlabel=dict(bgcolor=BG_PANEL, font_color=TEXT_PRIMARY, bordercolor=BORDER)
+        )
+        st.plotly_chart(fig_equity, use_container_width=True)
+
+    with col_leaderboard:
+        st.markdown("<p class='section-title'>🏆 Swarm Leaderboard</p>", unsafe_allow_html=True)
+        st.markdown("<p class='section-subtitle'>Ranked by total equity</p>", unsafe_allow_html=True)
+
+        leaderboard_df = latest_snapshots[['agent_id', 'equity', 'cash', 'pnl_pct']].sort_values('equity', ascending=False)
+
+        st.dataframe(
+            leaderboard_df,
+            column_config={
+                "agent_id": st.column_config.TextColumn("Agent ID"),
+                "equity": st.column_config.NumberColumn("Total Equity", format="$%.2f"),
+                "cash": st.column_config.NumberColumn("Available Cash", format="$%.2f"),
+                "pnl_pct": st.column_config.NumberColumn("PnL %", format="%+.2f%%"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            height=350
+        )
+
+render_row_1()
+
+st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
+
+# --- ROW 2: AGENT PORTFOLIO INSPECTOR ---
 st.markdown("<p class='section-title'>🔍 Agent Position & Allocation Inspector</p>", unsafe_allow_html=True)
 st.markdown("<p class='section-subtitle'>Drill into any agent's live book (Long & Short Positions)</p>", unsafe_allow_html=True)
 
-agents_list = latest_snapshots['agent_id'].unique().tolist()
+df_snaps_init = load_snapshots()
+agents_list = df_snaps_init['agent_id'].unique().tolist() if not df_snaps_init.empty else ["Agent_Alpha", "Agent_Beta", "Agent_Gamma", "Agent_Delta", "Agent_Epsilon"]
 selected_agent = st.selectbox("Select Agent Persona to Inspect:", agents_list)
 
-col_positions, col_pie = st.columns([3, 2])
+@st.fragment(run_every=refresh_interval)
+def render_row_2(agent_id):
+    df_holdings = load_holdings()
+    col_positions, col_pie = st.columns([3, 2])
 
-if not df_holdings.empty:
-    agent_pos = df_holdings[df_holdings['agent_id'] == selected_agent].copy()
+    if not df_holdings.empty:
+        agent_pos = df_holdings[df_holdings['agent_id'] == agent_id].copy()
 
-    if not agent_pos.empty:
-        agent_pos['position_type'] = agent_pos['amount'].apply(lambda x: "LONG" if x > 0 else "SHORT")
-        agent_pos['shares_abs'] = agent_pos['amount'].abs()
-        agent_pos['pos_value'] = agent_pos['shares_abs'] * agent_pos['entry_price']
-
-    with col_positions:
         if not agent_pos.empty:
-            st.markdown(f"**Active Positions for `{selected_agent}`:**")
+            agent_pos['position_type'] = agent_pos['amount'].apply(lambda x: "LONG" if x > 0 else "SHORT")
+            agent_pos['shares_abs'] = agent_pos['amount'].abs()
+            agent_pos['pos_value'] = agent_pos['shares_abs'] * agent_pos['entry_price']
+
+        with col_positions:
+            if not agent_pos.empty:
+                st.markdown(f"**Active Positions for `{agent_id}`:**")
+                st.dataframe(
+                    agent_pos[['ticker', 'position_type', 'shares_abs', 'entry_price', 'pos_value']],
+                    column_config={
+                        "ticker": st.column_config.TextColumn("Ticker"),
+                        "position_type": st.column_config.TextColumn("Side"),
+                        "shares_abs": st.column_config.NumberColumn("Shares", format="%.2f"),
+                        "entry_price": st.column_config.NumberColumn("Avg Entry Price", format="$%.2f"),
+                        "pos_value": st.column_config.NumberColumn("Notional Value", format="$%.2f"),
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+            else:
+                st.info(f"💡 `{agent_id}` is currently holding **100% Cash**.")
+
+        with col_pie:
+            if not agent_pos.empty and (agent_pos['pos_value'] > 0).any():
+                pie_df = agent_pos[agent_pos['pos_value'] > 0].copy()
+                pie_df['display_name'] = pie_df['ticker'] + " (" + pie_df['position_type'] + ")"
+
+                fig_donut = px.pie(
+                    pie_df,
+                    names="display_name",
+                    values="pos_value",
+                    hole=0.55,
+                    color_discrete_sequence=[ACCENT, ACCENT_2, ACCENT_WARN, "#F472B6", ACCENT_UP, "#60A5FA"]
+                )
+
+                fig_donut.update_traces(
+                    textposition='inside',
+                    textinfo='percent+label',
+                    insidetextfont=dict(color='#0B0E14', size=11, family="Inter, sans-serif"),
+                    marker=dict(line=dict(color=BG_PANEL_ALT, width=3))
+                )
+
+                fig_donut.update_layout(
+                    title=dict(
+                        text=f"Allocation Breakdown ({agent_id})",
+                        font=dict(color=TEXT_PRIMARY, size=14, family="Inter, sans-serif")
+                    ),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    showlegend=True,
+                    legend=dict(
+                        font=dict(color=TEXT_PRIMARY, size=12),
+                        orientation="v",
+                        yanchor="middle",
+                        y=0.5,
+                        xanchor="left",
+                        x=1.05
+                    ),
+                    height=360,
+                    margin=dict(l=10, r=10, t=40, b=10),
+                    hoverlabel=dict(bgcolor=BG_PANEL, font_color=TEXT_PRIMARY, bordercolor=BORDER)
+                )
+                st.plotly_chart(fig_donut, use_container_width=True)
+    else:
+        st.info(f"💡 `{agent_id}` has no active stock positions registered across the swarm.")
+
+render_row_2(selected_agent)
+
+st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
+
+# --- ROW 3: DIVIDEND ACTIVITY & SCHEDULE LEDGER FRAGMENT ---
+@st.fragment(run_every=refresh_interval)
+def render_row_3():
+    df_divs = load_dividends()
+    df_div_sched = load_dividend_schedule()
+
+    st.markdown("<p class='section-title'>💰 Dividend Activity & Schedule Ledger</p>", unsafe_allow_html=True)
+    st.markdown("<p class='section-subtitle'>Real-time ex-dividend payouts (Long Credits / Short Obligations) and calendar schedule</p>", unsafe_allow_html=True)
+
+    col_div_logs, col_div_sched = st.columns([3, 2])
+
+    with col_div_logs:
+        st.markdown("**Recent Dividend Transactions:**")
+        if not df_divs.empty:
             st.dataframe(
-                agent_pos[['ticker', 'position_type', 'shares_abs', 'entry_price', 'pos_value']],
+                df_divs[['timestamp', 'agent_id', 'ticker', 'action', 'shares', 'amount_per_share', 'total_amount']],
                 column_config={
+                    "timestamp": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm"),
+                    "agent_id": st.column_config.TextColumn("Agent"),
                     "ticker": st.column_config.TextColumn("Ticker"),
-                    "position_type": st.column_config.TextColumn("Side"),
-                    "shares_abs": st.column_config.NumberColumn("Shares", format="%.2f"),
-                    "entry_price": st.column_config.NumberColumn("Avg Entry Price", format="$%.2f"),
-                    "pos_value": st.column_config.NumberColumn("Notional Value", format="$%.2f"),
+                    "action": st.column_config.TextColumn("Action"),
+                    "shares": st.column_config.NumberColumn("Shares", format="%.2f"),
+                    "amount_per_share": st.column_config.NumberColumn("Div/Share", format="$%.2f"),
+                    "total_amount": st.column_config.NumberColumn("Total Cash Impact", format="$%+.2f"),
                 },
                 hide_index=True,
                 use_container_width=True
             )
         else:
-            st.info(f"💡 `{selected_agent}` is currently holding **100% Cash**.")
+            st.info("No ex-dividend payout/debit transactions logged yet.")
 
-    with col_pie:
-        if not agent_pos.empty and (agent_pos['pos_value'] > 0).any():
-            pie_df = agent_pos[agent_pos['pos_value'] > 0].copy()
-            pie_df['display_name'] = pie_df['ticker'] + " (" + pie_df['position_type'] + ")"
-
-            fig_donut = px.pie(
-                pie_df,
-                names="display_name",
-                values="pos_value",
-                hole=0.55,
-                color_discrete_sequence=[ACCENT, ACCENT_2, ACCENT_WARN, "#F472B6", ACCENT_UP, "#60A5FA"]
+    with col_div_sched:
+        st.markdown("**Ex-Dividend Calendar Schedule:**")
+        if not df_div_sched.empty:
+            st.dataframe(
+                df_div_sched[['ticker', 'ex_date', 'amount_per_share']],
+                column_config={
+                    "ticker": st.column_config.TextColumn("Ticker"),
+                    "ex_date": st.column_config.DateColumn("Ex-Dividend Date", format="YYYY-MM-DD"),
+                    "amount_per_share": st.column_config.NumberColumn("Est. Div/Share", format="$%.2f"),
+                },
+                hide_index=True,
+                use_container_width=True
             )
+        else:
+            st.info("No upcoming ex-dividend dates registered.")
 
-            fig_donut.update_traces(
-                textposition='inside',
-                textinfo='percent+label',
-                insidetextfont=dict(color='#0B0E14', size=11, family="Inter, sans-serif"),
-                marker=dict(line=dict(color=BG_PANEL_ALT, width=3))
-            )
-
-            fig_donut.update_layout(
-                title=dict(
-                    text=f"Allocation Breakdown ({selected_agent})",
-                    font=dict(color=TEXT_PRIMARY, size=14, family="Inter, sans-serif")
-                ),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                showlegend=True,
-                legend=dict(
-                    font=dict(color=TEXT_PRIMARY, size=12),
-                    orientation="v",
-                    yanchor="middle",
-                    y=0.5,
-                    xanchor="left",
-                    x=1.05
-                ),
-                height=360,
-                margin=dict(l=10, r=10, t=40, b=10),
-                hoverlabel=dict(bgcolor=BG_PANEL, font_color=TEXT_PRIMARY, bordercolor=BORDER)
-            )
-            st.plotly_chart(fig_donut, use_container_width=True)
-else:
-    st.info(f"💡 `{selected_agent}` has no active stock positions registered across the swarm.")
-
-st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
-
-# --- ROW 3: DIVIDEND ACTIVITY & SCHEDULE LEDGER ---
-st.markdown("<p class='section-title'>💰 Dividend Activity & Schedule Ledger</p>", unsafe_allow_html=True)
-st.markdown("<p class='section-subtitle'>Real-time ex-dividend payouts (Long Credits / Short Obligations) and calendar schedule</p>", unsafe_allow_html=True)
-
-col_div_logs, col_div_sched = st.columns([3, 2])
-
-with col_div_logs:
-    st.markdown("**Recent Dividend Transactions:**")
-    if not df_divs.empty:
-        st.dataframe(
-            df_divs[['timestamp', 'agent_id', 'ticker', 'action', 'shares', 'amount_per_share', 'total_amount']],
-            column_config={
-                "timestamp": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm"),
-                "agent_id": st.column_config.TextColumn("Agent"),
-                "ticker": st.column_config.TextColumn("Ticker"),
-                "action": st.column_config.TextColumn("Action"),
-                "shares": st.column_config.NumberColumn("Shares", format="%.2f"),
-                "amount_per_share": st.column_config.NumberColumn("Div/Share", format="$%.2f"),
-                "total_amount": st.column_config.NumberColumn("Total Cash Impact", format="$%+.2f"),
-            },
-            hide_index=True,
-            use_container_width=True
-        )
-    else:
-        st.info("No ex-dividend payout/debit transactions logged yet.")
-
-with col_div_sched:
-    st.markdown("**Ex-Dividend Calendar Schedule:**")
-    if not df_div_sched.empty:
-        st.dataframe(
-            df_div_sched[['ticker', 'ex_date', 'amount_per_share']],
-            column_config={
-                "ticker": st.column_config.TextColumn("Ticker"),
-                "ex_date": st.column_config.DateColumn("Ex-Dividend Date", format="YYYY-MM-DD"),
-                "amount_per_share": st.column_config.NumberColumn("Est. Div/Share", format="$%.2f"),
-            },
-            hide_index=True,
-            use_container_width=True
-        )
-    else:
-        st.info("No upcoming ex-dividend dates registered.")
+render_row_3()
 
 st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
 
@@ -629,57 +653,59 @@ st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
 st.markdown("<p class='section-title'>📜 Master Execution Trade Audit Log</p>", unsafe_allow_html=True)
 st.markdown("<p class='section-subtitle'>Full execution history across the swarm, filterable by agent, action, and reason</p>", unsafe_allow_html=True)
 
-if not df_trades.empty:
+df_trades_init = load_trades()
+if not df_trades_init.empty:
     f_col1, f_col2, f_col3 = st.columns(3)
 
+    default_agents = df_trades_init['agent_id'].unique().tolist() if 'agent_id' in df_trades_init.columns else []
+    default_actions = df_trades_init['action'].unique().tolist() if 'action' in df_trades_init.columns else []
+    reasons_list = df_trades_init['reason'].unique().tolist() if "reason" in df_trades_init.columns else ["ALLOCATION"]
+
     with f_col1:
-        selected_agents_filter = st.multiselect(
-            "Filter Agents:", options=df_trades['agent_id'].unique(), default=df_trades['agent_id'].unique()
-        )
+        selected_agents_filter = st.multiselect("Filter Agents:", options=default_agents, default=default_agents)
     with f_col2:
-        selected_actions_filter = st.multiselect(
-            "Filter Order Type:", options=df_trades['action'].unique(), default=df_trades['action'].unique()
-        )
+        selected_actions_filter = st.multiselect("Filter Order Type:", options=default_actions, default=default_actions)
     with f_col3:
-        reasons_list = df_trades['reason'].unique() if "reason" in df_trades.columns else ["ALLOCATION"]
-        selected_reasons_filter = st.multiselect(
-            "Filter Execution Reason:", options=reasons_list, default=reasons_list
+        selected_reasons_filter = st.multiselect("Filter Execution Reason:", options=reasons_list, default=reasons_list)
+
+    @st.fragment(run_every=refresh_interval)
+    def render_row_4(sel_agents, sel_actions, sel_reasons):
+        df_trades = load_trades()
+        if df_trades.empty:
+            st.info("No trade logs recorded in `TimescaleDB` yet.")
+            return
+
+        filtered_df = df_trades[
+            (df_trades['agent_id'].isin(sel_agents)) &
+            (df_trades['action'].isin(sel_actions))
+        ].copy()
+
+        if "reason" in df_trades.columns:
+            filtered_df = filtered_df[filtered_df['reason'].isin(sel_reasons)]
+
+        cols_to_show = ['timestamp', 'agent_id', 'action', 'ticker', 'shares', 'price', 'allocation_pct']
+        if "reason" in df_trades.columns:
+            cols_to_show.append('reason')
+
+        display_df = filtered_df[cols_to_show].copy()
+        display_df['allocation_pct'] = display_df['allocation_pct'] * 100.0
+
+        st.dataframe(
+            display_df,
+            column_config={
+                "timestamp": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm:ss"),
+                "agent_id": st.column_config.TextColumn("Agent"),
+                "action": st.column_config.TextColumn("Action"),
+                "ticker": st.column_config.TextColumn("Ticker"),
+                "shares": st.column_config.NumberColumn("Shares", format="%.2f"),
+                "price": st.column_config.NumberColumn("Exec Price", format="$%.2f"),
+                "allocation_pct": st.column_config.NumberColumn("Alloc %", format="%.1f%%"),
+                "reason": st.column_config.TextColumn("Execution Reason"),
+            },
+            use_container_width=True,
+            hide_index=True
         )
 
-    filtered_df = df_trades[
-        (df_trades['agent_id'].isin(selected_agents_filter)) &
-        (df_trades['action'].isin(selected_actions_filter))
-    ].copy()
-
-    if "reason" in df_trades.columns:
-        filtered_df = filtered_df[filtered_df['reason'].isin(selected_reasons_filter)]
-
-    cols_to_show = ['timestamp', 'agent_id', 'action', 'ticker', 'shares', 'price', 'allocation_pct']
-    if "reason" in df_trades.columns:
-        cols_to_show.append('reason')
-
-    display_df = filtered_df[cols_to_show].copy()
-    display_df['allocation_pct'] = display_df['allocation_pct'] * 100.0
-
-    st.dataframe(
-        display_df,
-        column_config={
-            "timestamp": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm:ss"),
-            "agent_id": st.column_config.TextColumn("Agent"),
-            "action": st.column_config.TextColumn("Action"),
-            "ticker": st.column_config.TextColumn("Ticker"),
-            "shares": st.column_config.NumberColumn("Shares", format="%.2f"),
-            "price": st.column_config.NumberColumn("Exec Price", format="$%.2f"),
-            "allocation_pct": st.column_config.NumberColumn("Alloc %", format="%.1f%%"),
-            "reason": st.column_config.TextColumn("Execution Reason"),
-        },
-        use_container_width=True,
-        hide_index=True
-    )
+    render_row_4(selected_agents_filter, selected_actions_filter, selected_reasons_filter)
 else:
     st.info("No trade logs recorded in `TimescaleDB` yet.")
-
-# --- 5-SECOND AUTO-REFRESH EXECUTION LOOP ---
-if auto_refresh:
-    time.sleep(5)
-    st.rerun()
