@@ -2,9 +2,11 @@ import os
 import re
 import json
 import logging
+import asyncio
 import httpx
 import feedparser
 import numpy as np
+import boto3
 from typing import Dict, Any
 from dotenv import load_dotenv
 
@@ -16,11 +18,12 @@ logger = logging.getLogger("NewsSentimentAgent")
 class NewsSentimentAgent:
     """
     RAG Macro News Sentiment & Regime Scaler Agent.
-    Fetches real-time financial headlines from RSS feeds and uses Qwen 2.5 72B models
+    Fetches real-time financial headlines from RSS feeds and uses multi-provider LLMs
+    (Groq -> OpenRouter -> GitHub Models -> SambaNova -> AWS Bedrock)
     to output a strictly bounded risk multiplier [0.5x, 1.5x].
     """
     def __init__(self, api_key: str = None):
-        self.api_key = api_key or os.getenv("GROQ_API_KEY")
+        self.api_key = api_key or os.getenv("GROQ_API_KEY2")
         self.rss_feeds = [
             "https://finance.yahoo.com/news/rssindex",
             "https://feeds.content.dowjones.io/public/rss/mw_topstories",
@@ -50,6 +53,44 @@ class NewsSentimentAgent:
             return "Markets trading in normal consolidation range. No major systemic news events detected."
 
         return "\n".join([f"- {h}" for h in headlines[:max_headlines]])
+
+    def _call_aws_bedrock_llama(self, prompt: str) -> str:
+        """
+        Synchronous AWS Bedrock Converse API invocation for Llama 3.3 70B Instruct.
+        Executed inside an async thread executor to avoid blocking the event loop.
+        """
+        aws_key = os.getenv("AWS_ACCESS_KEY_ID")
+        aws_secret = os.getenv("AWS_SECRET_ACCESS_KEY")
+        region = os.getenv("AWS_REGION", "us-east-1")
+
+        if not aws_key or not aws_secret:
+            raise ValueError("AWS credentials not set in environment.")
+
+        bedrock_client = boto3.client(
+            service_name="bedrock-runtime",
+            region_name=region,
+            aws_access_key_id=aws_key,
+            aws_secret_access_key=aws_secret
+        )
+
+        model_id = "us.meta.llama3-3-70b-instruct-v1:0"
+
+        response = bedrock_client.converse(
+            modelId=model_id,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"text": prompt}]
+                }
+            ],
+            inferenceConfig={
+                "temperature": 0.1,
+                "maxTokens": 1024
+            }
+        )
+
+        output_message = response["output"]["message"]["content"][0]["text"]
+        return output_message
 
     def _sanitize_sentiment_output(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -88,7 +129,6 @@ class NewsSentimentAgent:
         """
         Synchronous wrapper calling the multi-provider LLM analysis safely without external loop dependencies.
         """
-        import asyncio
         import concurrent.futures
 
         try:
@@ -100,7 +140,7 @@ class NewsSentimentAgent:
             if loop and loop.is_running():
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(lambda: asyncio.run(self.analyze_macro_sentiment_async()))
-                    return future.result(timeout=25.0)
+                    return future.result(timeout=30.0)
             else:
                 return asyncio.run(self.analyze_macro_sentiment_async())
         except Exception as e:
@@ -109,7 +149,8 @@ class NewsSentimentAgent:
 
     async def analyze_macro_sentiment_async(self) -> Dict[str, Any]:
         """
-        Queries multi-provider Qwen 2.5 72B models asynchronously to evaluate current financial headlines.
+        Queries multi-provider LLMs asynchronously to evaluate current financial headlines.
+        Routes through free tiers first, falling back to AWS Bedrock Llama 3.3 70B if rate-limited.
         """
         async with httpx.AsyncClient() as client:
             headlines_text = await self._fetch_rss_headlines_async(client)
@@ -132,43 +173,63 @@ INSTRUCTIONS:
 """
 
             providers = [
-    {
-        "name": "Groq",
-        "url": "https://api.groq.com/openai/v1/chat/completions",
-        "key": self.api_key or os.getenv("GROQ_API_KEY2"),
-        "model": "llama-3.3-70b-versatile",
-        "use_json_format": True
-    },
-    {
-        "name": "OpenRouter",
-        "url": "https://openrouter.ai/api/v1/chat/completions",
-        "key": os.getenv("OPENROUTER_API_KEY2"),
-        "model": "meta-llama/llama-3.3-70b-instruct:free",
-        "headers": {
-            "HTTP-Referer": "https://github.com/EvoQuant-AI",
-            "X-Title": "EvoQuant Trading Swarm"
-        },
-        "use_json_format": True
-    },
-    {
-        "name": "GitHub Models",
-        "url": "https://models.inference.ai.azure.com/chat/completions",
-        "key": os.getenv("GITHUB_TOKEN2"),
-        "model": "Llama-3.3-70B-Instruct",
-        "use_json_format": True
-    },
-    {
-        "name": "SambaNova",
-        "url": "https://api.sambanova.ai/v1/chat/completions",
-        "key": os.getenv("SAMBANOVA_API_KEY2"),
-        "model": "Meta-Llama-3.3-70B-Instruct",
-        "use_json_format": False  # Keeps SambaNova from throwing 400 Bad Request
-    }
-]
+                {
+                    "name": "Groq",
+                    "type": "http",
+                    "url": "https://api.groq.com/openai/v1/chat/completions",
+                    "key": self.api_key or os.getenv("GROQ_API_KEY2"),
+                    "model": "llama-3.3-70b-versatile",
+                    "use_json_format": True
+                },
+                {
+                    "name": "OpenRouter",
+                    "type": "http",
+                    "url": "https://openrouter.ai/api/v1/chat/completions",
+                    "key": os.getenv("OPENROUTER_API_KEY2"),
+                    "model": "meta-llama/llama-3.3-70b-instruct:free",
+                    "headers": {
+                        "HTTP-Referer": "https://github.com/EvoQuant-AI",
+                        "X-Title": "EvoQuant Trading Swarm"
+                    },
+                    "use_json_format": True
+                },
+                {
+                    "name": "GitHub Models",
+                    "type": "http",
+                    "url": "https://models.inference.ai.azure.com/chat/completions",
+                    "key": os.getenv("GITHUB_TOKEN2"),
+                    "model": "Llama-3.3-70B-Instruct",
+                    "use_json_format": True
+                },
+                {
+                    "name": "SambaNova",
+                    "type": "http",
+                    "url": "https://api.sambanova.ai/v1/chat/completions",
+                    "key": os.getenv("SAMBANOVA_API_KEY2"),
+                    "model": "Meta-Llama-3.3-70B-Instruct",
+                    "use_json_format": False
+                },
+                {
+                    "name": "AWS Bedrock (Llama 3.3 70B)",
+                    "type": "bedrock",
+                    "key": os.getenv("AWS_ACCESS_KEY_ID")
+                }
+            ]
 
             for p in providers:
                 if not p["key"]:
                     continue
+
+                if p["type"] == "bedrock":
+                    try:
+                        logger.info("🛡️ Free tiers exhausted or rate-limited. Routing request to AWS Bedrock (Llama 3.3 70B)...")
+                        content = await asyncio.to_thread(self._call_aws_bedrock_llama, prompt)
+                        cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", content).strip()
+                        parsed = json.loads(cleaned)
+                        return self._sanitize_sentiment_output(parsed)
+                    except Exception as e:
+                        logger.warning(f"⚠️ AWS Bedrock execution failed: {e}")
+                        continue
 
                 headers = {
                     "Authorization": f"Bearer {p['key']}",
@@ -188,7 +249,7 @@ INSTRUCTIONS:
 
                 try:
                     resp = await client.post(p["url"], json=payload, headers=headers, timeout=12.0)
-                    if resp.status_code in (400, 402, 404, 429):
+                    if resp.status_code in (400, 401, 402, 404, 410, 429):
                         logger.warning(f"⚠️ [{p['name']}] News sentiment fetch failed ({resp.status_code}). Trying next provider...")
                         continue
 
