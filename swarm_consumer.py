@@ -1,7 +1,9 @@
 import os
 import json
+import math
 import asyncio
 import httpx
+import sqlalchemy
 import redis.asyncio as redis
 import pandas as pd
 from datetime import datetime
@@ -28,6 +30,66 @@ risk_engine = AdvancedRiskEngine(target_volatility=0.15, max_position_pct=0.05)
 sentiment_agent = NewsSentimentAgent()
 broker_bridge = AlpacaExecutionBridge()
 
+
+def restore_agent_states_from_db(swarm_mgr, db):
+    """Restore agent cash, holdings, and entry prices from TimescaleDB on container startup."""
+    try:
+        engine = getattr(db, 'engine', None)
+        if engine is None:
+            postgres_user = os.getenv("POSTGRES_USER", "evoquant")
+            postgres_password = os.getenv("POSTGRES_PASSWORD", "evoquant_secret_pass")
+            postgres_host = os.getenv("POSTGRES_HOST", "localhost")
+            postgres_port = os.getenv("POSTGRES_PORT", "5432")
+            postgres_db = os.getenv("POSTGRES_DB", "evoquant_db")
+            postgres_url = f"postgresql+psycopg://{postgres_user}:{postgres_password}@{postgres_host}:{postgres_port}/{postgres_db}"
+            engine = sqlalchemy.create_engine(postgres_url)
+
+        snapshots_df = pd.read_sql(
+            "SELECT DISTINCT ON (agent_id) agent_id, cash, equity FROM agent_snapshots ORDER BY agent_id, timestamp DESC;",
+            engine
+        )
+        holdings_df = pd.read_sql(
+            "SELECT agent_id, ticker, amount, entry_price FROM agent_holdings WHERE amount != 0;",
+            engine
+        )
+
+        for agent in swarm_mgr.population:
+            if not hasattr(agent, 'entry_prices'):
+                agent.entry_prices = {}
+
+            # Restore Cash
+            agent_snap = snapshots_df[snapshots_df['agent_id'] == agent.agent_id]
+            if not agent_snap.empty:
+                agent.cash = float(agent_snap.iloc[0]['cash'])
+
+            # Restore Active Holdings & Entry Prices
+            agent_pos = holdings_df[holdings_df['agent_id'] == agent.agent_id]
+            if not agent_pos.empty:
+                agent.holdings = {row['ticker']: float(row['amount']) for _, row in agent_pos.iterrows()}
+                agent.entry_prices = {row['ticker']: float(row['entry_price']) for _, row in agent_pos.iterrows()}
+
+        logger.info("✅ Successfully restored agent cash, holdings, and entry prices from TimescaleDB.")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not restore state from DB (starting with defaults): {e}")
+
+
+def submit_safe_broker_order(broker, ticker: str, shares: float, action: str):
+    """Submits orders to Alpaca, ensuring integer quantities for SHORT/COVER to prevent HTTP 422 errors."""
+    if not broker.is_active():
+        return
+    try:
+        if action in ["SHORT", "COVER"]:
+            int_shares = math.floor(abs(shares))
+            if int_shares >= 1:
+                broker.submit_market_order(ticker, int_shares, action)
+            else:
+                logger.warning(f"⚠️ Skipped Alpaca {action} order for {ticker}: {shares:.2f} shares < 1.0 integer share minimum.")
+        else:
+            broker.submit_market_order(ticker, abs(shares), action)
+    except Exception as e:
+        logger.error(f"❌ [ALPACA BROKER EXCEPTION] {action} {ticker}: {e}")
+
+
 async def run_consumer():
     groq_api_key = os.getenv("GROQ_API_KEY")
     if not groq_api_key:
@@ -39,6 +101,9 @@ async def run_consumer():
 
     for agent in swarm_mgr.population:
         db.register_agent(agent.agent_id)
+
+    # RECOVER PORTFOLIO STATE ON STARTUP
+    restore_agent_states_from_db(swarm_mgr, db)
 
     REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 
@@ -162,7 +227,7 @@ async def run_consumer():
                                         db.log_trade(agent.agent_id, tk, action, abs(shares), exec_price, 0.0, reason="HARD_STOP_LOSS")
                                         logger.warning(f"  🚨 [{agent.agent_id}] HARD STOP-LOSS on {tk} ({action}): Exec @ ${exec_price:.2f} ({pos_pnl*100:.2f}%)")
 
-                                        broker_bridge.submit_market_order(tk, abs(shares), action)
+                                        submit_safe_broker_order(broker_bridge, tk, abs(shares), action)
 
                                     # Hard Take-Profit Liquidation
                                     elif pos_pnl >= TAKE_PROFIT_PCT:
@@ -182,7 +247,7 @@ async def run_consumer():
                                         db.log_trade(agent.agent_id, tk, action, abs(shares), exec_price, 0.0, reason="HARD_TAKE_PROFIT")
                                         logger.info(f"  🎯 [{agent.agent_id}] HARD TAKE-PROFIT on {tk} ({action}): Exec @ ${exec_price:.2f} (+{pos_pnl*100:.2f}%)")
 
-                                        broker_bridge.submit_market_order(tk, abs(shares), action)
+                                        submit_safe_broker_order(broker_bridge, tk, abs(shares), action)
 
                         # -------------------------------------------------------------
                         # PHASE B: CONCURRENT ASYNC STRATEGY EXECUTION
@@ -238,7 +303,7 @@ async def run_consumer():
                                         db.log_trade(agent.agent_id, ticker, "BUY", shares, exec_price, effective_alloc, reason="RISK_PARITY_ALLOCATION")
                                         logger.info(f"  📈 [{agent.agent_id}] BOUGHT {ticker}: +{shares:.2f}sh @ ${exec_price:.2f} (Avg Cost: ${weighted_entry:.2f})")
 
-                                        broker_bridge.submit_market_order(ticker, shares, "BUY")
+                                        submit_safe_broker_order(broker_bridge, ticker, shares, "BUY")
 
                                 # 2. SELL Execution (Long Reduction / Exit)
                                 elif target.action == "SELL" and current_pos_qty > 0:
@@ -261,7 +326,7 @@ async def run_consumer():
                                         db.log_trade(agent.agent_id, ticker, "SELL", sell_shares, exec_price, effective_alloc, reason="RISK_PARITY_REBALANCE")
                                         logger.info(f"  📉 [{agent.agent_id}] SOLD {ticker}: -{sell_shares:.2f}sh @ ${exec_price:.2f}")
 
-                                        broker_bridge.submit_market_order(ticker, sell_shares, "SELL")
+                                        submit_safe_broker_order(broker_bridge, ticker, sell_shares, "SELL")
 
                                 # 3. SHORT Execution (Short Entry / Scale Up)
                                 elif target.action == "SHORT":
@@ -288,7 +353,7 @@ async def run_consumer():
                                             db.log_trade(agent.agent_id, ticker, "SHORT", actual_short_shares, exec_price, effective_alloc, reason="RISK_PARITY_SHORT")
                                             logger.info(f"  📉 [{agent.agent_id}] SHORTED {ticker}: -{actual_short_shares:.2f}sh @ ${exec_price:.2f}")
 
-                                            broker_bridge.submit_market_order(ticker, actual_short_shares, "SHORT")
+                                            submit_safe_broker_order(broker_bridge, ticker, actual_short_shares, "SHORT")
 
                                 # 4. COVER Execution (Short Reduction / Exit)
                                 elif target.action == "COVER" and current_pos_qty < 0:
@@ -312,7 +377,7 @@ async def run_consumer():
                                         db.log_trade(agent.agent_id, ticker, "COVER", cover_shares, exec_price, effective_alloc, reason="RISK_PARITY_COVER")
                                         logger.info(f"  📈 [{agent.agent_id}] COVERED {ticker}: +{cover_shares:.2f}sh @ ${exec_price:.2f}")
 
-                                        broker_bridge.submit_market_order(ticker, cover_shares, "COVER")
+                                        submit_safe_broker_order(broker_bridge, ticker, cover_shares, "COVER")
 
                         # Print Competing Leaderboard & Log Snapshots
                         logger.info("\n🏆 --- COMPETING AGENT LEADERBOARD ---")
