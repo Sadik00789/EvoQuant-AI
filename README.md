@@ -76,7 +76,7 @@ EvoQuant-AI operates as a containerized microservice architecture using a decoup
 
 ## 🧰 Tech Stack
 
-- **Language & Runtime:** Python 3.12-slim
+- **Language & Runtime:** Python 3.14-slim
 - **Containerization:** Docker & Docker Compose V2
 - **Storage Layer:** PostgreSQL 16 / TimescaleDB (psycopg3, SQLAlchemy)
 - **In-Memory Messaging:** Redis (alpine)
