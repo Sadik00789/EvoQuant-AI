@@ -32,13 +32,13 @@ broker_bridge = AlpacaExecutionBridge()
 
 
 def restore_agent_states_from_db(swarm_mgr, db):
-    """Restore agent cash, holdings, and entry prices from TimescaleDB on container startup."""
+    """Restore agent cash, holdings, and entry prices from TimescaleDB on container startup, and log initial snapshot."""
     try:
         engine = getattr(db, 'engine', None)
         if engine is None:
             postgres_user = os.getenv("POSTGRES_USER", "evoquant")
             postgres_password = os.getenv("POSTGRES_PASSWORD", "evoquant_secret_pass")
-            postgres_host = os.getenv("POSTGRES_HOST", "localhost")
+            postgres_host = os.getenv("POSTGRES_HOST", "timescaledb")
             postgres_port = os.getenv("POSTGRES_PORT", "5432")
             postgres_db = os.getenv("POSTGRES_DB", "evoquant_db")
             postgres_url = f"postgresql+psycopg://{postgres_user}:{postgres_password}@{postgres_host}:{postgres_port}/{postgres_db}"
@@ -68,7 +68,17 @@ def restore_agent_states_from_db(swarm_mgr, db):
                 agent.holdings = {row['ticker']: float(row['amount']) for _, row in agent_pos.iterrows()}
                 agent.entry_prices = {row['ticker']: float(row['entry_price']) for _, row in agent_pos.iterrows()}
 
-        logger.info("✅ Successfully restored agent cash, holdings, and entry prices from TimescaleDB.")
+            # Recalculate Restored Equity on Startup using restored entry prices
+            long_val = sum(qty * agent.entry_prices.get(tk, 0.0) for tk, qty in agent.holdings.items() if qty > 0)
+            short_liability = sum(abs(qty) * agent.entry_prices.get(tk, 0.0) for tk, qty in agent.holdings.items() if qty < 0)
+            restored_equity = round(agent.cash + long_val - short_liability, 2)
+            agent.equity_history = [restored_equity]
+
+            # Log instant startup snapshot so TimescaleDB updates immediately
+            pnl = ((restored_equity - 100000.0) / 100000.0) * 100
+            db.log_snapshot(agent.agent_id, restored_equity, agent.cash, pnl)
+
+        logger.info("✅ Successfully restored agent cash, holdings, equity, and logged startup snapshots.")
     except Exception as e:
         logger.warning(f"⚠️ Could not restore state from DB (starting with defaults): {e}")
 
@@ -102,7 +112,7 @@ async def run_consumer():
     for agent in swarm_mgr.population:
         db.register_agent(agent.agent_id)
 
-    # RECOVER PORTFOLIO STATE ON STARTUP
+    # RECOVER PORTFOLIO STATE & LOG STARTUP SNAPSHOT
     restore_agent_states_from_db(swarm_mgr, db)
 
     REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
@@ -157,19 +167,21 @@ async def run_consumer():
                             except Exception as e:
                                 logger.warning(f"⚠️ Daily dividend processing note: {e}")
 
-                        # Refresh news sentiment every 4 market ticks (~1 hour)
-                        if tick_counter % 4 == 0:
+                        # Refresh news sentiment every 4 ticks (~1 hour) OR retry immediately if currently on fallback
+                        if tick_counter % 4 == 0 or macro_multiplier == 1.0:
                             try:
                                 macro_news = await sentiment_agent.analyze_macro_sentiment_async()
-                                macro_multiplier = macro_news.get("risk_multiplier", 1.0)
-                                db.log_macro_regime(
-                                    sentiment_score=macro_news.get("sentiment_score", 0.0),
-                                    risk_multiplier=macro_multiplier,
-                                    reasoning=macro_news.get("summary_reasoning", "")
-                                )
-                                logger.info(f"📰 Updated News RAG Multiplier: {macro_multiplier:.2f}x")
+                                new_mult = macro_news.get("risk_multiplier", 1.0)
+                                if new_mult != 1.0 or macro_multiplier == 1.0:
+                                    macro_multiplier = new_mult
+                                    db.log_macro_regime(
+                                        sentiment_score=macro_news.get("sentiment_score", 0.0),
+                                        risk_multiplier=macro_multiplier,
+                                        reasoning=macro_news.get("summary_reasoning", "")
+                                    )
+                                    logger.info(f"📰 Updated News RAG Multiplier: {macro_multiplier:.2f}x | {macro_news.get('summary_reasoning', '')}")
                             except Exception as e:
-                                logger.warning(f"⚠️ Periodic news sentiment fetch failed: {e}")
+                                logger.warning(f"⚠️ Periodic news sentiment fetch note: {e}")
 
                         # Track SPY price and return history for 200 SMA Macro Guard
                         if "SPY" in market_state:
@@ -260,8 +272,15 @@ async def run_consumer():
                         )
 
                         for agent in swarm_mgr.population:
-                            long_val = sum(qty * prices[tk] for tk, qty in agent.holdings.items() if qty > 0 and tk in prices)
-                            short_liability = sum(abs(qty) * prices[tk] for tk, qty in agent.holdings.items() if qty < 0 and tk in prices)
+                            # SAFE EQUITY CALCULATION: Fallback to entry price if current live tick price is missing
+                            long_val = sum(
+                                qty * prices.get(tk, agent.entry_prices.get(tk, 0.0)) 
+                                for tk, qty in agent.holdings.items() if qty > 0
+                            )
+                            short_liability = sum(
+                                abs(qty) * prices.get(tk, agent.entry_prices.get(tk, 0.0)) 
+                                for tk, qty in agent.holdings.items() if qty < 0
+                            )
                             current_equity = round(agent.cash + long_val - short_liability, 2)
                             agent.equity_history.append(current_equity)
 
