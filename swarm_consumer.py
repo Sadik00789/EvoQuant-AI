@@ -24,9 +24,10 @@ load_dotenv()
 EPOCH_TICK_THRESHOLD = 20  # Culling evaluation every 20 ticks (~5 hours)
 STOP_LOSS_PCT = -0.025     # Hard stop loss at -2.5%
 TAKE_PROFIT_PCT = 0.050    # Hard take profit at +5.0%
+MAX_SINGLE_POS_CAP = 0.050 # Global Single Position Cap at 5.0%
 
 # Initialize Risk, Sentiment, and Broker Execution Engines
-risk_engine = AdvancedRiskEngine(target_volatility=0.15, max_position_pct=0.05)
+risk_engine = AdvancedRiskEngine(target_volatility=0.15, max_position_pct=MAX_SINGLE_POS_CAP)
 sentiment_agent = NewsSentimentAgent()
 broker_bridge = AlpacaExecutionBridge()
 
@@ -295,7 +296,17 @@ async def run_consumer():
                                 raw_price = prices[ticker]
                                 adv = market_state.get(ticker, {}).get("adv", 1000000.0)
 
-                                effective_alloc = target.allocation_pct * macro_multiplier * regime_scaler
+                                # SWARM POSITION CAP GUARDRAIL ENFORCEMENT
+                                current_swarm_alloc = db.get_active_swarm_ticker_allocation(ticker) if hasattr(db, 'get_active_swarm_ticker_allocation') else 0.0
+                                remaining_headroom = max(0.0, MAX_SINGLE_POS_CAP - current_swarm_alloc)
+
+                                if target.action in ["BUY", "SHORT"] and remaining_headroom <= 0.001:
+                                    logger.warning(f"  🛡️ [GUARDRAIL BLOCKED] Swarm capacity maxed out for {ticker} ({current_swarm_alloc*100:.1f}% >= {MAX_SINGLE_POS_CAP*100:.1f}%). Rejecting {target.action} by {agent.agent_id}.")
+                                    continue
+
+                                raw_effective_alloc = target.allocation_pct * macro_multiplier * regime_scaler
+                                # Enforce per-agent allocation clamping to remaining headroom & max cap
+                                effective_alloc = min(raw_effective_alloc, remaining_headroom, MAX_SINGLE_POS_CAP)
                                 target_val = current_equity * effective_alloc
                                 current_pos_qty = agent.holdings.get(ticker, 0.0)
 
@@ -320,7 +331,7 @@ async def run_consumer():
                                         db.update_agent_cash(agent.agent_id, agent.cash)
                                         db.update_agent_holding(agent.agent_id, ticker, new_shares, weighted_entry)
                                         db.log_trade(agent.agent_id, ticker, "BUY", shares, exec_price, effective_alloc, reason="RISK_PARITY_ALLOCATION")
-                                        logger.info(f"  📈 [{agent.agent_id}] BOUGHT {ticker}: +{shares:.2f}sh @ ${exec_price:.2f} (Avg Cost: ${weighted_entry:.2f})")
+                                        logger.info(f"   📈 [{agent.agent_id}] BOUGHT {ticker}: +{shares:.2f}sh @ ${exec_price:.2f} (Avg Cost: ${weighted_entry:.2f}) [Alloc: {effective_alloc*100:.1f}%]")
 
                                         submit_safe_broker_order(broker_bridge, ticker, shares, "BUY")
 
@@ -343,7 +354,7 @@ async def run_consumer():
                                         db.update_agent_cash(agent.agent_id, agent.cash)
                                         db.update_agent_holding(agent.agent_id, ticker, agent.holdings[ticker], agent.entry_prices.get(ticker, 0.0))
                                         db.log_trade(agent.agent_id, ticker, "SELL", sell_shares, exec_price, effective_alloc, reason="RISK_PARITY_REBALANCE")
-                                        logger.info(f"  📉 [{agent.agent_id}] SOLD {ticker}: -{sell_shares:.2f}sh @ ${exec_price:.2f}")
+                                        logger.info(f"   📉 [{agent.agent_id}] SOLD {ticker}: -{sell_shares:.2f}sh @ ${exec_price:.2f}")
 
                                         submit_safe_broker_order(broker_bridge, ticker, sell_shares, "SELL")
 
@@ -370,7 +381,7 @@ async def run_consumer():
                                             db.update_agent_cash(agent.agent_id, agent.cash)
                                             db.update_agent_holding(agent.agent_id, ticker, -new_short_shares, weighted_entry)
                                             db.log_trade(agent.agent_id, ticker, "SHORT", actual_short_shares, exec_price, effective_alloc, reason="RISK_PARITY_SHORT")
-                                            logger.info(f"  📉 [{agent.agent_id}] SHORTED {ticker}: -{actual_short_shares:.2f}sh @ ${exec_price:.2f}")
+                                            logger.info(f"   📉 [{agent.agent_id}] SHORTED {ticker}: -{actual_short_shares:.2f}sh @ ${exec_price:.2f} [Alloc: {effective_alloc*100:.1f}%]")
 
                                             submit_safe_broker_order(broker_bridge, ticker, actual_short_shares, "SHORT")
 
@@ -394,7 +405,7 @@ async def run_consumer():
                                         db.update_agent_cash(agent.agent_id, agent.cash)
                                         db.update_agent_holding(agent.agent_id, ticker, agent.holdings[ticker], agent.entry_prices.get(ticker, 0.0))
                                         db.log_trade(agent.agent_id, ticker, "COVER", cover_shares, exec_price, effective_alloc, reason="RISK_PARITY_COVER")
-                                        logger.info(f"  📈 [{agent.agent_id}] COVERED {ticker}: +{cover_shares:.2f}sh @ ${exec_price:.2f}")
+                                        logger.info(f"   📈 [{agent.agent_id}] COVERED {ticker}: +{cover_shares:.2f}sh @ ${exec_price:.2f}")
 
                                         submit_safe_broker_order(broker_bridge, ticker, cover_shares, "COVER")
 
