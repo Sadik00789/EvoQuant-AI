@@ -134,7 +134,7 @@ class RiskParityOptimizer:
     """
     Mathematical Portfolio Construction.
     Converts qualitative LLM conviction scores into volatility-adjusted weights
-    using Inverse-Volatility Risk Parity.
+    using Inverse-Volatility Risk Parity. Enforces a strict 5% max position cap.
     """
     def __init__(self, max_position_cap: float = 0.05):  # 5% max position cap
         self.max_position_cap = max_position_cap
@@ -193,6 +193,7 @@ class RiskParityOptimizer:
         if total_risk_score > 0:
             for ticker, (action, score) in active_candidates.items():
                 unclamped_weight = score / total_risk_score
+                # Strict hard clamp at max_position_cap (5.0%)
                 clamped_weight = round(float(min(max_position_cap, unclamped_weight)), 4)
                 raw_decisions[ticker] = PortfolioAllocation(ticker=ticker, action=action, allocation_pct=clamped_weight)
 
@@ -543,7 +544,8 @@ class CrossAssetPortfolioManager:
         password: str = None,
         min_pool_size: int = 2,
         max_pool_size: int = 10,
-        initial_capital: float = 100000.0
+        initial_capital: float = 100000.0,
+        max_position_cap: float = 0.05
     ):
         self.host = host or os.getenv("POSTGRES_HOST", "localhost")
         self.port = int(port or os.getenv("POSTGRES_PORT", 5432))
@@ -551,6 +553,7 @@ class CrossAssetPortfolioManager:
         self.user = user or os.getenv("POSTGRES_USER", "evoquant")
         self.password = password or os.getenv("POSTGRES_PASSWORD", "evoquant_secret_pass")
         self.initial_capital = initial_capital
+        self.max_position_cap = max_position_cap
 
         conninfo = f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.dbname}"
         
@@ -707,6 +710,30 @@ class CrossAssetPortfolioManager:
                 rows = cur.fetchall()
                 return {row['ticker']: float(row['amount']) for row in rows}
 
+    def get_active_swarm_ticker_allocation(self, ticker: str) -> float:
+        """
+        Calculates aggregate active allocation percentage across ALL agents for a given ticker.
+        Enables swarm-level guardrail evaluation prior to order execution.
+        """
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COALESCE(SUM(ABS(amount * entry_price)), 0.0) as gross_val
+                    FROM agent_holdings
+                    WHERE ticker = %s AND amount != 0;
+                """, (ticker,))
+                row = cur.fetchone()
+                gross_position_val = float(row['gross_val']) if row else 0.0
+
+                cur.execute("SELECT COALESCE(SUM(cash), 0.0) as total_cash FROM agent_accounts;")
+                cash_row = cur.fetchone()
+                total_cash = float(cash_row['total_cash']) if cash_row else self.initial_capital
+
+                if total_cash <= 0:
+                    return 0.0
+
+                return gross_position_val / total_cash
+
     def update_agent_holding(self, agent_id: str, ticker: str, amount: float, entry_price: float = 0.0):
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
@@ -782,12 +809,13 @@ class CrossAssetPortfolioManager:
         return self.fetch_dataframe(query)
 
     def log_trade(self, agent_id: str, ticker: str, action: str, shares: float, price: float, pct: float, reason: str = 'ALLOCATION'):
+        clamped_pct = min(pct, self.max_position_cap)
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO trade_logs (agent_id, ticker, action, shares, price, allocation_pct, reason)
                     VALUES (%s, %s, %s, %s, %s, %s, %s);
-                """, (agent_id, ticker, action, shares, price, pct, reason))
+                """, (agent_id, ticker, action, shares, price, clamped_pct, reason))
                 conn.commit()
 
     def log_snapshot(self, agent_id: str, equity: float, cash: float, pnl_pct: float):
