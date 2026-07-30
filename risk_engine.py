@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 logger = logging.getLogger("AdvancedRiskEngine")
 
@@ -28,10 +28,14 @@ class AdvancedRiskEngine:
         Formula:
         $$SD_{down} = \\sqrt{\\frac{1}{N} \\sum_{t=1}^{N} \\min(0, R_t - R_{target})^2}$$
         """
-        if len(returns) < 2:
+        if returns is None or len(returns) < 2:
             return 0.0001
         
-        downside_returns = returns[returns < target_return]
+        cleaned_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(cleaned_returns) < 2:
+            return 0.0001
+
+        downside_returns = cleaned_returns[cleaned_returns < target_return]
         if len(downside_returns) == 0:
             return 0.0001
             
@@ -46,10 +50,14 @@ class AdvancedRiskEngine:
         Formula:
         $$CVaR_{\\alpha}(X) = \\mathbb{E}[X \\mid X \\le VaR_{\\alpha}(X)]$$
         """
-        if len(returns) < 10:
+        if returns is None or len(returns) < 10:
+            return 0.02
+
+        cleaned_returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(cleaned_returns) < 10:
             return 0.02
             
-        sorted_returns = np.sort(returns)
+        sorted_returns = np.sort(cleaned_returns.values)
         cutoff_index = int(np.floor(alpha * len(sorted_returns)))
         if cutoff_index == 0:
             cutoff_index = 1
@@ -71,13 +79,13 @@ class AdvancedRiskEngine:
         if not volatility_map:
             return {}
 
-        inv_vols = {tk: 1.0 / max(vol, 0.0001) for tk, vol in volatility_map.items()}
+        inv_vols = {tk: 1.0 / max(vol, 0.0001) for tk, vol in volatility_map.items() if vol is not None}
         total_inv_vol = sum(inv_vols.values())
 
         if total_inv_vol <= 0:
             return {tk: 0.0 for tk in volatility_map}
 
-        raw_weights = {tk: inv_vols[tk] / total_inv_vol for tk in volatility_map}
+        raw_weights = {tk: inv_vols[tk] / total_inv_vol for tk in inv_vols}
 
         scaled_allocations = {}
         for tk, weight in raw_weights.items():
@@ -88,16 +96,20 @@ class AdvancedRiskEngine:
 
         return scaled_allocations
 
-    def calculate_regime_scaler(self, spy_returns: pd.Series, spy_prices: pd.Series = None) -> float:
+    def calculate_regime_scaler(self, spy_returns: pd.Series, spy_prices: Optional[pd.Series] = None) -> float:
         """
         Computes the market regime multiplier safely against NaN returns and flat volatility periods.
         Dampens portfolio leverage during high volatility or when SPY breaks below
         its 200-period Simple Moving Average (Macro Trend Guard).
         """
-        if len(spy_returns) < 5 or spy_returns.empty:
+        if spy_returns is None or len(spy_returns) < 5 or spy_returns.empty:
             return 1.0
 
-        vol = spy_returns.std()
+        cleaned_returns = spy_returns.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(cleaned_returns) < 5:
+            return 1.0
+
+        vol = cleaned_returns.std()
         # NaN / Flat Volatility Trap Guard
         if pd.isna(vol) or vol <= 0:
             return 1.0
@@ -107,14 +119,16 @@ class AdvancedRiskEngine:
 
         # Macro Trend Guard: Cut risk by 50% if SPY trades below its 200-period SMA
         if spy_prices is not None and len(spy_prices) >= 200:
-            sma_200 = spy_prices.rolling(window=200).mean().iloc[-1]
-            current_spy = spy_prices.iloc[-1]
-            if not pd.isna(sma_200) and current_spy < sma_200:
-                scaler *= 0.5
-                logger.warning(
-                    f"📉 MACRO TREND GUARD TRIGGERED: SPY (${current_spy:.2f}) < 200 SMA (${sma_200:.2f}). "
-                    f"Scaling risk target to {scaler:.2f}x"
-                )
+            cleaned_prices = spy_prices.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(cleaned_prices) >= 200:
+                sma_200 = cleaned_prices.rolling(window=200).mean().iloc[-1]
+                current_spy = cleaned_prices.iloc[-1]
+                if not pd.isna(sma_200) and current_spy < sma_200:
+                    scaler *= 0.5
+                    logger.warning(
+                        f"📉 MACRO TREND GUARD TRIGGERED: SPY (${current_spy:.2f}) < 200 SMA (${sma_200:.2f}). "
+                        f"Scaling risk target to {scaler:.2f}x"
+                    )
 
         return float(np.clip(scaler, 0.25, 1.5))
 
@@ -125,8 +139,8 @@ class AdvancedRiskEngine:
         Formula:
         $$P_{exec} = P_{raw} \\cdot \\left(1 \\pm \\gamma \\cdot \\sqrt{\\frac{\\text{Order Shares}}{\\text{ADV}}}\\right)$$
         """
-        if adv <= 0 or shares <= 0:
-            return raw_price
+        if raw_price <= 0 or adv <= 0 or shares <= 0:
+            return max(raw_price, 0.01)
 
         participation_rate = shares / max(adv, 1.0)
         slippage_pct = 0.10 * np.sqrt(participation_rate)  # 10% market impact factor
@@ -138,7 +152,7 @@ class AdvancedRiskEngine:
         elif action in ("SELL", "SHORT"):
             return round(raw_price * (1.0 - slippage_pct), 4)
             
-        return raw_price
+        return round(raw_price, 4)
 
     def evaluate_margin_health(
         self, 
