@@ -26,16 +26,22 @@ class NewsSentimentAgent:
             "https://finance.yahoo.com/news/rssindex"
         ]
 
-    def _fetch_rss_headlines(self, max_headlines: int = 8) -> str:
-        """Fetches and aggregates recent macro headlines from RSS feeds."""
+    async def _fetch_rss_headlines_async(self, client: httpx.AsyncClient, max_headlines: int = 8) -> str:
+        """Asynchronously fetches and aggregates recent macro headlines from RSS feeds."""
         headlines = []
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+
         for url in self.rss_feeds:
             try:
-                feed = feedparser.parse(url)
-                for entry in feed.entries[:max_headlines]:
-                    clean_title = re.sub(r'<[^>]+>', '', entry.title).strip()
-                    if clean_title and clean_title not in headlines:
-                        headlines.append(clean_title)
+                resp = await client.get(url, headers=headers, timeout=6.0, follow_redirects=True)
+                if resp.status_code == 200:
+                    feed = feedparser.parse(resp.text)
+                    for entry in feed.entries[:max_headlines]:
+                        clean_title = re.sub(r'<[^>]+>', '', getattr(entry, 'title', '')).strip()
+                        if clean_title and clean_title not in headlines:
+                            headlines.append(clean_title)
             except Exception as e:
                 logger.warning(f"⚠️ Failed to parse RSS feed ({url}): {e}")
 
@@ -49,7 +55,8 @@ class NewsSentimentAgent:
         Hard-clamps sentiment score and risk multiplier to prevent LLM hallucination extremes.
         """
         try:
-            score = float(raw_data.get("sentiment_score", 0.0))
+            raw_score = raw_data.get("sentiment_score")
+            score = float(raw_score) if raw_score is not None else 0.0
             score = float(np.clip(score, -1.0, 1.0))
             
             # Map score (-1.0 to +1.0) into risk multiplier range (0.7x to 1.3x)
@@ -57,7 +64,7 @@ class NewsSentimentAgent:
             # Enforce hard safety boundaries [0.5, 1.5]
             multiplier = float(np.clip(multiplier, 0.5, 1.5))
             
-            reasoning = str(raw_data.get("summary_reasoning", "Macro news sentiment evaluated.")).strip()
+            reasoning = str(raw_data.get("summary_reasoning") or "Macro news sentiment evaluated.").strip()
 
             return {
                 "sentiment_score": round(score, 2),
@@ -78,28 +85,36 @@ class NewsSentimentAgent:
 
     def analyze_macro_sentiment(self) -> Dict[str, Any]:
         """
-        Synchronous wrapper calling the multi-provider LLM analysis.
-        Returns dict with keys: sentiment_score, risk_multiplier, summary_reasoning.
+        Synchronous wrapper calling the multi-provider LLM analysis safely without external loop dependencies.
         """
         import asyncio
+        import concurrent.futures
+
         try:
-            return asyncio.run(self.analyze_macro_sentiment_async())
-        except RuntimeError:
-            # Handle nested event loop scenarios
-            loop = asyncio.get_event_loop()
-            return loop.run_until_complete(self.analyze_macro_sentiment_async())
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(lambda: asyncio.run(self.analyze_macro_sentiment_async()))
+                    return future.result(timeout=25.0)
+            else:
+                return asyncio.run(self.analyze_macro_sentiment_async())
         except Exception as e:
             logger.error(f"❌ Sentiment analysis execution failed: {e}")
             return self._neutral_fallback()
 
     async def analyze_macro_sentiment_async(self) -> Dict[str, Any]:
         """
-        Queries multi-provider LLMs to evaluate current financial headlines.
+        Queries multi-provider LLMs asynchronously to evaluate current financial headlines.
         """
-        headlines_text = self._fetch_rss_headlines()
+        async with httpx.AsyncClient() as client:
+            headlines_text = await self._fetch_rss_headlines_async(client)
 
-        prompt = f"""
-You are a Senior Macroeconomic Risk Analyst for an Quantitative Trading Swarm.
+            prompt = f"""
+You are a Senior Macroeconomic Risk Analyst for a Quantitative Trading Swarm.
 Evaluate the following recent market headlines and determine the systemic market sentiment.
 
 HEADLINES:
@@ -115,28 +130,41 @@ INSTRUCTIONS:
 }}
 """
 
-        providers = [
-            {
-                "name": "Groq",
-                "url": "https://api.groq.com/openai/v1/chat/completions",
-                "key": self.api_key or os.getenv("GROQ_API_KEY"),
-                "model": "llama-3.3-70b-versatile"
-            },
-            {
-                "name": "OpenRouter",
-                "url": "https://openrouter.ai/api/v1/chat/completions",
-                "key": os.getenv("OPENROUTER_API_KEY"),
-                "model": "meta-llama/llama-3.3-70b-instruct"
-            },
-            {
-                "name": "GitHub Models",
-                "url": "https://models.inference.ai.azure.com/chat/completions",
-                "key": os.getenv("GITHUB_TOKEN"),
-                "model": "Llama-3.3-70B-Instruct"
-            }
-        ]
+            providers = [
+                {
+                    "name": "Groq",
+                    "url": "https://api.groq.com/openai/v1/chat/completions",
+                    "key": self.api_key or os.getenv("GROQ_API_KEY"),
+                    "model": "llama-3.3-70b-versatile",
+                    "use_json_format": True
+                },
+                {
+                    "name": "OpenRouter",
+                    "url": "https://openrouter.ai/api/v1/chat/completions",
+                    "key": os.getenv("OPENROUTER_API_KEY"),
+                    "model": "meta-llama/llama-3.3-70b-instruct:free",
+                    "headers": {
+                        "HTTP-Referer": "https://github.com/EvoQuant-AI",
+                        "X-Title": "EvoQuant Trading Swarm"
+                    },
+                    "use_json_format": True
+                },
+                {
+                    "name": "GitHub Models",
+                    "url": "https://models.inference.ai.azure.com/chat/completions",
+                    "key": os.getenv("GITHUB_TOKEN"),
+                    "model": "Llama-3.3-70B-Instruct",
+                    "use_json_format": True
+                },
+                {
+                    "name": "SambaNova",
+                    "url": "https://api.sambanova.ai/v1/chat/completions",
+                    "key": os.getenv("SAMBANOVA_API_KEY"),
+                    "model": "Meta-Llama-3.3-70B-Instruct",
+                    "use_json_format": False
+                }
+            ]
 
-        async with httpx.AsyncClient() as client:
             for p in providers:
                 if not p["key"]:
                     continue
@@ -145,23 +173,29 @@ INSTRUCTIONS:
                     "Authorization": f"Bearer {p['key']}",
                     "Content-Type": "application/json"
                 }
+                if "headers" in p:
+                    headers.update(p["headers"])
 
                 payload = {
                     "model": p["model"],
                     "messages": [{"role": "user", "content": prompt}],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.1
+                    "temperature": 0.1,
+                    "max_tokens": 1024
                 }
+                if p.get("use_json_format"):
+                    payload["response_format"] = {"type": "json_object"}
 
                 try:
-                    resp = await client.post(p["url"], json=payload, headers=headers, timeout=10.0)
-                    if resp.status_code in (429, 404):
+                    resp = await client.post(p["url"], json=payload, headers=headers, timeout=12.0)
+                    if resp.status_code in (400, 402, 404, 429):
+                        logger.warning(f"⚠️ [{p['name']}] News sentiment fetch failed ({resp.status_code}). Trying next provider...")
                         continue
 
                     resp.raise_for_status()
                     data = resp.json()
                     content = data['choices'][0]['message']['content']
-                    cleaned = re.sub(r'```json\s*|\s*```', '', content).strip()
+                    
+                    cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", content).strip()
                     parsed = json.loads(cleaned)
 
                     return self._sanitize_sentiment_output(parsed)
