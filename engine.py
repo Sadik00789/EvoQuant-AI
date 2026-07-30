@@ -17,9 +17,23 @@ logger = logging.getLogger("SwarmEngine")
 
 # Helper utility to strip markdown fences from LLM responses
 def clean_llm_json_string(raw_content: str) -> str:
-    """Strips ```json ... ``` markdown wrappers and leading/trailing whitespace."""
-    cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", raw_content).strip()
-    return cleaned
+    """
+    Strips conversational preambles/postambles and markdown fences 
+    to extract the exact raw JSON payload.
+    """
+    # 1. Extract content inside ```json ... ``` markdown block if present
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw_content)
+    if match:
+        raw_content = match.group(1).strip()
+    
+    # 2. Find the first '{' and last '}' to strip preambles like "To evaluate..." or trailing text
+    start_idx = raw_content.find('{')
+    end_idx = raw_content.rfind('}')
+    
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        return raw_content[start_idx:end_idx + 1].strip()
+    
+    return raw_content.strip()
 
 # ==========================================
 # 1. EXECUTION BRIDGE & PYDANTIC SCHEMAS
