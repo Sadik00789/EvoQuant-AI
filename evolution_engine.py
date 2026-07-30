@@ -4,6 +4,8 @@ import logging
 import httpx
 import asyncio
 import re
+import boto3
+import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Any
 
@@ -48,7 +50,7 @@ class AgentGenome:
 
 class EvolutionarySwarmManager:
     def __init__(self, api_key: str = None, population_size: int = 5):
-        self.api_key = api_key or os.getenv("GROQ_API_KEY")
+        self.api_key = api_key or os.getenv("GROQ_API_KEY2")
         self.population_size = population_size
         self.current_generation = 1
         self.population: List[AgentGenome] = self._bootstrap_initial_population()
@@ -73,6 +75,44 @@ class EvolutionarySwarmManager:
             )
             for name, prompt in baseline_personas
         ]
+
+    def _call_aws_bedrock_llama(self, prompt: str) -> str:
+        """
+        Synchronous AWS Bedrock Converse API invocation for Llama 3.3 70B Instruct.
+        Executed inside an async thread executor to avoid blocking the event loop.
+        """
+        aws_key = os.getenv("AWS_ACCESS_KEY_ID")
+        aws_secret = os.getenv("AWS_SECRET_ACCESS_KEY")
+        region = os.getenv("AWS_REGION", "us-east-1")
+
+        if not aws_key or not aws_secret:
+            raise ValueError("AWS credentials not set in environment.")
+
+        bedrock_client = boto3.client(
+            service_name="bedrock-runtime",
+            region_name=region,
+            aws_access_key_id=aws_key,
+            aws_secret_access_key=aws_secret
+        )
+
+        model_id = "us.meta.llama3-3-70b-instruct-v1:0"
+
+        response = bedrock_client.converse(
+            modelId=model_id,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"text": prompt}]
+                }
+            ],
+            inferenceConfig={
+                "temperature": 0.3,
+                "maxTokens": 1024
+            }
+        )
+
+        output_message = response["output"]["message"]["content"][0]["text"]
+        return output_message
 
     async def run_culling_cycle(self, prices: dict = None, risk_engine = None, db = None):
         """
@@ -147,18 +187,19 @@ class EvolutionarySwarmManager:
     async def _mutate_genome(self, parent: AgentGenome, mutation_trait: str, offspring_num: int) -> AgentGenome:
         """Queries 70B models with fallback chain to semantically mutate winning parent prompt."""
         prompt = f"""
-        You are an Evolutionary Prompt Engineer for trading algorithms.
-        A winning strategy prompt survived with high performance:
-        "{parent.persona_prompt}"
+You are an Evolutionary Prompt Engineer for trading algorithms.
+A winning strategy prompt survived with high performance:
+"{parent.persona_prompt}"
 
-        Create a slightly mutated version of this strategy prompt that incorporates the trait: "{mutation_trait}".
-        Ensure the prompt instructs the agent to evaluate technical theses and output trade actions (BUY, SELL, SHORT, COVER, or HOLD) with conviction scores (0.0 to 1.0).
-        Return ONLY a JSON object with key "new_prompt": {{"new_prompt": "string"}}
-        """
+Create a slightly mutated version of this strategy prompt that incorporates the trait: "{mutation_trait}".
+Ensure the prompt instructs the agent to evaluate technical theses and output trade actions (BUY, SELL, SHORT, COVER, or HOLD) with conviction scores (0.0 to 1.0).
+Return ONLY a JSON object with key "new_prompt": {{"new_prompt": "string"}}
+"""
 
         providers = [
             {
                 "name": "Groq",
+                "type": "http",
                 "url": "https://api.groq.com/openai/v1/chat/completions",
                 "key": self.api_key or os.getenv("GROQ_API_KEY"),
                 "model": "llama-3.3-70b-versatile",
@@ -166,6 +207,7 @@ class EvolutionarySwarmManager:
             },
             {
                 "name": "OpenRouter",
+                "type": "http",
                 "url": "https://openrouter.ai/api/v1/chat/completions",
                 "key": os.getenv("OPENROUTER_API_KEY"),
                 "model": "meta-llama/llama-3.3-70b-instruct:free",
@@ -177,6 +219,7 @@ class EvolutionarySwarmManager:
             },
             {
                 "name": "GitHub Models",
+                "type": "http",
                 "url": "https://models.inference.ai.azure.com/chat/completions",
                 "key": os.getenv("GITHUB_TOKEN"),
                 "model": "Llama-3.3-70B-Instruct",
@@ -184,10 +227,16 @@ class EvolutionarySwarmManager:
             },
             {
                 "name": "SambaNova",
+                "type": "http",
                 "url": "https://api.sambanova.ai/v1/chat/completions",
                 "key": os.getenv("SAMBANOVA_API_KEY"),
                 "model": "Meta-Llama-3.3-70B-Instruct",
                 "use_json_format": False
+            },
+            {
+                "name": "AWS Bedrock (Llama 3.3 70B)",
+                "type": "bedrock",
+                "key": os.getenv("AWS_ACCESS_KEY_ID")
             }
         ]
 
@@ -197,6 +246,21 @@ class EvolutionarySwarmManager:
             for p in providers:
                 if not p["key"]:
                     continue
+
+                if p["type"] == "bedrock":
+                    try:
+                        logger.info("🛡️ Free tiers exhausted or rate-limited. Routing mutation request to AWS Bedrock...")
+                        content = await asyncio.to_thread(self._call_aws_bedrock_llama, prompt)
+                        cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", content).strip()
+                        parsed = json.loads(cleaned)
+
+                        if "new_prompt" in parsed and parsed["new_prompt"]:
+                            mutated_prompt = parsed["new_prompt"]
+                            logger.info(f"✅ Genome successfully mutated via [AWS Bedrock]")
+                            break
+                    except Exception as e:
+                        logger.warning(f"⚠️ AWS Bedrock mutation attempt failed: {e}")
+                        continue
 
                 headers = {
                     "Authorization": f"Bearer {p['key']}",
@@ -216,7 +280,7 @@ class EvolutionarySwarmManager:
 
                 try:
                     resp = await client.post(p["url"], json=payload, headers=headers, timeout=15.0)
-                    if resp.status_code in (400, 402, 404, 429):
+                    if resp.status_code in (400, 401, 402, 404, 410, 429):
                         logger.warning(f"⚠️ [{p['name']}] Mutation failed ({resp.status_code}). Trying next provider...")
                         continue
 
