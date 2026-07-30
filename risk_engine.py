@@ -70,14 +70,16 @@ class AdvancedRiskEngine:
         self, 
         volatility_map: Dict[str, float], 
         convictions: Dict[str, float], 
-        max_cap: float = 0.05
+        max_cap: Optional[float] = None
     ) -> Dict[str, float]:
         """
         Computes Inverse-Volatility Risk Parity allocations weighted by agent conviction scores.
-        Enforces strict position caps (default 5%) across all assets.
+        Enforces strict position caps (default 5.0%) across all individual assets.
         """
         if not volatility_map:
             return {}
+
+        effective_cap = max_cap if max_cap is not None else self.max_position_pct
 
         inv_vols = {tk: 1.0 / max(vol, 0.0001) for tk, vol in volatility_map.items() if vol is not None}
         total_inv_vol = sum(inv_vols.values())
@@ -91,7 +93,9 @@ class AdvancedRiskEngine:
         for tk, weight in raw_weights.items():
             conv = convictions.get(tk, 0.5)
             alloc = weight * conv
-            clamped_alloc = min(alloc, max_cap)
+            
+            # Hard clip to guarantee allocation <= 5.0%
+            clamped_alloc = min(alloc, effective_cap)
             scaled_allocations[tk] = round(clamped_alloc, 4)
 
         return scaled_allocations
