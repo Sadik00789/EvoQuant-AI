@@ -710,29 +710,6 @@ class CrossAssetPortfolioManager:
                 rows = cur.fetchall()
                 return {row['ticker']: float(row['amount']) for row in rows}
 
-    def get_active_swarm_ticker_allocation(self, ticker: str) -> float:
-        """
-        Calculates aggregate active allocation percentage across ALL agents for a given ticker.
-        Enables swarm-level guardrail evaluation prior to order execution.
-        """
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT COALESCE(SUM(ABS(amount * entry_price)), 0.0) as gross_val
-                    FROM agent_holdings
-                    WHERE ticker = %s AND amount != 0;
-                """, (ticker,))
-                row = cur.fetchone()
-                gross_position_val = float(row['gross_val']) if row else 0.0
-
-                cur.execute("SELECT COALESCE(SUM(cash), 0.0) as total_cash FROM agent_accounts;")
-                cash_row = cur.fetchone()
-                total_cash = float(cash_row['total_cash']) if cash_row else self.initial_capital
-
-                if total_cash <= 0:
-                    return 0.0
-
-                return gross_position_val / total_cash
 
     def update_agent_holding(self, agent_id: str, ticker: str, amount: float, entry_price: float = 0.0):
         with self.pool.connection() as conn:
