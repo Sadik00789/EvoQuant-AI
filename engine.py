@@ -14,22 +14,27 @@ from psycopg.rows import dict_row
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SwarmEngine")
 
-# Helper utility to strip markdown fences from LLM responses
+# Helper utility to strip markdown fences and Gemma thinking tags from LLM responses
 def clean_llm_json_string(raw_content: str) -> str:
     """
-    Strips conversational preambles/postambles and markdown fences 
-    to extract the exact raw JSON payload.
+    Strips conversational preambles/postambles, Gemma thinking tags (<thought>...</thought>),
+    and markdown fences to extract the exact raw JSON payload.
     """
+    # 1. Strip Gemma 4 internal thinking blocks (<thought>...</thought>)
+    raw_content = re.sub(r"<thought>[\s\S]*?</thought>", "", raw_content).strip()
+
+    # 2. Strip markdown fences
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw_content)
     if match:
         raw_content = match.group(1).strip()
-    
+
+    # 3. Extract bracketed JSON object {...}
     start_idx = raw_content.find('{')
     end_idx = raw_content.rfind('}')
-    
+
     if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
         return raw_content[start_idx:end_idx + 1].strip()
-    
+
     return raw_content.strip()
 
 # ==========================================
@@ -42,7 +47,7 @@ class AlpacaExecutionBridge:
         self.api_key = api_key or os.getenv("ALPACA_API_KEY")
         self.secret_key = secret_key or os.getenv("ALPACA_SECRET_KEY")
         self.base_url = base_url or os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-        
+
         self.headers = {
             "APCA-API-KEY-ID": self.api_key or "",
             "APCA-API-SECRET-KEY": self.secret_key or "",
@@ -255,7 +260,7 @@ class DualModelTradingSwarm:
                 {"role": "user", "content": user_input}
             ],
             "temperature": 0.1,
-            "max_tokens": 1024,
+            "max_tokens": 2048,
             "response_format": {"type": "json_object"}
         }
 
@@ -264,7 +269,6 @@ class DualModelTradingSwarm:
 
         for attempt in range(max_retries):
             try:
-                # 60.0 second timeout to handle heavy Gemma 4-31B structured JSON inference
                 resp = await client.post(url, json=payload, headers=headers, timeout=60.0)
 
                 if resp.status_code == 429:
@@ -310,8 +314,9 @@ class DualModelTradingSwarm:
             "ROLE: Bull Researcher Agent.\n"
             "TASK: Build the strongest possible BULLISH thesis for each asset. Focus on asymmetric upside, "
             "MACD bullish momentum, oversold RSI bounces, key support levels, and positive relative strength.\n"
+            "CRITICAL: Do NOT use the literal placeholder 'TICKER' as a key. Use the actual asset ticker symbols from input (e.g., 'AAPL', 'NVDA', 'ORCL').\n"
             "MUST INCLUDE BOTH `arguments` and `overall_perspective` in JSON output.\n"
-            'Format MUST be JSON matching schema: {"arguments": {"TICKER": {"ticker": "TICKER", "thesis_summary": "summary", "key_factors": ["f1"], "strength_score": 0.85}}, "overall_perspective": "perspective"}'
+            'Example output format: {"arguments": {"AAPL": {"ticker": "AAPL", "thesis_summary": "strong technical momentum", "key_factors": ["MACD crossover"], "strength_score": 0.85}}, "overall_perspective": "constructive market outlook"}'
         )
         return await self._call_gemma_provider(client, sys_prompt, strategy_input, AgentDebateCase, "BullResearcher")
 
@@ -323,8 +328,9 @@ class DualModelTradingSwarm:
             "ROLE: Bear Researcher Agent (Adversary).\n"
             "TASK: Hunt for flaws, Bull Traps, weak breakout volume, RSI bearish divergence, overhead resistance, "
             "and broader macro tail-risk for each asset. Build an aggressive BEARISH counter-case.\n"
+            "CRITICAL: Do NOT use the literal placeholder 'TICKER' as a key. Use the actual asset ticker symbols from input (e.g., 'AAPL', 'NVDA', 'ORCL').\n"
             "MUST INCLUDE BOTH `arguments` and `overall_perspective` in JSON output.\n"
-            'Format MUST be JSON matching schema: {"arguments": {"TICKER": {"ticker": "TICKER", "thesis_summary": "summary", "key_factors": ["f1"], "strength_score": 0.75}}, "overall_perspective": "perspective"}'
+            'Example output format: {"arguments": {"NVDA": {"ticker": "NVDA", "thesis_summary": "overbought divergence", "key_factors": ["RSI above 70"], "strength_score": 0.75}}, "overall_perspective": "defensive posture required"}'
         )
         return await self._call_gemma_provider(client, sys_prompt, strategy_input, AgentDebateCase, "BearResearcher")
 
@@ -364,7 +370,7 @@ class DualModelTradingSwarm:
             logger.warning(f"⚠️ Bull Researcher failed: {e}. Falling back to default bullish case.")
             bull_case_data = "Bullish case unavailable due to rate limit or error."
 
-        await asyncio.sleep(1.0)  # Pacing pause between LLM calls
+        await asyncio.sleep(1.0)
 
         try:
             bear_res = await self._generate_bear_case(client, strategy_input, custom_persona)
@@ -373,7 +379,7 @@ class DualModelTradingSwarm:
             logger.warning(f"⚠️ Bear Researcher failed: {e}. Falling back to default bearish case.")
             bear_case_data = "Bearish case unavailable due to rate limit or error."
 
-        await asyncio.sleep(1.0)  # Pacing pause between LLM calls
+        await asyncio.sleep(1.0)
 
         # --- STEP 2: SYNTHESIZER / PORTFOLIO MANAGER JUDGMENT ---
         synth_input = json.dumps({
@@ -385,15 +391,15 @@ class DualModelTradingSwarm:
         synth_sys_prompt = (
             f"{custom_persona}\n"
             "ROLE: Chief Investment Officer / Impartial Judge.\n"
-            "TASK: Evaluate the Bull Case and Bear Case side-by-side against market data. Detect bull traps, "
-            "cross-examine arguments, weigh data points, and issue final trade actions with conviction scores (0.0 to 1.0).\n"
+            "TASK: Evaluate Bull Case and Bear Case against market data. Detect bull traps, cross-examine arguments, "
+            "and issue final trade actions with conviction scores (0.0 to 1.0).\n"
             "Allowed Actions: BUY (long), SELL (close long), SHORT (open short), COVER (close short), HOLD.\n"
+            "CRITICAL: Replace ticker placeholders with actual stock symbols from the input data (e.g., 'AAPL', 'NVDA', 'ORCL'). Do NOT output literal 'TICKER'.\n"
             "DECISION RULES FOR SHORTING:\n"
-            "- If Bear Case argument strength > Bull Case strength OR asset RSI > 68 OR relative strength vs SPY < -1.5, issue SHORT with conviction > 0.5.\n"
+            "- If Bear Case strength > Bull Case strength OR asset RSI > 68 OR relative strength vs SPY < -1.5, issue SHORT with conviction > 0.5.\n"
             "- If holding a SHORT position and stock rebounds significantly, issue COVER.\n"
             "MUST INCLUDE BOTH `signals` and `macro_reasoning` in JSON output.\n"
-            'Format MUST be JSON showing both BUY and SHORT setups: '
-            '{"signals": {"AAPL": {"ticker": "AAPL", "action": "BUY", "conviction": 0.8}, "NVDA": {"ticker": "NVDA", "action": "SHORT", "conviction": 0.85}}, "macro_reasoning": "Synthesized reasoning"}'
+            'Example output format: {"signals": {"AAPL": {"ticker": "AAPL", "action": "BUY", "conviction": 0.8}, "NVDA": {"ticker": "NVDA", "action": "SHORT", "conviction": 0.85}}, "macro_reasoning": "Balanced multi-asset thesis"}'
         )
 
         try:
@@ -434,7 +440,7 @@ class DualModelTradingSwarm:
                 logger.error(f"❌ Execution failed for [{agent.agent_id}]: {e}")
                 decisions_map[agent.agent_id] = CrossAssetRiskDecision(decisions={}, macro_reasoning="Execution error")
 
-            # 2.5-second pacing delay between agents to prevent TPM spikes
+            # 2.5-second pacing delay between agents
             await asyncio.sleep(2.5)
 
         return decisions_map
