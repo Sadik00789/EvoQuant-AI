@@ -4,7 +4,6 @@ import logging
 import httpx
 import asyncio
 import re
-import boto3
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Any
@@ -29,7 +28,6 @@ class AgentGenome:
         if len(self.equity_history) < 2:
             return 0.0
 
-        # Use recent 50-tick rolling window for fitness evaluation
         recent_history = self.equity_history[-50:]
         current_equity = recent_history[-1]
         pnl_pct = (current_equity - 100000.0) / 100000.0
@@ -50,7 +48,7 @@ class AgentGenome:
 
 class EvolutionarySwarmManager:
     def __init__(self, api_key: str = None, population_size: int = 5):
-        self.api_key = api_key or os.getenv("GROQ_API_KEY2")
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         self.population_size = population_size
         self.current_generation = 1
         self.population: List[AgentGenome] = self._bootstrap_initial_population()
@@ -76,61 +74,21 @@ class EvolutionarySwarmManager:
             for name, prompt in baseline_personas
         ]
 
-    def _call_aws_bedrock_llama(self, prompt: str) -> str:
-        """
-        Synchronous AWS Bedrock Converse API invocation for Llama 3.3 70B Instruct.
-        Executed inside an async thread executor to avoid blocking the event loop.
-        """
-        aws_key = os.getenv("AWS_ACCESS_KEY_ID")
-        aws_secret = os.getenv("AWS_SECRET_ACCESS_KEY")
-        region = os.getenv("AWS_REGION", "us-east-1")
-
-        if not aws_key or not aws_secret:
-            raise ValueError("AWS credentials not set in environment.")
-
-        bedrock_client = boto3.client(
-            service_name="bedrock-runtime",
-            region_name=region,
-            aws_access_key_id=aws_key,
-            aws_secret_access_key=aws_secret
-        )
-
-        model_id = "us.meta.llama3-3-70b-instruct-v1:0"
-
-        response = bedrock_client.converse(
-            modelId=model_id,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [{"text": prompt}]
-                }
-            ],
-            inferenceConfig={
-                "temperature": 0.3,
-                "maxTokens": 1024
-            }
-        )
-
-        output_message = response["output"]["message"]["content"][0]["text"]
-        return output_message
-
     async def run_culling_cycle(self, prices: dict = None, risk_engine = None, db = None):
         """
         Executes Darwinian selection:
         1. Recalculates exact equity state using current asset prices (handling long & short valuation).
         2. Ranks agents by risk-adjusted fitness score.
         3. Liquidates open positions (SELL for longs, COVER for shorts) of bottom 2 agents.
-        4. Mutates top performer into 2 new offspring using multi-provider 70B models.
+        4. Mutates top performer into 2 new offspring using Google AI Studio (Gemma 4-31B).
         """
         logger.info(f"🧬 --- EXECUTING EVOLUTIONARY CULLING (GEN {self.current_generation}) ---")
 
-        # 1. Update in-memory equity state if live prices are passed
         if prices:
             for agent in self.population:
                 asset_val = sum(agent.holdings.get(tk, 0.0) * prices[tk] for tk in agent.holdings if tk in prices)
                 agent.equity_history.append(round(agent.cash + asset_val, 2))
 
-        # 2. Rank by fitness score
         self.population.sort(key=lambda x: x.calculate_fitness(), reverse=True)
         
         for idx, agent in enumerate(self.population):
@@ -140,11 +98,9 @@ class EvolutionarySwarmManager:
                 f"Equity: ${agent.equity_history[-1]:,.2f}"
             )
 
-        # 3. Separate survivors and culled agents
         survivors = self.population[:3]
         culled = self.population[3:]
 
-        # 4. Liquidate open holdings for culled agents (handles both Long & Short positions)
         for dead in culled:
             if prices:
                 for tk, shares in list(dead.holdings.items()):
@@ -157,7 +113,7 @@ class EvolutionarySwarmManager:
                         if shares > 0:
                             dead.cash += shares * exec_price
                         else:
-                            dead.cash -= abs(shares) * exec_price  # Pay cash to cover short position
+                            dead.cash -= abs(shares) * exec_price  
                             
                         dead.holdings[tk] = 0.0
                         dead.entry_prices[tk] = 0.0
@@ -169,7 +125,6 @@ class EvolutionarySwarmManager:
 
             logger.warning(f"  💀 CULLED & LIQUIDATED: {dead.agent_id} (Fitness: {dead.calculate_fitness()})")
 
-        # 5. Generate 2 new mutated offspring from top performer
         parent = survivors[0]
         offspring_1 = await self._mutate_genome(parent, "Higher Risk Sensitivity & Volatility Protection", 1)
         offspring_2 = await self._mutate_genome(parent, "Exploit Short-term Momentum Breakouts & Breakdown Shorts", 2)
@@ -177,7 +132,6 @@ class EvolutionarySwarmManager:
         self.current_generation += 1
         self.population = survivors + [offspring_1, offspring_2]
 
-        # 6. Register new offspring in database
         if db:
             for agent in self.population:
                 db.register_agent(agent.agent_id)
@@ -185,7 +139,7 @@ class EvolutionarySwarmManager:
         logger.info(f"🎉 Generation {self.current_generation} successfully spawned with 5 active agents!")
 
     async def _mutate_genome(self, parent: AgentGenome, mutation_trait: str, offspring_num: int) -> AgentGenome:
-        """Queries 70B models with fallback chain to semantically mutate winning parent prompt."""
+        """Queries Google AI Studio using Gemma 4-31B with rate-limit exception handling to mutate winning parent prompt."""
         prompt = f"""
 You are an Evolutionary Prompt Engineer for trading algorithms.
 A winning strategy prompt survived with high performance:
@@ -196,107 +150,63 @@ Ensure the prompt instructs the agent to evaluate technical theses and output tr
 Return ONLY a JSON object with key "new_prompt": {{"new_prompt": "string"}}
 """
 
-        providers = [
-            {
-                "name": "Groq",
-                "type": "http",
-                "url": "https://api.groq.com/openai/v1/chat/completions",
-                "key": self.api_key or os.getenv("GROQ_API_KEY"),
-                "model": "llama-3.3-70b-versatile",
-                "use_json_format": True
-            },
-            {
-                "name": "OpenRouter",
-                "type": "http",
-                "url": "https://openrouter.ai/api/v1/chat/completions",
-                "key": os.getenv("OPENROUTER_API_KEY"),
-                "model": "meta-llama/llama-3.3-70b-instruct:free",
-                "headers": {
-                    "HTTP-Referer": "https://github.com/EvoQuant-AI",
-                    "X-Title": "EvoQuant Trading Swarm"
-                },
-                "use_json_format": True
-            },
-            {
-                "name": "GitHub Models",
-                "type": "http",
-                "url": "https://models.inference.ai.azure.com/chat/completions",
-                "key": os.getenv("GITHUB_TOKEN"),
-                "model": "Llama-3.3-70B-Instruct",
-                "use_json_format": True
-            },
-            {
-                "name": "SambaNova",
-                "type": "http",
-                "url": "https://api.sambanova.ai/v1/chat/completions",
-                "key": os.getenv("SAMBANOVA_API_KEY"),
-                "model": "Meta-Llama-3.3-70B-Instruct",
-                "use_json_format": False
-            },
-            {
-                "name": "AWS Bedrock (Llama 3.3 70B)",
-                "type": "bedrock",
-                "key": os.getenv("AWS_ACCESS_KEY_ID")
-            }
-        ]
+        url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        api_key = self.api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
-        mutated_prompt = parent.persona_prompt  # Fallback if all providers fail
+        if not api_key:
+            raise ValueError("Gemini API key is not set in environment variables (GEMINI_API_KEY or GOOGLE_API_KEY).")
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": "gemma-4-31b-it",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "max_tokens": 1024,
+            "response_format": {"type": "json_object"}
+        }
+
+        mutated_prompt = parent.persona_prompt
+        max_retries = 3
+        backoff_factor = 2.0
 
         async with httpx.AsyncClient() as client:
-            for p in providers:
-                if not p["key"]:
-                    continue
-
-                if p["type"] == "bedrock":
-                    try:
-                        logger.info("🛡️ Free tiers exhausted or rate-limited. Routing mutation request to AWS Bedrock...")
-                        content = await asyncio.to_thread(self._call_aws_bedrock_llama, prompt)
-                        cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", content).strip()
-                        parsed = json.loads(cleaned)
-
-                        if "new_prompt" in parsed and parsed["new_prompt"]:
-                            mutated_prompt = parsed["new_prompt"]
-                            logger.info(f"✅ Genome successfully mutated via [AWS Bedrock]")
-                            break
-                    except Exception as e:
-                        logger.warning(f"⚠️ AWS Bedrock mutation attempt failed: {e}")
-                        continue
-
-                headers = {
-                    "Authorization": f"Bearer {p['key']}",
-                    "Content-Type": "application/json"
-                }
-                if "headers" in p:
-                    headers.update(p["headers"])
-
-                payload = {
-                    "model": p["model"],
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3,
-                    "max_tokens": 1024
-                }
-                if p.get("use_json_format"):
-                    payload["response_format"] = {"type": "json_object"}
-
+            for attempt in range(max_retries):
                 try:
-                    resp = await client.post(p["url"], json=payload, headers=headers, timeout=15.0)
-                    if resp.status_code in (400, 401, 402, 404, 410, 429):
-                        logger.warning(f"⚠️ [{p['name']}] Mutation failed ({resp.status_code}). Trying next provider...")
+                    resp = await client.post(url, json=payload, headers=headers, timeout=20.0)
+
+                    if resp.status_code == 429:
+                        sleep_time = backoff_factor ** (attempt + 1)
+                        logger.warning(f"⚠️ [Rate Limit / 429] during genome mutation. Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
+                        await asyncio.sleep(sleep_time)
                         continue
 
                     resp.raise_for_status()
-                    content = resp.json()['choices'][0]['message']['content']
+                    data = resp.json()
+                    content = data['choices'][0]['message']['content']
                     cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", content).strip()
                     parsed = json.loads(cleaned)
-                    
+
                     if "new_prompt" in parsed and parsed["new_prompt"]:
                         mutated_prompt = parsed["new_prompt"]
-                        logger.info(f"✅ Genome successfully mutated via [{p['name']}]")
+                        logger.info("✅ Genome successfully mutated via [Google AI Studio - Gemma 4 31B]")
                         break
 
+                except httpx.HTTPStatusError as hse:
+                    logger.warning(f"⚠️ HTTP error {hse.response.status_code} during mutation: {hse.response.text}")
+                    if hse.response.status_code in (400, 401, 403, 404):
+                        break
+                    if attempt == max_retries - 1:
+                        break
+                    await asyncio.sleep(backoff_factor ** (attempt + 1))
                 except Exception as e:
-                    logger.warning(f"⚠️ Mutation attempt failed on [{p['name']}]: {e}")
-                    continue
+                    logger.warning(f"⚠️ Mutation attempt failed: {e}")
+                    if attempt == max_retries - 1:
+                        break
+                    await asyncio.sleep(backoff_factor ** (attempt + 1))
 
         base_parent_name = re.sub(r'^Gen\d+_', '', parent.agent_id)
         base_parent_name = re.sub(r'_v\d+$', '', base_parent_name)
