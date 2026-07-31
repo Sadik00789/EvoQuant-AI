@@ -28,7 +28,7 @@ class NewsSentimentAgent:
             "https://news.google.com/rss/search?q=stock+market+economy&hl=en-US&gl=US&ceid=US:en"
         ]
 
-    async def _fetch_rss_headlines_async(self, client: httpx.AsyncClient, max_headlines: int = 8) -> str:
+    async def _fetch_rss_headlines_async(self, client: httpx.AsyncClient, max_headlines: int = 5) -> str:
         """Asynchronously fetches and aggregates recent macro headlines from RSS feeds."""
         headlines = []
         headers = {
@@ -100,7 +100,7 @@ class NewsSentimentAgent:
             if loop and loop.is_running():
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(lambda: asyncio.run(self.analyze_macro_sentiment_async()))
-                    return future.result(timeout=30.0)
+                    return future.result(timeout=40.0)
             else:
                 return asyncio.run(self.analyze_macro_sentiment_async())
         except Exception as e:
@@ -110,10 +110,10 @@ class NewsSentimentAgent:
     async def analyze_macro_sentiment_async(self) -> Dict[str, Any]:
         """
         Queries Google AI Studio (Gemma 4-31B) asynchronously to evaluate current financial headlines.
-        Includes automated rate-limit exception handling with exponential backoff.
+        Includes automated rate-limit exception handling with exponential backoff and robust JSON cleaning.
         """
         async with httpx.AsyncClient() as client:
-            headlines_text = await self._fetch_rss_headlines_async(client)
+            headlines_text = await self._fetch_rss_headlines_async(client, max_headlines=5)
 
             prompt = f"""
 You are a Senior Macroeconomic Risk Analyst for a Quantitative Trading Swarm.
@@ -157,7 +157,7 @@ INSTRUCTIONS:
 
             for attempt in range(max_retries):
                 try:
-                    resp = await client.post(url, json=payload, headers=headers, timeout=15.0)
+                    resp = await client.post(url, json=payload, headers=headers, timeout=35.0)
 
                     if resp.status_code == 429:
                         sleep_time = backoff_factor ** (attempt + 1)
@@ -167,10 +167,18 @@ INSTRUCTIONS:
 
                     resp.raise_for_status()
                     data = resp.json()
-                    content = data['choices'][0]['message']['content']
-                    
-                    cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", content).strip()
-                    parsed = json.loads(cleaned)
+                    raw_content = data['choices'][0]['message']['content']
+
+                    # 1. Strip internal thinking tags (<thought>...</thought>)
+                    content_no_thoughts = re.sub(r"<thought>[\s\S]*?</thought>", "", raw_content).strip()
+
+                    # 2. Extract valid JSON object block {...}
+                    json_match = re.search(r"\{[\s\S]*\}", content_no_thoughts)
+                    if not json_match:
+                        raise ValueError(f"Could not locate JSON object pattern in response: '{raw_content[:80]}...'")
+
+                    cleaned_json_str = json_match.group(0)
+                    parsed = json.loads(cleaned_json_str)
 
                     logger.info("✅ News sentiment evaluated successfully via [Google AI Studio - Gemma 4 31B]")
                     return self._sanitize_sentiment_output(parsed)
@@ -183,7 +191,7 @@ INSTRUCTIONS:
                         break
                     await asyncio.sleep(backoff_factor ** (attempt + 1))
                 except Exception as e:
-                    logger.warning(f"⚠️ News sentiment fetch attempt failed: {e}")
+                    logger.warning(f"⚠️ News sentiment fetch attempt failed: {type(e).__name__} - {e}")
                     if attempt == max_retries - 1:
                         break
                     await asyncio.sleep(backoff_factor ** (attempt + 1))
