@@ -213,8 +213,9 @@ class DualModelTradingSwarm:
             reverse=True
         )
 
-        top_candidates = [tk for tk, _ in ranked_stocks[:12]]
-        combined_tickers = set(top_candidates + active_holdings)
+        # Capped at top 5 candidates to keep payload lightweight and avoid timeouts
+        top_candidates = [tk for tk, _ in ranked_stocks[:5]]
+        combined_tickers = list(set(top_candidates + active_holdings))[:6]
 
         for ticker in combined_tickers:
             if ticker in market_state:
@@ -255,7 +256,7 @@ class DualModelTradingSwarm:
                 {"role": "user", "content": user_input}
             ],
             "temperature": 0.1,
-            "max_tokens": 4096,  # Raised to 4096 to prevent truncation from thinking tokens
+            "max_tokens": 4096,
             "response_format": {"type": "json_object"}
         }
 
@@ -264,7 +265,8 @@ class DualModelTradingSwarm:
 
         for attempt in range(max_retries):
             try:
-                resp = await client.post(url, json=payload, headers=headers, timeout=60.0)
+                # 120.0s timeout to allow full generation window
+                resp = await client.post(url, json=payload, headers=headers, timeout=120.0)
 
                 if resp.status_code == 429:
                     sleep_time = backoff_factor ** (attempt + 1)
@@ -307,9 +309,9 @@ class DualModelTradingSwarm:
         sys_prompt = (
             f"{persona}\n"
             "ROLE: Bull Researcher Agent.\n"
-            "TASK: Build a concise BULLISH thesis for each asset. Focus on asymmetric upside, "
-            "MACD momentum, and support levels.\n"
+            "TASK: Build a concise BULLISH thesis for up to 5 top assets.\n"
             "INSTRUCTIONS:\n"
+            "- Focus ONLY on the top 3-5 most compelling tickers in the provided input.\n"
             "- Keep `thesis_summary` to 1 short sentence per ticker.\n"
             "- Limit `key_factors` to maximum 2 brief bullet strings.\n"
             "- Do NOT use literal 'TICKER'. Use exact stock symbols from input (e.g., 'AAPL', 'NVDA').\n"
@@ -323,9 +325,9 @@ class DualModelTradingSwarm:
         sys_prompt = (
             f"{persona}\n"
             "ROLE: Bear Researcher Agent (Adversary).\n"
-            "TASK: Build a concise BEARISH thesis for each asset. Focus on bull traps, overhead resistance, "
-            "and overbought RSI divergence.\n"
+            "TASK: Build a concise BEARISH thesis for up to 5 top assets.\n"
             "INSTRUCTIONS:\n"
+            "- Focus ONLY on the top 3-5 most compelling tickers in the provided input.\n"
             "- Keep `thesis_summary` to 1 short sentence per ticker.\n"
             "- Limit `key_factors` to maximum 2 brief bullet strings.\n"
             "- Do NOT use literal 'TICKER'. Use exact stock symbols from input (e.g., 'AAPL', 'NVDA').\n"
