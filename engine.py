@@ -68,10 +68,10 @@ class AlpacaExecutionBridge:
         url = f"{self.base_url}/v2/orders"
         payload = {
             "symbol": symbol.upper(),
-            "qty": str(round(qty, 4)),
+            "qty": str(round(qty, 2)),
             "side": side,
             "type": "market",
-            "time_in_force": "gtc"
+            "time_in_force": "day"  # Required by Alpaca for fractional share market orders
         }
         try:
             resp = requests.post(url, json=payload, headers=self.headers, timeout=10.0)
