@@ -4,7 +4,6 @@ import json
 import logging
 import asyncio
 import httpx
-import boto3
 import pandas as pd
 import requests
 from typing import Literal, Dict, Union, Any, List, Optional
@@ -21,12 +20,10 @@ def clean_llm_json_string(raw_content: str) -> str:
     Strips conversational preambles/postambles and markdown fences 
     to extract the exact raw JSON payload.
     """
-    # 1. Extract content inside ```json ... ``` markdown block if present
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw_content)
     if match:
         raw_content = match.group(1).strip()
     
-    # 2. Find the first '{' and last '}' to strip preambles like "To evaluate..." or trailing text
     start_idx = raw_content.find('{')
     end_idx = raw_content.rfind('}')
     
@@ -59,7 +56,6 @@ class AlpacaExecutionBridge:
         if not self.is_active() or qty <= 0:
             return None
 
-        # Map agent actions to Alpaca REST API order side
         side_map = {
             "BUY": "buy",
             "COVER": "buy",
@@ -136,7 +132,7 @@ class RiskParityOptimizer:
     Converts qualitative LLM conviction scores into volatility-adjusted weights
     using Inverse-Volatility Risk Parity. Enforces a strict 5% max position cap.
     """
-    def __init__(self, max_position_cap: float = 0.05):  # 5% max position cap
+    def __init__(self, max_position_cap: float = 0.05):
         self.max_position_cap = max_position_cap
 
     def optimize(self, convictions: dict, atrs: dict) -> dict:
@@ -193,19 +189,18 @@ class RiskParityOptimizer:
         if total_risk_score > 0:
             for ticker, (action, score) in active_candidates.items():
                 unclamped_weight = score / total_risk_score
-                # Strict hard clamp at max_position_cap (5.0%)
                 clamped_weight = round(float(min(max_position_cap, unclamped_weight)), 4)
                 raw_decisions[ticker] = PortfolioAllocation(ticker=ticker, action=action, allocation_pct=clamped_weight)
 
         return CrossAssetRiskDecision(decisions=raw_decisions, macro_reasoning=signals.macro_reasoning)
 
 # ==========================================
-# 3. HYBRID AI SWARM ENGINE WITH DEBATE LOOP
+# 3. GEMMA 4-31B SWARM ENGINE WITH DEBATE LOOP
 # ==========================================
 
 class DualModelTradingSwarm:
     def __init__(self, api_key: str = None):
-        self.primary_api_key = api_key or os.getenv("GROQ_API_KEY2")
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
     def analyze_technical_state(self, market_state: dict, active_holdings: list = None) -> dict:
         filtered_thesis = {}
@@ -233,46 +228,7 @@ class DualModelTradingSwarm:
 
         return filtered_thesis
 
-    def _call_aws_bedrock_llama(self, sys_prompt: str, user_input: str) -> str:
-        """
-        Synchronous AWS Bedrock Converse API invocation for Llama 3.3 70B Instruct.
-        Executed inside an async thread executor to prevent blocking the event loop.
-        """
-        aws_key = os.getenv("AWS_ACCESS_KEY_ID")
-        aws_secret = os.getenv("AWS_SECRET_ACCESS_KEY")
-        region = os.getenv("AWS_REGION", "us-east-1")
-
-        if not aws_key or not aws_secret:
-            raise ValueError("AWS credentials not set in environment.")
-
-        bedrock_client = boto3.client(
-            service_name="bedrock-runtime",
-            region_name=region,
-            aws_access_key_id=aws_key,
-            aws_secret_access_key=aws_secret
-        )
-
-        model_id = "us.meta.llama3-3-70b-instruct-v1:0"
-
-        response = bedrock_client.converse(
-            modelId=model_id,
-            system=[{"text": sys_prompt}],
-            messages=[
-                {
-                    "role": "user",
-                    "content": [{"text": user_input}]
-                }
-            ],
-            inferenceConfig={
-                "temperature": 0.1,
-                "maxTokens": 2048
-            }
-        )
-
-        output_message = response["output"]["message"]["content"][0]["text"]
-        return output_message
-
-    async def _call_llm_provider_chain(
+    async def _call_gemma_provider(
         self,
         client: httpx.AsyncClient,
         sys_prompt: str,
@@ -280,116 +236,69 @@ class DualModelTradingSwarm:
         model_class: Any,
         role_tag: str = "LLM"
     ) -> Any:
-        """Helper executing multi-provider LLM calls with automated schema validation."""
-        providers = [
-            {
-                "name": "Groq",
-                "type": "http",
-                "url": "https://api.groq.com/openai/v1/chat/completions",
-                "key": self.primary_api_key or os.getenv("GROQ_API_KEY"),
-                "model": "llama-3.3-70b-versatile",
-                "use_json_format": True
-            },
-            {
-                "name": "OpenRouter (70B)",
-                "type": "http",
-                "url": "https://openrouter.ai/api/v1/chat/completions",
-                "key": os.getenv("OPENROUTER_API_KEY"),
-                "model": "meta-llama/llama-3.3-70b-instruct:free",
-                "headers": {
-                    "HTTP-Referer": "https://github.com/EvoQuant-AI",
-                    "X-Title": "EvoQuant Trading Swarm"
-                },
-                "use_json_format": True
-            },
-            {
-                "name": "GitHub Models",
-                "type": "http",
-                "url": "https://models.inference.ai.azure.com/chat/completions",
-                "key": os.getenv("GITHUB_TOKEN"),
-                "model": "Llama-3.3-70B-Instruct",
-                "use_json_format": True
-            },
-            {
-                "name": "SambaNova",
-                "type": "http",
-                "url": "https://api.sambanova.ai/v1/chat/completions",
-                "key": os.getenv("SAMBANOVA_API_KEY"),
-                "model": "Meta-Llama-3.3-70B-Instruct",
-                "use_json_format": False
-            },
-            {
-                "name": "AWS Bedrock (Llama 3.3 70B)",
-                "type": "bedrock",
-                "key": os.getenv("AWS_ACCESS_KEY_ID")
-            }
-        ]
+        """Executes LLM calls via Google AI Studio using Gemma 4-31B with built-in rate-limit exception handling & backoff."""
+        url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        api_key = self.api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
-        base_messages = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_input}
-        ]
+        if not api_key:
+            raise ValueError("Gemini API key is not set in environment variables (GEMINI_API_KEY or GOOGLE_API_KEY).")
 
-        for p in providers:
-            if not p["key"]:
-                continue
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
 
-            # -------------------------------------------------------------
-            # BEDROCK FALLBACK EXECUTION (BOTTOM OF CHAIN)
-            # -------------------------------------------------------------
-            if p["type"] == "bedrock":
-                try:
-                    logger.info(f"🛡️ Free tiers exhausted or rate-limited for [{role_tag}]. Routing request to AWS Bedrock...")
-                    raw_content = await asyncio.to_thread(self._call_aws_bedrock_llama, sys_prompt, user_input)
-                    cleaned_content = clean_llm_json_string(raw_content)
-                    validated_output = model_class.model_validate_json(cleaned_content)
-                    logger.info(f"✅ [{role_tag}] Evaluated successfully via [AWS Bedrock]")
-                    return validated_output
-                except Exception as e:
-                    logger.warning(f"⚠️ AWS Bedrock execution failed for [{role_tag}]: {e}")
-                    continue
+        payload = {
+            "model": "gemma-4-31b-it",
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_input}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 2048,
+            "response_format": {"type": "json_object"}
+        }
 
-            # -------------------------------------------------------------
-            # STANDARD HTTP PROVIDER EXECUTION (FREE TIERS)
-            # -------------------------------------------------------------
-            headers = {
-                "Authorization": f"Bearer {p['key']}",
-                "Content-Type": "application/json"
-            }
-            if "headers" in p:
-                headers.update(p["headers"])
+        max_retries = 3
+        backoff_factor = 2.0
 
-            payload = {
-                "model": p["model"],
-                "messages": list(base_messages),
-                "temperature": 0.1,
-                "max_tokens": 2048
-            }
-            if p.get("use_json_format"):
-                payload["response_format"] = {"type": "json_object"}
-
+        for attempt in range(max_retries):
             try:
-                resp = await client.post(p["url"], json=payload, headers=headers, timeout=15.0)
-                if resp.status_code in (400, 401, 402, 404, 410, 429):
-                    logger.warning(f"⚠️ [{p['name']} - {role_tag}] Status {resp.status_code}. Routing to next provider...")
+                resp = await client.post(url, json=payload, headers=headers, timeout=25.0)
+
+                if resp.status_code == 429:
+                    sleep_time = backoff_factor ** (attempt + 1)
+                    logger.warning(f"⚠️ [Rate Limit / 429] encountered for [{role_tag}] on Gemma 4 31B. Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
+                    await asyncio.sleep(sleep_time)
                     continue
 
                 resp.raise_for_status()
-                raw_content = resp.json()['choices'][0]['message']['content']
+                data = resp.json()
+                raw_content = data['choices'][0]['message']['content']
                 cleaned_content = clean_llm_json_string(raw_content)
-                
+
                 validated_output = model_class.model_validate_json(cleaned_content)
-                logger.info(f"✅ [{role_tag}] Evaluated successfully via [{p['name']}]")
+                logger.info(f"✅ [{role_tag}] Evaluated successfully via [Google AI Studio - Gemma 4 31B]")
                 return validated_output
 
+            except httpx.HTTPStatusError as hse:
+                logger.warning(f"⚠️ HTTP error {hse.response.status_code} for [{role_tag}]: {hse.response.text}")
+                if hse.response.status_code in (400, 401, 403, 404):
+                    raise
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(backoff_factor ** (attempt + 1))
             except ValidationError as ve:
-                logger.warning(f"⚠️ Validation error on [{p['name']} - {role_tag}]: {ve}. Trying next...")
-                continue
+                logger.warning(f"⚠️ Validation error on [{role_tag}]: {ve}. Retrying...")
+                if attempt == max_retries - 1:
+                    raise
             except Exception as e:
-                logger.warning(f"⚠️ [{p['name']} - {role_tag}] Provider failed: {e}. Trying next...")
-                continue
+                logger.warning(f"⚠️ [{role_tag}] Provider failed: {e}. Retrying...")
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(backoff_factor ** (attempt + 1))
 
-        raise RuntimeError(f"All providers (including AWS Bedrock) failed or rate-limited for [{role_tag}].")
+        raise RuntimeError(f"Gemma 4 31B failed or rate-limited for [{role_tag}] after {max_retries} attempts.")
 
     async def _generate_bull_case(
         self, client: httpx.AsyncClient, strategy_input: str, persona: str
@@ -402,7 +311,7 @@ class DualModelTradingSwarm:
             "MUST INCLUDE BOTH `arguments` and `overall_perspective` in JSON output.\n"
             'Format MUST be JSON matching schema: {"arguments": {"TICKER": {"ticker": "TICKER", "thesis_summary": "summary", "key_factors": ["f1"], "strength_score": 0.85}}, "overall_perspective": "perspective"}'
         )
-        return await self._call_llm_provider_chain(client, sys_prompt, strategy_input, AgentDebateCase, "BullResearcher")
+        return await self._call_gemma_provider(client, sys_prompt, strategy_input, AgentDebateCase, "BullResearcher")
 
     async def _generate_bear_case(
         self, client: httpx.AsyncClient, strategy_input: str, persona: str
@@ -415,7 +324,7 @@ class DualModelTradingSwarm:
             "MUST INCLUDE BOTH `arguments` and `overall_perspective` in JSON output.\n"
             'Format MUST be JSON matching schema: {"arguments": {"TICKER": {"ticker": "TICKER", "thesis_summary": "summary", "key_factors": ["f1"], "strength_score": 0.75}}, "overall_perspective": "perspective"}'
         )
-        return await self._call_llm_provider_chain(client, sys_prompt, strategy_input, AgentDebateCase, "BearResearcher")
+        return await self._call_gemma_provider(client, sys_prompt, strategy_input, AgentDebateCase, "BearResearcher")
 
     async def execute_agent_strategy(
         self, 
@@ -453,13 +362,13 @@ class DualModelTradingSwarm:
 
         if isinstance(bull_res, Exception):
             logger.warning(f"⚠️ Bull Researcher failed: {bull_res}. Falling back to default bullish case.")
-            bull_case_data = "Bullish case unavailable due to API rate limit."
+            bull_case_data = "Bullish case unavailable due to rate limit or error."
         else:
             bull_case_data = bull_res.model_dump_json()
 
         if isinstance(bear_res, Exception):
             logger.warning(f"⚠️ Bear Researcher failed: {bear_res}. Falling back to default bearish case.")
-            bear_case_data = "Bearish case unavailable due to API rate limit."
+            bear_case_data = "Bearish case unavailable due to rate limit or error."
         else:
             bear_case_data = bear_res.model_dump_json()
 
@@ -485,7 +394,7 @@ class DualModelTradingSwarm:
         )
 
         try:
-            qualitative_signals = await self._call_llm_provider_chain(
+            qualitative_signals = await self._call_gemma_provider(
                 client, synth_sys_prompt, synth_input, AgentSignalDecision, "SynthesizerJudge"
             )
             return RiskParityOptimizer.optimize_allocations(qualitative_signals, thesis)
@@ -502,7 +411,6 @@ class DualModelTradingSwarm:
     ) -> Dict[str, CrossAssetRiskDecision]:
         """
         Executes all agent strategy decisions in PARALLEL using asyncio.gather.
-        Reduces multi-agent processing time from ~20s to <1.5s per tick.
         """
         tasks = []
         agent_ids = []
@@ -700,7 +608,6 @@ class CrossAssetPortfolioManager:
                 conn.commit()
 
     def get_agent_holdings(self, agent_id: str) -> Dict[str, float]:
-        """Fetches active non-zero holdings (Long > 0, Short < 0) for an agent."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -709,7 +616,6 @@ class CrossAssetPortfolioManager:
                 """, (agent_id,))
                 rows = cur.fetchall()
                 return {row['ticker']: float(row['amount']) for row in rows}
-
 
     def update_agent_holding(self, agent_id: str, ticker: str, amount: float, entry_price: float = 0.0):
         with self.pool.connection() as conn:
@@ -726,7 +632,6 @@ class CrossAssetPortfolioManager:
                 conn.commit()
 
     def process_daily_dividends(self, current_date_str: str):
-        """Scans dividend_schedule for ex-dates matching current_date_str and applies payouts/debits."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
