@@ -14,21 +14,17 @@ from psycopg.rows import dict_row
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SwarmEngine")
 
-# Helper utility to strip markdown fences and Gemma thinking tags from LLM responses
 def clean_llm_json_string(raw_content: str) -> str:
     """
-    Strips conversational preambles/postambles, Gemma thinking tags (<thought>...</thought>),
+    Strips conversational preambles, Gemma thinking tags (<thought>...</thought>),
     and markdown fences to extract the exact raw JSON payload.
     """
-    # 1. Strip Gemma 4 internal thinking blocks (<thought>...</thought>)
     raw_content = re.sub(r"<thought>[\s\S]*?</thought>", "", raw_content).strip()
 
-    # 2. Strip markdown fences
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw_content)
     if match:
         raw_content = match.group(1).strip()
 
-    # 3. Extract bracketed JSON object {...}
     start_idx = raw_content.find('{')
     end_idx = raw_content.rfind('}')
 
@@ -241,7 +237,6 @@ class DualModelTradingSwarm:
         model_class: Any,
         role_tag: str = "LLM"
     ) -> Any:
-        """Executes LLM calls via Google AI Studio using Gemma 4-31B with built-in rate-limit exception handling & backoff."""
         url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         api_key = self.api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
@@ -260,7 +255,7 @@ class DualModelTradingSwarm:
                 {"role": "user", "content": user_input}
             ],
             "temperature": 0.1,
-            "max_tokens": 2048,
+            "max_tokens": 4096,  # Raised to 4096 to prevent truncation from thinking tokens
             "response_format": {"type": "json_object"}
         }
 
@@ -312,11 +307,13 @@ class DualModelTradingSwarm:
         sys_prompt = (
             f"{persona}\n"
             "ROLE: Bull Researcher Agent.\n"
-            "TASK: Build the strongest possible BULLISH thesis for each asset. Focus on asymmetric upside, "
-            "MACD bullish momentum, oversold RSI bounces, key support levels, and positive relative strength.\n"
-            "CRITICAL: Do NOT use the literal placeholder 'TICKER' as a key. Use the actual asset ticker symbols from input (e.g., 'AAPL', 'NVDA', 'ORCL').\n"
-            "MUST INCLUDE BOTH `arguments` and `overall_perspective` in JSON output.\n"
-            'Example output format: {"arguments": {"AAPL": {"ticker": "AAPL", "thesis_summary": "strong technical momentum", "key_factors": ["MACD crossover"], "strength_score": 0.85}}, "overall_perspective": "constructive market outlook"}'
+            "TASK: Build a concise BULLISH thesis for each asset. Focus on asymmetric upside, "
+            "MACD momentum, and support levels.\n"
+            "INSTRUCTIONS:\n"
+            "- Keep `thesis_summary` to 1 short sentence per ticker.\n"
+            "- Limit `key_factors` to maximum 2 brief bullet strings.\n"
+            "- Do NOT use literal 'TICKER'. Use exact stock symbols from input (e.g., 'AAPL', 'NVDA').\n"
+            'Example output: {"arguments": {"AAPL": {"ticker": "AAPL", "thesis_summary": "Bullish momentum above 200 SMA", "key_factors": ["MACD golden cross", "Strong RS"], "strength_score": 0.85}}, "overall_perspective": "Positive market outlook"}'
         )
         return await self._call_gemma_provider(client, sys_prompt, strategy_input, AgentDebateCase, "BullResearcher")
 
@@ -326,11 +323,13 @@ class DualModelTradingSwarm:
         sys_prompt = (
             f"{persona}\n"
             "ROLE: Bear Researcher Agent (Adversary).\n"
-            "TASK: Hunt for flaws, Bull Traps, weak breakout volume, RSI bearish divergence, overhead resistance, "
-            "and broader macro tail-risk for each asset. Build an aggressive BEARISH counter-case.\n"
-            "CRITICAL: Do NOT use the literal placeholder 'TICKER' as a key. Use the actual asset ticker symbols from input (e.g., 'AAPL', 'NVDA', 'ORCL').\n"
-            "MUST INCLUDE BOTH `arguments` and `overall_perspective` in JSON output.\n"
-            'Example output format: {"arguments": {"NVDA": {"ticker": "NVDA", "thesis_summary": "overbought divergence", "key_factors": ["RSI above 70"], "strength_score": 0.75}}, "overall_perspective": "defensive posture required"}'
+            "TASK: Build a concise BEARISH thesis for each asset. Focus on bull traps, overhead resistance, "
+            "and overbought RSI divergence.\n"
+            "INSTRUCTIONS:\n"
+            "- Keep `thesis_summary` to 1 short sentence per ticker.\n"
+            "- Limit `key_factors` to maximum 2 brief bullet strings.\n"
+            "- Do NOT use literal 'TICKER'. Use exact stock symbols from input (e.g., 'AAPL', 'NVDA').\n"
+            'Example output: {"arguments": {"NVDA": {"ticker": "NVDA", "thesis_summary": "RSI overbought divergence near resistance", "key_factors": ["RSI > 70", "Volume fade"], "strength_score": 0.75}}, "overall_perspective": "Cautious posture recommended"}'
         )
         return await self._call_gemma_provider(client, sys_prompt, strategy_input, AgentDebateCase, "BearResearcher")
 
@@ -341,12 +340,6 @@ class DualModelTradingSwarm:
         portfolio_state: dict, 
         custom_persona: str
     ) -> CrossAssetRiskDecision:
-        """
-        Executes Adversarial Debate Loop:
-        1. Runs Bull & Bear Research agents sequentially to prevent provider throttling.
-        2. Passes both cases to Synthesizer/Judge agent to filter out confirmation bias.
-        3. Optimizes allocations using Inverse-Volatility Risk Parity.
-        """
         if isinstance(thesis, dict):
             compact_theses = {
                 tk: f"P:{data.get('price')}|RSI:{data.get('rsi')}|MACD:{data.get('macd_hist')}|RS:{data.get('rel_strength')}|ATR:{data.get('atr')}"
@@ -391,15 +384,10 @@ class DualModelTradingSwarm:
         synth_sys_prompt = (
             f"{custom_persona}\n"
             "ROLE: Chief Investment Officer / Impartial Judge.\n"
-            "TASK: Evaluate Bull Case and Bear Case against market data. Detect bull traps, cross-examine arguments, "
-            "and issue final trade actions with conviction scores (0.0 to 1.0).\n"
+            "TASK: Evaluate Bull Case and Bear Case against market data. Issue final trade actions with conviction scores (0.0 to 1.0).\n"
             "Allowed Actions: BUY (long), SELL (close long), SHORT (open short), COVER (close short), HOLD.\n"
-            "CRITICAL: Replace ticker placeholders with actual stock symbols from the input data (e.g., 'AAPL', 'NVDA', 'ORCL'). Do NOT output literal 'TICKER'.\n"
-            "DECISION RULES FOR SHORTING:\n"
-            "- If Bear Case strength > Bull Case strength OR asset RSI > 68 OR relative strength vs SPY < -1.5, issue SHORT with conviction > 0.5.\n"
-            "- If holding a SHORT position and stock rebounds significantly, issue COVER.\n"
-            "MUST INCLUDE BOTH `signals` and `macro_reasoning` in JSON output.\n"
-            'Example output format: {"signals": {"AAPL": {"ticker": "AAPL", "action": "BUY", "conviction": 0.8}, "NVDA": {"ticker": "NVDA", "action": "SHORT", "conviction": 0.85}}, "macro_reasoning": "Balanced multi-asset thesis"}'
+            "CRITICAL: Replace ticker placeholders with actual stock symbols from input data (e.g., 'AAPL', 'NVDA'). Do NOT output literal 'TICKER'.\n"
+            'Example output: {"signals": {"AAPL": {"ticker": "AAPL", "action": "BUY", "conviction": 0.8}, "NVDA": {"ticker": "NVDA", "action": "SHORT", "conviction": 0.85}}, "macro_reasoning": "Balanced multi-asset thesis"}'
         )
 
         try:
@@ -418,10 +406,6 @@ class DualModelTradingSwarm:
         population: List[Any],
         prices: Dict[str, float]
     ) -> Dict[str, CrossAssetRiskDecision]:
-        """
-        Evaluates agent strategies sequentially with rate-limit pacing to stay 
-        strictly within Google AI Studio Free Tier limits (16k TPM / 30 RPM).
-        """
         decisions_map = {}
 
         for agent in population:
@@ -440,7 +424,6 @@ class DualModelTradingSwarm:
                 logger.error(f"❌ Execution failed for [{agent.agent_id}]: {e}")
                 decisions_map[agent.agent_id] = CrossAssetRiskDecision(decisions={}, macro_reasoning="Execution error")
 
-            # 2.5-second pacing delay between agents
             await asyncio.sleep(2.5)
 
         return decisions_map
@@ -471,7 +454,7 @@ class CrossAssetPortfolioManager:
         self.max_position_cap = max_position_cap
 
         conninfo = f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.dbname}"
-        
+
         self.pool = ConnectionPool(
             conninfo=conninfo,
             min_size=min_pool_size,
@@ -583,7 +566,7 @@ class CrossAssetPortfolioManager:
                     CREATE INDEX IF NOT EXISTS idx_div_schedule_ex_date 
                     ON dividend_schedule (ex_date);
                 """)
-                
+
                 conn.commit()
 
     def register_agent(self, agent_id: str):
@@ -732,5 +715,4 @@ class CrossAssetPortfolioManager:
     def close(self):
         self.pool.close()
 
-# Alias for backward compatibility across modules
 PostgresPortfolioManager = CrossAssetPortfolioManager
