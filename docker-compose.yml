@@ -77,11 +77,8 @@ services:
       - ALPACA_API_KEY=${ALPACA_API_KEY}
       - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
       - ALPACA_BASE_URL=${ALPACA_BASE_URL:-https://paper-api.alpaca.markets}
-      # 70B Provider Fallback Keys
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
-      - SAMBANOVA_API_KEY=${SAMBANOVA_API_KEY}
+      # Google AI Studio Primary API Key
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
     depends_on:
       redis:
         condition: service_started
