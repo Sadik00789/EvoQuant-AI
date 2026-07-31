@@ -124,11 +124,11 @@ HEADLINES:
 
 INSTRUCTIONS:
 1. Assign a sentiment_score from -1.0 (Extreme Bearish/Panic) to +1.0 (Extreme Bullish/Euphonic).
-2. Write a concise 1-sentence summary_reasoning justifying your score.
+2. Write a detailed 2 to 3 sentence summary_reasoning highlighting key drivers (e.g. Fed policy, tech earnings, inflation).
 3. Return ONLY a JSON object:
 {{
     "sentiment_score": 0.2,
-    "summary_reasoning": "Tech earnings stability offsetting rate uncertainty."
+    "summary_reasoning": "Post-earnings sell-offs are hitting growth sectors, but opportunistic dip-buying is providing a floor. Investors remain cautious ahead of upcoming Fed guidance."
 }}
 """
 
