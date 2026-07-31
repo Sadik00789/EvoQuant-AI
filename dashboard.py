@@ -363,7 +363,7 @@ st.sidebar.markdown(
 )
 st.sidebar.markdown(
     f"<span style='color:{TEXT_MUTED} !important; font-size:0.85rem;'>"
-    f"<b style='color:{ACCENT} !important;'>Engine:</b> Llama-70B + Risk Parity</span>",
+    f"<b style='color:{ACCENT} !important;'>Engine:</b> Gemma 4-31B + Risk Parity</span>",
     unsafe_allow_html=True
 )
 st.sidebar.markdown("<hr class='app-divider' style='margin:16px 0;'>", unsafe_allow_html=True)
