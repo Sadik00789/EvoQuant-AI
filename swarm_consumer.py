@@ -6,7 +6,7 @@ import httpx
 import sqlalchemy
 import redis.asyncio as redis
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from engine import (
@@ -160,7 +160,7 @@ async def run_consumer():
                         logger.info(f"\n==================== 🔔 MARKET TICK #{tick_counter} ====================")
 
                         # Daily Ex-Dividend Payout / Debit Engine Trigger
-                        today_date_str = datetime.utcnow().strftime("%Y-%m-%d")
+                        today_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                         if today_date_str != last_processed_date:
                             try:
                                 db.process_daily_dividends(today_date_str)
