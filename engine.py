@@ -255,7 +255,7 @@ class DualModelTradingSwarm:
                 {"role": "user", "content": user_input}
             ],
             "temperature": 0.1,
-            "max_tokens": 2048,
+            "max_tokens": 1024,
             "response_format": {"type": "json_object"}
         }
 
@@ -264,7 +264,8 @@ class DualModelTradingSwarm:
 
         for attempt in range(max_retries):
             try:
-                resp = await client.post(url, json=payload, headers=headers, timeout=25.0)
+                # 60.0 second timeout to handle heavy Gemma 4-31B structured JSON inference
+                resp = await client.post(url, json=payload, headers=headers, timeout=60.0)
 
                 if resp.status_code == 429:
                     sleep_time = backoff_factor ** (attempt + 1)
@@ -282,7 +283,7 @@ class DualModelTradingSwarm:
                 return validated_output
 
             except httpx.HTTPStatusError as hse:
-                logger.warning(f"⚠️ HTTP error {hse.response.status_code} for [{role_tag}]: {hse.response.text}")
+                logger.warning(f"⚠️ HTTP status error {hse.response.status_code} for [{role_tag}]: {hse.response.text}")
                 if hse.response.status_code in (400, 401, 403, 404):
                     raise
                 if attempt == max_retries - 1:
@@ -293,7 +294,8 @@ class DualModelTradingSwarm:
                 if attempt == max_retries - 1:
                     raise
             except Exception as e:
-                logger.warning(f"⚠️ [{role_tag}] Provider failed: {e}. Retrying...")
+                err_msg = str(e) if str(e) else type(e).__name__
+                logger.warning(f"⚠️ [{role_tag}] Provider failed: {err_msg}. Retrying in {backoff_factor ** (attempt + 1)}s...")
                 if attempt == max_retries - 1:
                     raise
                 await asyncio.sleep(backoff_factor ** (attempt + 1))
@@ -335,7 +337,7 @@ class DualModelTradingSwarm:
     ) -> CrossAssetRiskDecision:
         """
         Executes Adversarial Debate Loop:
-        1. Runs Bull & Bear Research agents in PARALLEL via asyncio.gather.
+        1. Runs Bull & Bear Research agents sequentially to prevent provider throttling.
         2. Passes both cases to Synthesizer/Judge agent to filter out confirmation bias.
         3. Optimizes allocations using Inverse-Volatility Risk Parity.
         """
@@ -354,23 +356,24 @@ class DualModelTradingSwarm:
 
         strategy_input = json.dumps({"theses": compact_theses, "liquidity": portfolio_state})
 
-        # --- STEP 1: PARALLEL ADVERSARIAL DEBATE GENERATION ---
-        bull_task = self._generate_bull_case(client, strategy_input, custom_persona)
-        bear_task = self._generate_bear_case(client, strategy_input, custom_persona)
-
-        bull_res, bear_res = await asyncio.gather(bull_task, bear_task, return_exceptions=True)
-
-        if isinstance(bull_res, Exception):
-            logger.warning(f"⚠️ Bull Researcher failed: {bull_res}. Falling back to default bullish case.")
-            bull_case_data = "Bullish case unavailable due to rate limit or error."
-        else:
+        # --- STEP 1: SEQUENTIAL ADVERSARIAL DEBATE GENERATION ---
+        try:
+            bull_res = await self._generate_bull_case(client, strategy_input, custom_persona)
             bull_case_data = bull_res.model_dump_json()
+        except Exception as e:
+            logger.warning(f"⚠️ Bull Researcher failed: {e}. Falling back to default bullish case.")
+            bull_case_data = "Bullish case unavailable due to rate limit or error."
 
-        if isinstance(bear_res, Exception):
-            logger.warning(f"⚠️ Bear Researcher failed: {bear_res}. Falling back to default bearish case.")
-            bear_case_data = "Bearish case unavailable due to rate limit or error."
-        else:
+        await asyncio.sleep(1.0)  # Pacing pause between LLM calls
+
+        try:
+            bear_res = await self._generate_bear_case(client, strategy_input, custom_persona)
             bear_case_data = bear_res.model_dump_json()
+        except Exception as e:
+            logger.warning(f"⚠️ Bear Researcher failed: {e}. Falling back to default bearish case.")
+            bear_case_data = "Bearish case unavailable due to rate limit or error."
+
+        await asyncio.sleep(1.0)  # Pacing pause between LLM calls
 
         # --- STEP 2: SYNTHESIZER / PORTFOLIO MANAGER JUDGMENT ---
         synth_input = json.dumps({
