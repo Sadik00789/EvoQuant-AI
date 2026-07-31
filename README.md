@@ -138,22 +138,20 @@ cp .env.example .env
 Edit `.env` and fill in your API credentials:
 
 ```env
-# Database Credentials
-POSTGRES_USER=evoquant
-POSTGRES_PASSWORD=your_secure_password
+# Primary LLM API Key (Google AI Studio)
+GEMINI_API_KEY=your_google_ai_studio_api_key_here
+
+# PostgreSQL / TimescaleDB
+POSTGRES_HOST=timescaledb
+POSTGRES_PORT=5432
 POSTGRES_DB=evoquant_db
+POSTGRES_USER=evoquant
+POSTGRES_PASSWORD=evoquant_secret_pass
 
-# Market Data API & Alpaca Paper Trading Bridge
-ALPACA_API_KEY=your_alpaca_api_key
+# Optional Broker Execution
+ALPACA_API_KEY=your_alpaca_key
 ALPACA_SECRET_KEY=your_alpaca_secret_key
-ALPACA_BASE_URL=https://paper-api.alpaca.markets
 
-# LLM Swarm API Keys (Multi-Provider Llama 3.3 70B Fallback)
-GROQ_API_KEY=your_groq_api_key
-OPENROUTER_API_KEY=your_openrouter_api_key
-SAMBANOVA_API_KEY=your_sambanova_api_key
-GITHUB_TOKEN=your_github_token
-```
 
 ### 4. Build and Launch the Stack
 
