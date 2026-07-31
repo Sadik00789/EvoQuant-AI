@@ -410,10 +410,10 @@ class DualModelTradingSwarm:
         prices: Dict[str, float]
     ) -> Dict[str, CrossAssetRiskDecision]:
         """
-        Executes all agent strategy decisions in PARALLEL using asyncio.gather.
+        Evaluates agent strategies sequentially with rate-limit pacing to stay 
+        strictly within Google AI Studio Free Tier limits (16k TPM / 30 RPM).
         """
-        tasks = []
-        agent_ids = []
+        decisions_map = {}
 
         for agent in population:
             asset_val = sum(agent.holdings.get(tk, 0.0) * prices[tk] for tk in agent.holdings if tk in prices)
@@ -423,18 +423,16 @@ class DualModelTradingSwarm:
                 "holdings": {k: round(v, 4) for k, v in agent.holdings.items() if v != 0},
                 "equity": current_equity
             }
-            tasks.append(self.execute_agent_strategy(client, shared_thesis, port_state, agent.persona_prompt))
-            agent_ids.append(agent.agent_id)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        decisions_map = {}
-        for agent_id, res in zip(agent_ids, results):
-            if isinstance(res, CrossAssetRiskDecision):
-                decisions_map[agent_id] = res
-            else:
-                logger.error(f"❌ Concurrent execution failed for [{agent_id}]: {res}")
-                decisions_map[agent_id] = CrossAssetRiskDecision(decisions={}, macro_reasoning="Execution error")
+            try:
+                decision = await self.execute_agent_strategy(client, shared_thesis, port_state, agent.persona_prompt)
+                decisions_map[agent.agent_id] = decision
+            except Exception as e:
+                logger.error(f"❌ Execution failed for [{agent.agent_id}]: {e}")
+                decisions_map[agent.agent_id] = CrossAssetRiskDecision(decisions={}, macro_reasoning="Execution error")
+
+            # 2.5-second pacing delay between agents to prevent TPM spikes
+            await asyncio.sleep(2.5)
 
         return decisions_map
 
