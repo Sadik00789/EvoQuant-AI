@@ -127,7 +127,6 @@ async def run_consumer():
 
     tick_counter = 0
     macro_multiplier = 1.0
-    spy_returns_history = []
     spy_prices_history = []
     last_processed_date = ""
 
@@ -185,16 +184,14 @@ async def run_consumer():
                             except Exception as e:
                                 logger.warning(f"⚠️ Periodic news sentiment fetch note: {e}")
 
-                        # Track SPY price and return history for 200 SMA Macro Guard
+                        # Track SPY price history for 200 SMA Macro Guard
                         if "SPY" in market_state:
                             spy_close = market_state["SPY"]["close"]
                             spy_prices_history.append(spy_close)
-                            spy_returns_history.append(spy_close)
+                            if len(spy_prices_history) > 250:
+                                spy_prices_history.pop(0)
 
-                            if len(spy_returns_history) > 30:
-                                spy_returns_history.pop(0)
-
-                        spy_series = pd.Series(spy_returns_history).pct_change().dropna() if len(spy_returns_history) > 2 else pd.Series()
+                        spy_series = pd.Series(spy_prices_history).pct_change().dropna() if len(spy_prices_history) > 2 else pd.Series()
                         spy_price_series = pd.Series(spy_prices_history) if len(spy_prices_history) >= 200 else None
                         regime_scaler = risk_engine.calculate_regime_scaler(spy_series, spy_prices=spy_price_series)
 
