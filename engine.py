@@ -213,9 +213,9 @@ class DualModelTradingSwarm:
             reverse=True
         )
 
-        # Capped at top 5 candidates to keep payload lightweight and avoid timeouts
-        top_candidates = [tk for tk, _ in ranked_stocks[:5]]
-        combined_tickers = list(set(top_candidates + active_holdings))[:6]
+        # Retains full 12-candidate universe plus active portfolio holdings
+        top_candidates = [tk for tk, _ in ranked_stocks[:12]]
+        combined_tickers = list(set(top_candidates + active_holdings))
 
         for ticker in combined_tickers:
             if ticker in market_state:
@@ -265,7 +265,6 @@ class DualModelTradingSwarm:
 
         for attempt in range(max_retries):
             try:
-                # 120.0s timeout to allow full generation window
                 resp = await client.post(url, json=payload, headers=headers, timeout=120.0)
 
                 if resp.status_code == 429:
@@ -309,15 +308,39 @@ class DualModelTradingSwarm:
         sys_prompt = (
             f"{persona}\n"
             "ROLE: Bull Researcher Agent.\n"
-            "TASK: Build a concise BULLISH thesis for up to 5 top assets.\n"
+            "TASK: Build a concise BULLISH thesis for each asset in the input payload.\n"
             "INSTRUCTIONS:\n"
-            "- Focus ONLY on the top 3-5 most compelling tickers in the provided input.\n"
             "- Keep `thesis_summary` to 1 short sentence per ticker.\n"
             "- Limit `key_factors` to maximum 2 brief bullet strings.\n"
             "- Do NOT use literal 'TICKER'. Use exact stock symbols from input (e.g., 'AAPL', 'NVDA').\n"
             'Example output: {"arguments": {"AAPL": {"ticker": "AAPL", "thesis_summary": "Bullish momentum above 200 SMA", "key_factors": ["MACD golden cross", "Strong RS"], "strength_score": 0.85}}, "overall_perspective": "Positive market outlook"}'
         )
-        return await self._call_gemma_provider(client, sys_prompt, strategy_input, AgentDebateCase, "BullResearcher")
+
+        input_data = json.loads(strategy_input)
+        theses = input_data.get("theses", {})
+        ticker_items = list(theses.items())
+        batch_size = 6
+
+        merged_arguments = {}
+        overall_perspectives = []
+
+        # Micro-batching tickers (6 per call) to avoid LLM generation timeouts
+        for i in range(0, len(ticker_items), batch_size):
+            chunk_theses = dict(ticker_items[i:i + batch_size])
+            chunk_input = json.dumps({"theses": chunk_theses, "liquidity": input_data.get("liquidity", {})})
+
+            res: AgentDebateCase = await self._call_gemma_provider(
+                client, sys_prompt, chunk_input, AgentDebateCase, f"BullResearcher_Batch_{i//batch_size + 1}"
+            )
+            merged_arguments.update(res.arguments)
+            if res.overall_perspective:
+                overall_perspectives.append(res.overall_perspective)
+
+            if i + batch_size < len(ticker_items):
+                await asyncio.sleep(1.0)
+
+        combined_perspective = " | ".join(overall_perspectives) if overall_perspectives else "Constructive stance across candidate pool."
+        return AgentDebateCase(arguments=merged_arguments, overall_perspective=combined_perspective)
 
     async def _generate_bear_case(
         self, client: httpx.AsyncClient, strategy_input: str, persona: str
@@ -325,15 +348,38 @@ class DualModelTradingSwarm:
         sys_prompt = (
             f"{persona}\n"
             "ROLE: Bear Researcher Agent (Adversary).\n"
-            "TASK: Build a concise BEARISH thesis for up to 5 top assets.\n"
+            "TASK: Build a concise BEARISH thesis for each asset in the input payload.\n"
             "INSTRUCTIONS:\n"
-            "- Focus ONLY on the top 3-5 most compelling tickers in the provided input.\n"
             "- Keep `thesis_summary` to 1 short sentence per ticker.\n"
             "- Limit `key_factors` to maximum 2 brief bullet strings.\n"
             "- Do NOT use literal 'TICKER'. Use exact stock symbols from input (e.g., 'AAPL', 'NVDA').\n"
             'Example output: {"arguments": {"NVDA": {"ticker": "NVDA", "thesis_summary": "RSI overbought divergence near resistance", "key_factors": ["RSI > 70", "Volume fade"], "strength_score": 0.75}}, "overall_perspective": "Cautious posture recommended"}'
         )
-        return await self._call_gemma_provider(client, sys_prompt, strategy_input, AgentDebateCase, "BearResearcher")
+
+        input_data = json.loads(strategy_input)
+        theses = input_data.get("theses", {})
+        ticker_items = list(theses.items())
+        batch_size = 6
+
+        merged_arguments = {}
+        overall_perspectives = []
+
+        for i in range(0, len(ticker_items), batch_size):
+            chunk_theses = dict(ticker_items[i:i + batch_size])
+            chunk_input = json.dumps({"theses": chunk_theses, "liquidity": input_data.get("liquidity", {})})
+
+            res: AgentDebateCase = await self._call_gemma_provider(
+                client, sys_prompt, chunk_input, AgentDebateCase, f"BearResearcher_Batch_{i//batch_size + 1}"
+            )
+            merged_arguments.update(res.arguments)
+            if res.overall_perspective:
+                overall_perspectives.append(res.overall_perspective)
+
+            if i + batch_size < len(ticker_items):
+                await asyncio.sleep(1.0)
+
+        combined_perspective = " | ".join(overall_perspectives) if overall_perspectives else "Defensive stance across candidate pool."
+        return AgentDebateCase(arguments=merged_arguments, overall_perspective=combined_perspective)
 
     async def execute_agent_strategy(
         self, 
@@ -357,7 +403,7 @@ class DualModelTradingSwarm:
 
         strategy_input = json.dumps({"theses": compact_theses, "liquidity": portfolio_state})
 
-        # --- STEP 1: SEQUENTIAL ADVERSARIAL DEBATE GENERATION ---
+        # --- STEP 1: SEQUENTIAL BATCHED DEBATE GENERATION ---
         try:
             bull_res = await self._generate_bull_case(client, strategy_input, custom_persona)
             bull_case_data = bull_res.model_dump_json()
