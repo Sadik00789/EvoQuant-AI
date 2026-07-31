@@ -213,9 +213,9 @@ class DualModelTradingSwarm:
             reverse=True
         )
 
-        # Retains full 12-candidate universe plus active portfolio holdings
+        # Strictly caps total scanning universe to top 12 tickers max
         top_candidates = [tk for tk, _ in ranked_stocks[:12]]
-        combined_tickers = list(set(top_candidates + active_holdings))
+        combined_tickers = list(set(top_candidates + active_holdings))[:12]
 
         for ticker in combined_tickers:
             if ticker in market_state:
@@ -324,10 +324,9 @@ class DualModelTradingSwarm:
         merged_arguments = {}
         overall_perspectives = []
 
-        # Micro-batching tickers (6 per call) to avoid LLM generation timeouts
         for i in range(0, len(ticker_items), batch_size):
             chunk_theses = dict(ticker_items[i:i + batch_size])
-            chunk_input = json.dumps({"theses": chunk_theses, "liquidity": input_data.get("liquidity", {})})
+            chunk_input = json.dumps({"theses": chunk_theses})
 
             res: AgentDebateCase = await self._call_gemma_provider(
                 client, sys_prompt, chunk_input, AgentDebateCase, f"BullResearcher_Batch_{i//batch_size + 1}"
@@ -366,7 +365,7 @@ class DualModelTradingSwarm:
 
         for i in range(0, len(ticker_items), batch_size):
             chunk_theses = dict(ticker_items[i:i + batch_size])
-            chunk_input = json.dumps({"theses": chunk_theses, "liquidity": input_data.get("liquidity", {})})
+            chunk_input = json.dumps({"theses": chunk_theses})
 
             res: AgentDebateCase = await self._call_gemma_provider(
                 client, sys_prompt, chunk_input, AgentDebateCase, f"BearResearcher_Batch_{i//batch_size + 1}"
@@ -381,72 +380,6 @@ class DualModelTradingSwarm:
         combined_perspective = " | ".join(overall_perspectives) if overall_perspectives else "Defensive stance across candidate pool."
         return AgentDebateCase(arguments=merged_arguments, overall_perspective=combined_perspective)
 
-    async def execute_agent_strategy(
-        self, 
-        client: httpx.AsyncClient, 
-        thesis: Union[dict, MultiTechnicalThesis], 
-        portfolio_state: dict, 
-        custom_persona: str
-    ) -> CrossAssetRiskDecision:
-        if isinstance(thesis, dict):
-            compact_theses = {
-                tk: f"P:{data.get('price')}|RSI:{data.get('rsi')}|MACD:{data.get('macd_hist')}|RS:{data.get('rel_strength')}|ATR:{data.get('atr')}"
-                for tk, data in thesis.items()
-            }
-        elif hasattr(thesis, "analyses"):
-            compact_theses = {
-                tk: f"{a.market_regime}|Conf:{a.confidence_score}|ATR:{a.atr}"
-                for tk, a in thesis.analyses.items()
-            }
-        else:
-            compact_theses = {}
-
-        strategy_input = json.dumps({"theses": compact_theses, "liquidity": portfolio_state})
-
-        # --- STEP 1: SEQUENTIAL BATCHED DEBATE GENERATION ---
-        try:
-            bull_res = await self._generate_bull_case(client, strategy_input, custom_persona)
-            bull_case_data = bull_res.model_dump_json()
-        except Exception as e:
-            logger.warning(f"⚠️ Bull Researcher failed: {e}. Falling back to default bullish case.")
-            bull_case_data = "Bullish case unavailable due to rate limit or error."
-
-        await asyncio.sleep(1.0)
-
-        try:
-            bear_res = await self._generate_bear_case(client, strategy_input, custom_persona)
-            bear_case_data = bear_res.model_dump_json()
-        except Exception as e:
-            logger.warning(f"⚠️ Bear Researcher failed: {e}. Falling back to default bearish case.")
-            bear_case_data = "Bearish case unavailable due to rate limit or error."
-
-        await asyncio.sleep(1.0)
-
-        # --- STEP 2: SYNTHESIZER / PORTFOLIO MANAGER JUDGMENT ---
-        synth_input = json.dumps({
-            "market_data_and_liquidity": strategy_input,
-            "bull_researcher_case": bull_case_data,
-            "bear_researcher_case": bear_case_data
-        })
-
-        synth_sys_prompt = (
-            f"{custom_persona}\n"
-            "ROLE: Chief Investment Officer / Impartial Judge.\n"
-            "TASK: Evaluate Bull Case and Bear Case against market data. Issue final trade actions with conviction scores (0.0 to 1.0).\n"
-            "Allowed Actions: BUY (long), SELL (close long), SHORT (open short), COVER (close short), HOLD.\n"
-            "CRITICAL: Replace ticker placeholders with actual stock symbols from input data (e.g., 'AAPL', 'NVDA'). Do NOT output literal 'TICKER'.\n"
-            'Example output: {"signals": {"AAPL": {"ticker": "AAPL", "action": "BUY", "conviction": 0.8}, "NVDA": {"ticker": "NVDA", "action": "SHORT", "conviction": 0.85}}, "macro_reasoning": "Balanced multi-asset thesis"}'
-        )
-
-        try:
-            qualitative_signals = await self._call_gemma_provider(
-                client, synth_sys_prompt, synth_input, AgentSignalDecision, "SynthesizerJudge"
-            )
-            return RiskParityOptimizer.optimize_allocations(qualitative_signals, thesis)
-        except Exception as e:
-            logger.error(f"❌ Synthesizer Judge failed: {e}. Executing hold-safe default.")
-            return CrossAssetRiskDecision(decisions={}, macro_reasoning="Adversarial debate failed to reach consensus.")
-
     async def execute_swarm_strategies_concurrently(
         self,
         client: httpx.AsyncClient,
@@ -456,6 +389,34 @@ class DualModelTradingSwarm:
     ) -> Dict[str, CrossAssetRiskDecision]:
         decisions_map = {}
 
+        # 1. Generate Global Bull & Bear cases ONCE for the whole swarm (4 calls total)
+        compact_theses = {
+            tk: f"P:{data.get('price')}|RSI:{data.get('rsi')}|MACD:{data.get('macd_hist')}|RS:{data.get('rel_strength')}|ATR:{data.get('atr')}"
+            for tk, data in shared_thesis.items()
+        }
+        strategy_input = json.dumps({"theses": compact_theses})
+
+        logger.info("🧠 [Swarm Intelligence] Generating Global Bull & Bear Market Debates for 12 Tickers...")
+
+        try:
+            bull_res = await self._generate_bull_case(client, strategy_input, "Global Technical Analyst")
+            bull_case_data = bull_res.model_dump_json()
+        except Exception as e:
+            logger.warning(f"⚠️ Global Bull Research failed: {e}")
+            bull_case_data = "Bullish case unavailable."
+
+        await asyncio.sleep(1.0)
+
+        try:
+            bear_res = await self._generate_bear_case(client, strategy_input, "Global Risk Analyst")
+            bear_case_data = bear_res.model_dump_json()
+        except Exception as e:
+            logger.warning(f"⚠️ Global Bear Research failed: {e}")
+            bear_case_data = "Bearish case unavailable."
+
+        await asyncio.sleep(1.0)
+
+        # 2. Each agent's Chief Investment Officer Judge evaluates the debate with their unique Persona & Holdings
         for agent in population:
             asset_val = sum(agent.holdings.get(tk, 0.0) * prices[tk] for tk in agent.holdings if tk in prices)
             current_equity = round(agent.cash + asset_val, 2)
@@ -465,14 +426,31 @@ class DualModelTradingSwarm:
                 "equity": current_equity
             }
 
+            synth_input = json.dumps({
+                "market_data_and_liquidity": json.dumps({"theses": compact_theses, "liquidity": port_state}),
+                "bull_researcher_case": bull_case_data,
+                "bear_researcher_case": bear_case_data
+            })
+
+            synth_sys_prompt = (
+                f"{agent.persona_prompt}\n"
+                "ROLE: Chief Investment Officer / Impartial Judge.\n"
+                "TASK: Evaluate Bull Case and Bear Case against market data. Issue final trade actions with conviction scores (0.0 to 1.0).\n"
+                "Allowed Actions: BUY (long), SELL (close long), SHORT (open short), COVER (close short), HOLD.\n"
+                "CRITICAL: Replace ticker placeholders with actual stock symbols from input data (e.g., 'AAPL', 'NVDA'). Do NOT output literal 'TICKER'.\n"
+                'Example output: {"signals": {"AAPL": {"ticker": "AAPL", "action": "BUY", "conviction": 0.8}, "NVDA": {"ticker": "NVDA", "action": "SHORT", "conviction": 0.85}}, "macro_reasoning": "Balanced multi-asset thesis"}'
+            )
+
             try:
-                decision = await self.execute_agent_strategy(client, shared_thesis, port_state, agent.persona_prompt)
-                decisions_map[agent.agent_id] = decision
+                qualitative_signals = await self._call_gemma_provider(
+                    client, synth_sys_prompt, synth_input, AgentSignalDecision, f"SynthesizerJudge_{agent.agent_id}"
+                )
+                decisions_map[agent.agent_id] = RiskParityOptimizer.optimize_allocations(qualitative_signals, shared_thesis)
             except Exception as e:
-                logger.error(f"❌ Execution failed for [{agent.agent_id}]: {e}")
+                logger.error(f"❌ Synthesizer Judge failed for [{agent.agent_id}]: {e}")
                 decisions_map[agent.agent_id] = CrossAssetRiskDecision(decisions={}, macro_reasoning="Execution error")
 
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(1.5)
 
         return decisions_map
 
