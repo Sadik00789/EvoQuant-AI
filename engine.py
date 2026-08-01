@@ -57,6 +57,12 @@ class AlpacaExecutionBridge:
         if not self.is_active() or qty <= 0:
             return None
 
+        # Precision rounding up to 4 decimals for Alpaca fractional support
+        rounded_qty = round(qty, 4)
+        if rounded_qty <= 0:
+            logger.warning(f"⚠️ [ALPACA BROKER SKIPPED] {action} {symbol} order quantity {qty:.6f} rounded down to 0.")
+            return None
+
         side_map = {
             "BUY": "buy",
             "COVER": "buy",
@@ -68,7 +74,7 @@ class AlpacaExecutionBridge:
         url = f"{self.base_url}/v2/orders"
         payload = {
             "symbol": symbol.upper(),
-            "qty": str(round(qty, 2)),
+            "qty": str(rounded_qty),
             "side": side,
             "type": "market",
             "time_in_force": "day"  # Required by Alpaca for fractional share market orders
@@ -77,7 +83,7 @@ class AlpacaExecutionBridge:
             resp = requests.post(url, json=payload, headers=self.headers, timeout=10.0)
             resp.raise_for_status()
             order_data = resp.json()
-            logger.info(f"⚡ [ALPACA BROKER EXECUTED] {action.upper()} {qty:.2f} {symbol} | Order ID: {order_data.get('id')}")
+            logger.info(f"⚡ [ALPACA BROKER EXECUTED] {action.upper()} {rounded_qty} {symbol} | Order ID: {order_data.get('id')}")
             return order_data
         except Exception as e:
             logger.error(f"❌ [ALPACA BROKER ERROR] Failed to submit order for {symbol} ({action}): {e}")
@@ -213,9 +219,10 @@ class DualModelTradingSwarm:
             reverse=True
         )
 
-        # Strictly caps total scanning universe to top 12 tickers max
         top_candidates = [tk for tk, _ in ranked_stocks[:12]]
-        combined_tickers = list(set(top_candidates + active_holdings))[:12]
+
+        # Order-preserving deduplication: prioritizes active holdings first so open positions are never dropped
+        combined_tickers = list(dict.fromkeys(active_holdings + top_candidates))[:12]
 
         for ticker in combined_tickers:
             if ticker in market_state:
