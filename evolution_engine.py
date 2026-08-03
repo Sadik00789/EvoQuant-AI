@@ -1,12 +1,12 @@
 import os
+import re
 import json
 import logging
 import httpx
 import asyncio
-import re
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger("EvolutionEngine")
 
@@ -74,26 +74,32 @@ class EvolutionarySwarmManager:
             for name, prompt in baseline_personas
         ]
 
-    async def run_culling_cycle(self, prices: dict = None, risk_engine = None, db = None):
+    async def run_culling_cycle(self, prices: dict = None, risk_engine = None, db = None, execution_bridge = None):
         """
-        Executes Darwinian selection:
-        1. Recalculates exact equity state using current asset prices (handling long & short valuation).
+        Executes True Darwinian Selection & Capital Transfer:
+        1. Recalculates exact equity state using current asset prices.
         2. Ranks agents by risk-adjusted fitness score.
-        3. Liquidates open positions (SELL for longs, COVER for shorts) of bottom 2 agents.
-        4. Mutates top performer into 2 new offspring using Google AI Studio (Gemma 4-31B).
+        3. Liquidates open positions of bottom agents and recovers their equity.
+        4. Mutates winning parent into offspring using Gemma 4-31B.
+        5. Reallocates 100% of recovered culled equity as inherited cash for offspring.
         """
-        logger.info(f"🧬 --- EXECUTING EVOLUTIONARY CULLING (GEN {self.current_generation}) ---")
+        logger.info(f"🧬 --- EXECUTING DARWINIAN CULLING & INHERITANCE (GEN {self.current_generation}) ---")
+        prices = prices or {}
 
+        # 1. Update in-memory equity state
         if prices:
             for agent in self.population:
                 asset_val = sum(agent.holdings.get(tk, 0.0) * prices[tk] for tk in agent.holdings if tk in prices)
-                agent.equity_history.append(round(agent.cash + asset_val, 2))
+                current_eq = round(agent.cash + asset_val, 2)
+                if not agent.equity_history or agent.equity_history[-1] != current_eq:
+                    agent.equity_history.append(current_eq)
 
+        # 2. Rank agents by fitness
         self.population.sort(key=lambda x: x.calculate_fitness(), reverse=True)
         
         for idx, agent in enumerate(self.population):
             logger.info(
-                f"  Rank #{idx+1} | {agent.agent_id:<25} | "
+                f"   Rank #{idx+1} | {agent.agent_id:<25} | "
                 f"Fitness: {agent.calculate_fitness():>8.4f} | "
                 f"Equity: ${agent.equity_history[-1]:,.2f}"
             )
@@ -101,34 +107,48 @@ class EvolutionarySwarmManager:
         survivors = self.population[:3]
         culled = self.population[3:]
 
-        for dead in culled:
-            if prices:
-                for tk, shares in list(dead.holdings.items()):
-                    if shares != 0 and tk in prices:
-                        current_price = prices[tk]
-                        adv = 1000000.0
-                        action = "SELL" if shares > 0 else "COVER"
-                        exec_price = risk_engine.calculate_execution_price(current_price, abs(shares), adv, action) if risk_engine else current_price
-                        
-                        if shares > 0:
-                            dead.cash += shares * exec_price
-                        else:
-                            dead.cash -= abs(shares) * exec_price  
-                            
-                        dead.holdings[tk] = 0.0
-                        dead.entry_prices[tk] = 0.0
-
-                        if db:
-                            db.update_agent_cash(dead.agent_id, dead.cash)
-                            db.update_agent_holding(dead.agent_id, tk, 0.0, 0.0)
-                            db.log_trade(dead.agent_id, tk, action, abs(shares), exec_price, 0.0, reason="CULLED_LIQUIDATION")
-
-            logger.warning(f"  💀 CULLED & LIQUIDATED: {dead.agent_id} (Fitness: {dead.calculate_fitness()})")
-
+        # 3. Mutate top performer into 2 offspring
         parent = survivors[0]
         offspring_1 = await self._mutate_genome(parent, "Higher Risk Sensitivity & Volatility Protection", 1)
         offspring_2 = await self._mutate_genome(parent, "Exploit Short-term Momentum Breakouts & Breakdown Shorts", 2)
 
+        recipient_ids = [offspring_1.agent_id, offspring_2.agent_id]
+
+        # 4. Liquidate culled agents & transfer capital
+        total_recovered_equity = 0.0
+
+        for dead in culled:
+            dead_asset_val = sum(dead.holdings.get(tk, 0.0) * prices[tk] for tk in dead.holdings if tk in prices)
+            dead_total_equity = max(0.0, dead.cash + dead_asset_val)
+            total_recovered_equity += dead_total_equity
+
+            # Execute database liquidation & capital transfer
+            if db:
+                db.cull_and_reallocate(
+                    loser_agent_id=dead.agent_id,
+                    recipient_agent_ids=recipient_ids,
+                    current_prices=prices,
+                    execution_bridge=execution_bridge
+                )
+
+            # Zero out memory state for culled agent
+            dead.cash = 0.0
+            dead.holdings = {}
+            dead.entry_prices = {}
+            logger.warning(f"  💀 CULLED & LIQUIDATED: {dead.agent_id} (Recovered Equity: ${dead_total_equity:,.2f})")
+
+        # 5. Distribute inherited capital equally to offspring in memory
+        share_per_offspring = round(total_recovered_equity / len(recipient_ids), 2) if recipient_ids else 0.0
+
+        offspring_1.cash = share_per_offspring
+        offspring_1.equity_history = [share_per_offspring]
+
+        offspring_2.cash = share_per_offspring
+        offspring_2.equity_history = [share_per_offspring]
+
+        logger.info(f"🎁 [INHERITANCE] Offspring [{offspring_1.agent_id}] and [{offspring_2.agent_id}] inherited ${share_per_offspring:,.2f} starting cash each!")
+
+        # 6. Update population state
         self.current_generation += 1
         self.population = survivors + [offspring_1, offspring_2]
 
@@ -218,8 +238,8 @@ Return ONLY a JSON object with key "new_prompt": {{"new_prompt": "string"}}
             agent_id=new_id,
             persona_prompt=mutated_prompt,
             generation=self.current_generation + 1,
-            cash=100000.0,
+            cash=0.0,  # Cash will be populated via inheritance
             holdings={},
             entry_prices={},
-            equity_history=[100000.0]
+            equity_history=[0.0]
         )
