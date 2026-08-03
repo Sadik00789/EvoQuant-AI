@@ -487,7 +487,7 @@ class DualModelTradingSwarm:
                 await asyncio.sleep(0.5)
                 return agent.agent_id, decision
 
-        # Execute all 5 judges concurrently
+        # Execute all agents concurrently
         judge_results = await asyncio.gather(*[evaluate_agent(agent) for agent in population])
 
         for agent_id, decision in judge_results:
@@ -686,6 +686,104 @@ class CrossAssetPortfolioManager:
                         entry_price = CASE WHEN EXCLUDED.entry_price > 0 THEN EXCLUDED.entry_price ELSE agent_holdings.entry_price END,
                         updated_at = CURRENT_TIMESTAMP;
                 """, (agent_id, ticker, amount, entry_price))
+                conn.commit()
+
+    def cull_and_reallocate(
+        self, 
+        loser_agent_id: str, 
+        recipient_agent_ids: List[str], 
+        current_prices: Dict[str, float], 
+        execution_bridge: Optional[Any] = None
+    ):
+        """
+        True Darwinian Culling: Liquidates an underperforming agent's positions,
+        calculates its remaining equity, distributes it equally among offspring,
+        and zeros out the loser agent.
+        """
+        if not recipient_agent_ids:
+            logger.warning("⚠️ No recipient agents specified for capital reallocation.")
+            return
+
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                # 1. Fetch loser's current cash balance
+                cur.execute("SELECT cash FROM agent_accounts WHERE agent_id = %s;", (loser_agent_id,))
+                row = cur.fetchone()
+                if not row:
+                    logger.error(f"❌ Agent [{loser_agent_id}] not found in database.")
+                    return
+                loser_cash = float(row['cash'])
+
+                # 2. Fetch loser's active holdings
+                cur.execute("""
+                    SELECT ticker, amount FROM agent_holdings 
+                    WHERE agent_id = %s AND amount != 0;
+                """, (loser_agent_id,))
+                holdings = cur.fetchall()
+
+                liquidated_value = 0.0
+
+                # 3. Liquidate holdings into virtual cash & execute broker orders
+                for item in holdings:
+                    ticker = item['ticker']
+                    amount = float(item['amount'])
+                    price = current_prices.get(ticker, 0.0)
+
+                    if amount != 0 and price > 0:
+                        position_val = amount * price
+                        liquidated_value += position_val
+
+                        # Execute physical broker liquidation if active
+                        if execution_bridge and execution_bridge.is_active():
+                            action = "SELL" if amount > 0 else "COVER"
+                            execution_bridge.submit_market_order(ticker, abs(amount), action)
+
+                        # Log trade event
+                        action_str = "LIQUIDATE_LONG" if amount > 0 else "LIQUIDATE_SHORT"
+                        self.log_trade(loser_agent_id, ticker, action_str, abs(amount), price, 0.0, reason="CULLING")
+
+                    # Zero out loser's holding record
+                    cur.execute("""
+                        UPDATE agent_holdings 
+                        SET amount = 0.0, updated_at = CURRENT_TIMESTAMP 
+                        WHERE agent_id = %s AND ticker = %s;
+                    """, (loser_agent_id, ticker))
+
+                total_recovered_equity = max(0.0, loser_cash + liquidated_value)
+                logger.info(f"💀 [DARWINIAN CULLING] Liquidated [{loser_agent_id}]. Total Recovered Equity: ${total_recovered_equity:,.2f}")
+
+                # 4. Zero out the loser's account cash
+                cur.execute("""
+                    UPDATE agent_accounts 
+                    SET cash = 0.0, updated_at = CURRENT_TIMESTAMP 
+                    WHERE agent_id = %s;
+                """, (loser_agent_id,))
+
+                if total_recovered_equity <= 0:
+                    logger.warning(f"⚠️ [{loser_agent_id}] has no positive equity to transfer.")
+                    conn.commit()
+                    return
+
+                # 5. Register recipient agents with 0 initial cash first (if not already registered)
+                for recipient_id in recipient_agent_ids:
+                    cur.execute("""
+                        INSERT INTO agent_accounts (agent_id, cash)
+                        VALUES (%s, 0.0)
+                        ON CONFLICT (agent_id) DO NOTHING;
+                    """, (recipient_id,))
+
+                # 6. Distribute recovered equity equally to offspring recipients
+                share_per_offspring = round(total_recovered_equity / len(recipient_agent_ids), 2)
+
+                for recipient_id in recipient_agent_ids:
+                    cur.execute("""
+                        UPDATE agent_accounts 
+                        SET cash = cash + %s, updated_at = CURRENT_TIMESTAMP 
+                        WHERE agent_id = %s;
+                    """, (share_per_offspring, recipient_id))
+                    
+                    logger.info(f"🎁 [INHERITANCE] Transferred +${share_per_offspring:,.2f} from [{loser_agent_id}] ➔ [{recipient_id}]")
+
                 conn.commit()
 
     def process_daily_dividends(self, current_date_str: str):
