@@ -57,8 +57,8 @@ class AlpacaExecutionBridge:
         if not self.is_active() or qty <= 0:
             return None
 
-        # Alpaca strictly requires whole integer shares for SHORT positions
-        if action.upper() == "SHORT":
+        # Alpaca strictly requires whole integer shares for SHORT and COVER actions
+        if action.upper() in ("SHORT", "COVER"):
             rounded_qty = int(qty)
         else:
             rounded_qty = round(qty, 4)
@@ -81,7 +81,7 @@ class AlpacaExecutionBridge:
             "qty": str(rounded_qty),
             "side": side,
             "type": "market",
-            "time_in_force": "day"  # Required by Alpaca for fractional share market orders
+            "time_in_force": "day"  # Required by Alpaca for market orders
         }
         try:
             resp = requests.post(url, json=payload, headers=self.headers, timeout=10.0)
