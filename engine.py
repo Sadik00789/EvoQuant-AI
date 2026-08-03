@@ -57,8 +57,12 @@ class AlpacaExecutionBridge:
         if not self.is_active() or qty <= 0:
             return None
 
-        # Precision rounding up to 4 decimals for Alpaca fractional support
-        rounded_qty = round(qty, 4)
+        # Alpaca strictly requires whole integer shares for SHORT positions
+        if action.upper() == "SHORT":
+            rounded_qty = int(qty)
+        else:
+            rounded_qty = round(qty, 4)
+
         if rounded_qty <= 0:
             logger.warning(f"⚠️ [ALPACA BROKER SKIPPED] {action} {symbol} order quantity {qty:.6f} rounded down to 0.")
             return None
