@@ -15,7 +15,7 @@ from engine import (
     AlpacaExecutionBridge, 
     logger
 )
-from evolution_engine import EvolutionarySwarmManager
+from evolution_engine import EvolutionarySwarmManager, AgentGenome
 from risk_engine import AdvancedRiskEngine
 from sentiment_agent import NewsSentimentAgent
 
@@ -33,7 +33,7 @@ broker_bridge = AlpacaExecutionBridge()
 
 
 def restore_agent_states_from_db(swarm_mgr, db):
-    """Restore agent cash, holdings, and entry prices from TimescaleDB on container startup, and log initial snapshot."""
+    """Restore active agent population, cash, holdings, and entry prices from PostgreSQL on container startup."""
     try:
         engine = getattr(db, 'engine', None)
         if engine is None:
@@ -44,6 +44,31 @@ def restore_agent_states_from_db(swarm_mgr, db):
             postgres_db = os.getenv("POSTGRES_DB", "evoquant_db")
             postgres_url = f"postgresql+psycopg://{postgres_user}:{postgres_password}@{postgres_host}:{postgres_port}/{postgres_db}"
             engine = sqlalchemy.create_engine(postgres_url)
+
+        # Restore active evolved 5 agents from database (where cash > 0)
+        accounts_df = pd.read_sql(
+            "SELECT agent_id, cash FROM agent_accounts WHERE cash > 0 ORDER BY updated_at DESC LIMIT 5;",
+            engine
+        )
+
+        if not accounts_df.empty and len(accounts_df) == 5:
+            db_agent_ids = accounts_df['agent_id'].tolist()
+            existing_map = {a.agent_id: a for a in swarm_mgr.population}
+            restored_pop = []
+            for ag_id in db_agent_ids:
+                if ag_id in existing_map:
+                    restored_pop.append(existing_map[ag_id])
+                else:
+                    restored_pop.append(AgentGenome(
+                        agent_id=ag_id,
+                        persona_prompt="You are an evolved quantitative trading agent focusing on risk-adjusted equity growth.",
+                        generation=2 if "Gen" in ag_id else 1,
+                        cash=float(accounts_df[accounts_df['agent_id'] == ag_id].iloc[0]['cash']),
+                        holdings={},
+                        entry_prices={},
+                        equity_history=[float(accounts_df[accounts_df['agent_id'] == ag_id].iloc[0]['cash'])]
+                    ))
+            swarm_mgr.population = restored_pop
 
         snapshots_df = pd.read_sql(
             "SELECT DISTINCT ON (agent_id) agent_id, cash, equity FROM agent_snapshots ORDER BY agent_id, timestamp DESC;",
@@ -418,7 +443,12 @@ async def run_consumer():
 
                         # Darwinian Selection & Mutation
                         if tick_counter % EPOCH_TICK_THRESHOLD == 0:
-                            await swarm_mgr.run_culling_cycle(prices=prices, risk_engine=risk_engine, db=db)
+                            await swarm_mgr.run_culling_cycle(
+                                prices=prices, 
+                                risk_engine=risk_engine, 
+                                db=db, 
+                                execution_bridge=broker_bridge
+                            )
 
         except Exception as e:
             logger.error(f"❌ Redis subscriber connection lost: {e}. Reconnecting in 5s...")
