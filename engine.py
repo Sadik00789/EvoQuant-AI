@@ -698,7 +698,7 @@ class CrossAssetPortfolioManager:
         """
         True Darwinian Culling: Liquidates an underperforming agent's positions,
         calculates its remaining equity, distributes it equally among offspring,
-        and zeros out the loser agent.
+        zeros out the loser agent, and logs updated snapshots.
         """
         if not recipient_agent_ids:
             logger.warning("⚠️ No recipient agents specified for capital reallocation.")
@@ -752,11 +752,16 @@ class CrossAssetPortfolioManager:
                 total_recovered_equity = max(0.0, loser_cash + liquidated_value)
                 logger.info(f"💀 [DARWINIAN CULLING] Liquidated [{loser_agent_id}]. Total Recovered Equity: ${total_recovered_equity:,.2f}")
 
-                # 4. Zero out the loser's account cash
+                # 4. Zero out the loser's account cash & log $0.00 snapshot immediately
                 cur.execute("""
                     UPDATE agent_accounts 
                     SET cash = 0.0, updated_at = CURRENT_TIMESTAMP 
                     WHERE agent_id = %s;
+                """, (loser_agent_id,))
+
+                cur.execute("""
+                    INSERT INTO agent_snapshots (agent_id, equity, cash, pnl_pct)
+                    VALUES (%s, 0.0, 0.0, -100.0);
                 """, (loser_agent_id,))
 
                 if total_recovered_equity <= 0:
@@ -772,7 +777,7 @@ class CrossAssetPortfolioManager:
                         ON CONFLICT (agent_id) DO NOTHING;
                     """, (recipient_id,))
 
-                # 6. Distribute recovered equity equally to offspring recipients
+                # 6. Distribute recovered equity equally to offspring recipients & log snapshots
                 share_per_offspring = round(total_recovered_equity / len(recipient_agent_ids), 2)
 
                 for recipient_id in recipient_agent_ids:
@@ -781,6 +786,15 @@ class CrossAssetPortfolioManager:
                         SET cash = cash + %s, updated_at = CURRENT_TIMESTAMP 
                         WHERE agent_id = %s;
                     """, (share_per_offspring, recipient_id))
+
+                    cur.execute("SELECT cash FROM agent_accounts WHERE agent_id = %s;", (recipient_id,))
+                    rec_row = cur.fetchone()
+                    updated_cash = float(rec_row['cash']) if rec_row else share_per_offspring
+
+                    cur.execute("""
+                        INSERT INTO agent_snapshots (agent_id, equity, cash, pnl_pct)
+                        VALUES (%s, %s, %s, 0.0);
+                    """, (recipient_id, updated_cash, updated_cash))
                     
                     logger.info(f"🎁 [INHERITANCE] Transferred +${share_per_offspring:,.2f} from [{loser_agent_id}] ➔ [{recipient_id}]")
 
