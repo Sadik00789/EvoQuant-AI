@@ -53,18 +53,44 @@ class AlpacaExecutionBridge:
     def is_active(self) -> bool:
         return bool(self.api_key and self.secret_key)
 
+    def get_physical_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Queries Alpaca's actual physical position for a ticker to prevent order collisions."""
+        if not self.is_active():
+            return None
+        url = f"{self.base_url}/v2/positions/{symbol.upper()}"
+        try:
+            resp = requests.get(url, headers=self.headers, timeout=5.0)
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+        except Exception:
+            return None
+
     def submit_market_order(self, symbol: str, qty: float, action: str) -> Optional[Dict[str, Any]]:
         if not self.is_active() or qty <= 0:
             return None
 
-        # Alpaca strictly requires whole integer shares for SHORT and COVER actions
-        if action.upper() in ("SHORT", "COVER"):
+        action_upper = action.upper()
+
+        # Pre-flight physical position check to prevent 403/422 collisions on shared account
+        pos = self.get_physical_position(symbol)
+        physical_qty = float(pos.get("qty", 0.0)) if pos else 0.0
+
+        if action_upper == "SELL" and physical_qty <= 0:
+            logger.warning(f"⚠️ [BROKER SKIPPED] {action_upper} {symbol}: Physical account holds no long position.")
+            return None
+        elif action_upper == "COVER" and physical_qty >= 0:
+            logger.warning(f"⚠️ [BROKER SKIPPED] {action_upper} {symbol}: Physical account holds no short position.")
+            return None
+
+        # Quantize whole integer shares for short-side actions
+        if action_upper in ("SHORT", "COVER"):
             rounded_qty = int(qty)
         else:
             rounded_qty = round(qty, 4)
 
         if rounded_qty <= 0:
-            logger.warning(f"⚠️ [ALPACA BROKER SKIPPED] {action} {symbol} order quantity {qty:.6f} rounded down to 0.")
+            logger.warning(f"⚠️ [BROKER SKIPPED] {action_upper} {symbol}: Quantity rounded down to 0.")
             return None
 
         side_map = {
@@ -73,7 +99,7 @@ class AlpacaExecutionBridge:
             "SELL": "sell",
             "SHORT": "sell"
         }
-        side = side_map.get(action.upper(), action.lower())
+        side = side_map.get(action_upper, action_upper.lower())
 
         url = f"{self.base_url}/v2/orders"
         payload = {
@@ -81,16 +107,20 @@ class AlpacaExecutionBridge:
             "qty": str(rounded_qty),
             "side": side,
             "type": "market",
-            "time_in_force": "day"  # Required by Alpaca for market orders
+            "time_in_force": "day"
         }
         try:
             resp = requests.post(url, json=payload, headers=self.headers, timeout=10.0)
             resp.raise_for_status()
             order_data = resp.json()
-            logger.info(f"⚡ [ALPACA BROKER EXECUTED] {action.upper()} {rounded_qty} {symbol} | Order ID: {order_data.get('id')}")
+            logger.info(f"⚡ [ALPACA BROKER EXECUTED] {action_upper} {rounded_qty} {symbol} | Order ID: {order_data.get('id')}")
             return order_data
+        except requests.exceptions.HTTPError as http_err:
+            status_code = http_err.response.status_code if http_err.response is not None else "Unknown"
+            logger.warning(f"⚠️ [ALPACA BROKER REJECTED] {action_upper} {rounded_qty} {symbol} (HTTP {status_code}): Shared account inventory lock or position constraint.")
+            return None
         except Exception as e:
-            logger.error(f"❌ [ALPACA BROKER ERROR] Failed to submit order for {symbol} ({action}): {e}")
+            logger.error(f"❌ [ALPACA BROKER ERROR] Failed to submit order for {symbol} ({action_upper}): {e}")
             return None
 
 class AssetThesis(BaseModel):
@@ -400,68 +430,68 @@ class DualModelTradingSwarm:
     ) -> Dict[str, CrossAssetRiskDecision]:
         decisions_map = {}
 
-        # 1. Generate Global Bull & Bear cases ONCE for the whole swarm (4 calls total)
         compact_theses = {
             tk: f"P:{data.get('price')}|RSI:{data.get('rsi')}|MACD:{data.get('macd_hist')}|RS:{data.get('rel_strength')}|ATR:{data.get('atr')}"
             for tk, data in shared_thesis.items()
         }
         strategy_input = json.dumps({"theses": compact_theses})
 
-        logger.info("🧠 [Swarm Intelligence] Generating Global Bull & Bear Market Debates for 12 Tickers...")
+        logger.info("🧠 [Swarm Intelligence] Generating Parallel Bull & Bear Market Debates...")
 
-        try:
-            bull_res = await self._generate_bull_case(client, strategy_input, "Global Technical Analyst")
-            bull_case_data = bull_res.model_dump_json()
-        except Exception as e:
-            logger.warning(f"⚠️ Global Bull Research failed: {e}")
-            bull_case_data = "Bullish case unavailable."
+        # 1. Run Bull and Bear Research concurrently instead of sequentially
+        bull_task = self._generate_bull_case(client, strategy_input, "Global Technical Analyst")
+        bear_task = self._generate_bear_case(client, strategy_input, "Global Risk Analyst")
 
-        await asyncio.sleep(1.0)
+        bull_res, bear_res = await asyncio.gather(bull_task, bear_task, return_exceptions=True)
 
-        try:
-            bear_res = await self._generate_bear_case(client, strategy_input, "Global Risk Analyst")
-            bear_case_data = bear_res.model_dump_json()
-        except Exception as e:
-            logger.warning(f"⚠️ Global Bear Research failed: {e}")
-            bear_case_data = "Bearish case unavailable."
+        bull_case_data = bull_res.model_dump_json() if isinstance(bull_res, AgentDebateCase) else "Bullish case unavailable."
+        bear_case_data = bear_res.model_dump_json() if isinstance(bear_res, AgentDebateCase) else "Bearish case unavailable."
 
-        await asyncio.sleep(1.0)
+        # 2. Evaluate Agent Judges with a Semaphore (Concurrency = 2) to optimize throughput while respecting Gemini quotas
+        semaphore = asyncio.Semaphore(2)
 
-        # 2. Each agent's Chief Investment Officer Judge evaluates the debate with their unique Persona & Holdings
-        for agent in population:
-            asset_val = sum(agent.holdings.get(tk, 0.0) * prices[tk] for tk in agent.holdings if tk in prices)
-            current_equity = round(agent.cash + asset_val, 2)
-            port_state = {
-                "cash": round(agent.cash, 2),
-                "holdings": {k: round(v, 4) for k, v in agent.holdings.items() if v != 0},
-                "equity": current_equity
-            }
+        async def evaluate_agent(agent):
+            async with semaphore:
+                asset_val = sum(agent.holdings.get(tk, 0.0) * prices[tk] for tk in agent.holdings if tk in prices)
+                current_equity = round(agent.cash + asset_val, 2)
+                port_state = {
+                    "cash": round(agent.cash, 2),
+                    "holdings": {k: round(v, 4) for k, v in agent.holdings.items() if v != 0},
+                    "equity": current_equity
+                }
 
-            synth_input = json.dumps({
-                "market_data_and_liquidity": json.dumps({"theses": compact_theses, "liquidity": port_state}),
-                "bull_researcher_case": bull_case_data,
-                "bear_researcher_case": bear_case_data
-            })
+                synth_input = json.dumps({
+                    "market_data_and_liquidity": json.dumps({"theses": compact_theses, "liquidity": port_state}),
+                    "bull_researcher_case": bull_case_data,
+                    "bear_researcher_case": bear_case_data
+                })
 
-            synth_sys_prompt = (
-                f"{agent.persona_prompt}\n"
-                "ROLE: Chief Investment Officer / Impartial Judge.\n"
-                "TASK: Evaluate Bull Case and Bear Case against market data. Issue final trade actions with conviction scores (0.0 to 1.0).\n"
-                "Allowed Actions: BUY (long), SELL (close long), SHORT (open short), COVER (close short), HOLD.\n"
-                "CRITICAL: Replace ticker placeholders with actual stock symbols from input data (e.g., 'AAPL', 'NVDA'). Do NOT output literal 'TICKER'.\n"
-                'Example output: {"signals": {"AAPL": {"ticker": "AAPL", "action": "BUY", "conviction": 0.8}, "NVDA": {"ticker": "NVDA", "action": "SHORT", "conviction": 0.85}}, "macro_reasoning": "Balanced multi-asset thesis"}'
-            )
-
-            try:
-                qualitative_signals = await self._call_gemma_provider(
-                    client, synth_sys_prompt, synth_input, AgentSignalDecision, f"SynthesizerJudge_{agent.agent_id}"
+                synth_sys_prompt = (
+                    f"{agent.persona_prompt}\n"
+                    "ROLE: Chief Investment Officer / Impartial Judge.\n"
+                    "TASK: Evaluate Bull Case and Bear Case against market data. Issue final trade actions with conviction scores (0.0 to 1.0).\n"
+                    "Allowed Actions: BUY (long), SELL (close long), SHORT (open short), COVER (close short), HOLD.\n"
+                    "CRITICAL: Replace ticker placeholders with actual stock symbols from input data (e.g., 'AAPL', 'NVDA'). Do NOT output literal 'TICKER'.\n"
+                    'Example output: {"signals": {"AAPL": {"ticker": "AAPL", "action": "BUY", "conviction": 0.8}, "NVDA": {"ticker": "NVDA", "action": "SHORT", "conviction": 0.85}}, "macro_reasoning": "Balanced multi-asset thesis"}'
                 )
-                decisions_map[agent.agent_id] = RiskParityOptimizer.optimize_allocations(qualitative_signals, shared_thesis)
-            except Exception as e:
-                logger.error(f"❌ Synthesizer Judge failed for [{agent.agent_id}]: {e}")
-                decisions_map[agent.agent_id] = CrossAssetRiskDecision(decisions={}, macro_reasoning="Execution error")
 
-            await asyncio.sleep(1.5)
+                try:
+                    qualitative_signals = await self._call_gemma_provider(
+                        client, synth_sys_prompt, synth_input, AgentSignalDecision, f"SynthesizerJudge_{agent.agent_id}"
+                    )
+                    decision = RiskParityOptimizer.optimize_allocations(qualitative_signals, shared_thesis)
+                except Exception as e:
+                    logger.error(f"❌ Synthesizer Judge failed for [{agent.agent_id}]: {e}")
+                    decision = CrossAssetRiskDecision(decisions={}, macro_reasoning="Execution error")
+
+                await asyncio.sleep(0.5)
+                return agent.agent_id, decision
+
+        # Execute all 5 judges concurrently
+        judge_results = await asyncio.gather(*[evaluate_agent(agent) for agent in population])
+
+        for agent_id, decision in judge_results:
+            decisions_map[agent_id] = decision
 
         return decisions_map
 
