@@ -769,34 +769,23 @@ class CrossAssetPortfolioManager:
                     conn.commit()
                     return
 
-                # 5. Register recipient agents with 0 initial cash first (if not already registered)
-                for recipient_id in recipient_agent_ids:
-                    cur.execute("""
-                        INSERT INTO agent_accounts (agent_id, cash)
-                        VALUES (%s, 0.0)
-                        ON CONFLICT (agent_id) DO NOTHING;
-                    """, (recipient_id,))
-
-                # 6. Distribute recovered equity equally to offspring recipients & log snapshots
+                # 5. Distribute recovered equity directly to offspring recipients (overwriting any pre-existing or default balances)
                 share_per_offspring = round(total_recovered_equity / len(recipient_agent_ids), 2)
 
                 for recipient_id in recipient_agent_ids:
                     cur.execute("""
-                        UPDATE agent_accounts 
-                        SET cash = cash + %s, updated_at = CURRENT_TIMESTAMP 
-                        WHERE agent_id = %s;
-                    """, (share_per_offspring, recipient_id))
-
-                    cur.execute("SELECT cash FROM agent_accounts WHERE agent_id = %s;", (recipient_id,))
-                    rec_row = cur.fetchone()
-                    updated_cash = float(rec_row['cash']) if rec_row else share_per_offspring
+                        INSERT INTO agent_accounts (agent_id, cash, updated_at)
+                        VALUES (%s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (agent_id) 
+                        DO UPDATE SET cash = EXCLUDED.cash, updated_at = CURRENT_TIMESTAMP;
+                    """, (recipient_id, share_per_offspring))
 
                     cur.execute("""
                         INSERT INTO agent_snapshots (agent_id, equity, cash, pnl_pct)
                         VALUES (%s, %s, %s, 0.0);
-                    """, (recipient_id, updated_cash, updated_cash))
+                    """, (recipient_id, share_per_offspring, share_per_offspring))
                     
-                    logger.info(f"🎁 [INHERITANCE] Transferred +${share_per_offspring:,.2f} from [{loser_agent_id}] ➔ [{recipient_id}]")
+                    logger.info(f"🎁 [INHERITANCE] Assigned exact inherited cash ${share_per_offspring:,.2f} from [{loser_agent_id}] ➔ [{recipient_id}]")
 
                 conn.commit()
 
