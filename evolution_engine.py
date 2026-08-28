@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger("EvolutionEngine")
 
+
 @dataclass
 class AgentGenome:
     agent_id: str
@@ -25,22 +26,28 @@ class AgentGenome:
         """
         Calculates risk-adjusted fitness score (Sharpe proxy) over rolling history window.
         Prevents division spikes when volatility is near zero.
+        If history contains fewer than 2 points, falls back directly to relative PnL percentage.
         """
-        if len(self.equity_history) < 2:
+        if not self.equity_history:
             return 0.0
 
         # Filter only positive historical equities to prevent ZeroDivisionError or negative basis
         recent_history = [eq for eq in self.equity_history[-50:] if eq > 0]
-        if len(recent_history) < 2:
+        if not recent_history:
             return 0.0
 
         current_equity = recent_history[-1]
         base_capital = self.initial_capital if self.initial_capital > 0 else 100000.0
         pnl_pct = (current_equity - base_capital) / base_capital
 
+        # Fallback to direct relative PnL if insufficient return variance data exists
+        if len(recent_history) < 2:
+            return round(pnl_pct, 4)
+
         returns = [
-            (recent_history[i] - recent_history[i-1]) / recent_history[i-1]
+            (recent_history[i] - recent_history[i - 1]) / recent_history[i - 1]
             for i in range(1, len(recent_history))
+            if recent_history[i - 1] > 0
         ]
         if not returns:
             return round(pnl_pct, 4)
@@ -51,6 +58,7 @@ class AgentGenome:
 
         fitness = pnl_pct / max(std_dev, 0.0001)
         return round(fitness, 4)
+
 
 class EvolutionarySwarmManager:
     def __init__(self, api_key: str = None, population_size: int = 5):
@@ -74,7 +82,7 @@ class EvolutionarySwarmManager:
                 agent_id=name, 
                 persona_prompt=prompt, 
                 initial_capital=100000.0,
-                cash=100000.0,
+                cash=100000.0, 
                 holdings={}, 
                 entry_prices={}, 
                 equity_history=[100000.0]
@@ -103,7 +111,7 @@ class EvolutionarySwarmManager:
                 if not agent.equity_history or agent.equity_history[-1] != current_eq:
                     agent.equity_history.append(current_eq)
 
-        # 2. Rank agents by fitness
+        # 2. Rank agents by fitness (Sharpe proxy or relative PnL fallback)
         self.population.sort(key=lambda x: x.calculate_fitness(), reverse=True)
         
         for idx, agent in enumerate(self.population):
@@ -170,17 +178,18 @@ class EvolutionarySwarmManager:
                 db.register_agent(agent.agent_id)
         
         logger.info(f"🎉 Generation {self.current_generation} successfully spawned with 5 active agents!")
+        return [dead.agent_id for dead in culled], recipient_ids
 
     async def _mutate_genome(self, parent: AgentGenome, mutation_trait: str, offspring_num: int) -> AgentGenome:
-        """Queries Google AI Studio using Gemma 4-31B with rate-limit exception handling to mutate winning parent prompt."""
+        """Queries Google AI Studio using Gemma 4-31B with rate-limit and robust JSON parsing to mutate winning parent prompt."""
         prompt = f"""
-You are an Evolutionary Prompt Engineer for trading algorithms.
-A winning strategy prompt survived with high performance:
+You are an Evolutionary Prompt Engineer for quantitative trading systems.
+A winning strategy prompt survived with superior performance:
 "{parent.persona_prompt}"
 
-Create a slightly mutated version of this strategy prompt that incorporates the trait: "{mutation_trait}".
+Create a mutated version of this strategy prompt that incorporates the trait: "{mutation_trait}".
 Ensure the prompt instructs the agent to evaluate technical theses and output trade actions (BUY, SELL, SHORT, COVER, or HOLD) with conviction scores (0.0 to 1.0).
-Return ONLY a JSON object with key "new_prompt": {{"new_prompt": "string"}}
+Return ONLY a valid JSON object: {{"new_prompt": "string"}}
 """
 
         url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
@@ -220,14 +229,26 @@ Return ONLY a JSON object with key "new_prompt": {{"new_prompt": "string"}}
 
                         resp.raise_for_status()
                         data = resp.json()
-                        content = data['choices'][0]['message']['content']
+                        content = data['choices'][0]['message']['content'] or ""
+                        
+                        # Strip markdown formatting
                         cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", content).strip()
-                        parsed = json.loads(cleaned)
+                        
+                        parsed = {}
+                        try:
+                            parsed = json.loads(cleaned)
+                        except Exception:
+                            # Robust fallback search for new_prompt inside the response
+                            match = re.search(r'\{[\s\S]*"new_prompt"\s*:\s*"([^"]+)"[\s\S]*\}', content)
+                            if match:
+                                parsed = {"new_prompt": match.group(1)}
 
                         if "new_prompt" in parsed and parsed["new_prompt"]:
                             mutated_prompt = parsed["new_prompt"]
                             logger.info("✅ Genome successfully mutated via [Google AI Studio - Gemma 4 31B]")
                             break
+                        else:
+                            logger.warning(f"⚠️ Empty or unparseable prompt response: {content[:100]}")
 
                     except httpx.HTTPStatusError as hse:
                         logger.warning(f"⚠️ HTTP error {hse.response.status_code} during mutation: {hse.response.text}")
@@ -253,7 +274,7 @@ Return ONLY a JSON object with key "new_prompt": {{"new_prompt": "string"}}
             persona_prompt=mutated_prompt,
             generation=self.current_generation + 1,
             initial_capital=0.0,
-            cash=0.0,  # Cash will be populated via inheritance
+            cash=0.0,
             holdings={},
             entry_prices={},
             equity_history=[0.0]
