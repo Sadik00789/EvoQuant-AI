@@ -795,8 +795,10 @@ class CrossAssetPortfolioManager:
 
                     cur.execute("""
                         INSERT INTO agent_snapshots (agent_id, equity, cash, pnl_pct)
-                        VALUES (%s, %s, %s, 0.0);
-                    """, (recipient_id, share_per_offspring, share_per_offspring))
+                        SELECT agent_id, cash, cash, 0.0 
+                        FROM agent_accounts 
+                        WHERE agent_id = %s;
+                    """, (recipient_id,))
                     
                     logger.info(f"🎁 [INHERITANCE] Assigned inherited cash ${share_per_offspring:,.2f} from [{loser_agent_id}] ➔ [{recipient_id}]")
 
