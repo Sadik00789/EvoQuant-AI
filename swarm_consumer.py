@@ -45,54 +45,98 @@ def restore_agent_states_from_db(swarm_mgr, db):
             postgres_url = f"postgresql+psycopg://{postgres_user}:{postgres_password}@{postgres_host}:{postgres_port}/{postgres_db}"
             engine = sqlalchemy.create_engine(postgres_url)
 
-        # Restore active evolved 5 agents from database (where cash > 0)
+        # Restore active agents from database (where cash > 0 or equity > 0)
         accounts_df = pd.read_sql(
-            "SELECT agent_id, cash FROM agent_accounts WHERE cash > 0 ORDER BY updated_at DESC LIMIT 5;",
+            "SELECT agent_id, cash FROM agent_accounts WHERE cash > 0 ORDER BY updated_at DESC;",
             engine
         )
-
-        if not accounts_df.empty and len(accounts_df) == 5:
-            db_agent_ids = accounts_df['agent_id'].tolist()
-            existing_map = {a.agent_id: a for a in swarm_mgr.population}
-            restored_pop = []
-            for ag_id in db_agent_ids:
-                if ag_id in existing_map:
-                    restored_pop.append(existing_map[ag_id])
-                else:
-                    restored_pop.append(AgentGenome(
-                        agent_id=ag_id,
-                        persona_prompt="You are an evolved quantitative trading agent focusing on risk-adjusted equity growth.",
-                        generation=2 if "Gen" in ag_id else 1,
-                        cash=float(accounts_df[accounts_df['agent_id'] == ag_id].iloc[0]['cash']),
-                        holdings={},
-                        entry_prices={},
-                        equity_history=[float(accounts_df[accounts_df['agent_id'] == ag_id].iloc[0]['cash'])]
-                    ))
-            swarm_mgr.population = restored_pop
 
         snapshots_df = pd.read_sql(
             "SELECT DISTINCT ON (agent_id) agent_id, cash, equity FROM agent_snapshots ORDER BY agent_id, timestamp DESC;",
             engine
         )
+
+        first_snapshots_df = pd.read_sql(
+            "SELECT DISTINCT ON (agent_id) agent_id, equity FROM agent_snapshots ORDER BY agent_id, timestamp ASC;",
+            engine
+        )
+        first_snap_map = dict(zip(first_snapshots_df['agent_id'], first_snapshots_df['equity'])) if not first_snapshots_df.empty else {}
+
         holdings_df = pd.read_sql(
             "SELECT agent_id, ticker, amount, entry_price FROM agent_holdings WHERE amount != 0;",
             engine
         )
+
+        active_agent_ids = []
+        if not accounts_df.empty:
+            active_agent_ids = accounts_df['agent_id'].tolist()
+        if not snapshots_df.empty:
+            active_from_snaps = snapshots_df[snapshots_df['equity'] > 0]['agent_id'].tolist()
+            for ag in active_from_snaps:
+                if ag not in active_agent_ids:
+                    active_agent_ids.append(ag)
+
+        existing_map = {a.agent_id: a for a in swarm_mgr.population}
+        restored_pop = []
+
+        for ag_id in active_agent_ids:
+            cash_val = 100000.0
+            if not accounts_df.empty and ag_id in accounts_df['agent_id'].values:
+                cash_val = float(accounts_df[accounts_df['agent_id'] == ag_id].iloc[0]['cash'])
+            elif not snapshots_df.empty and ag_id in snapshots_df['agent_id'].values:
+                cash_val = float(snapshots_df[snapshots_df['agent_id'] == ag_id].iloc[0]['cash'])
+
+            init_cap = float(first_snap_map.get(ag_id, cash_val))
+
+            if ag_id in existing_map:
+                agent = existing_map[ag_id]
+                agent.cash = cash_val
+                agent.initial_capital = init_cap
+                restored_pop.append(agent)
+            else:
+                restored_pop.append(AgentGenome(
+                    agent_id=ag_id,
+                    persona_prompt="You are an evolved quantitative trading agent focusing on risk-adjusted equity growth.",
+                    generation=2 if "Gen" in ag_id else 1,
+                    initial_capital=init_cap,
+                    cash=cash_val,
+                    holdings={},
+                    entry_prices={},
+                    equity_history=[cash_val]
+                ))
+
+        # If fewer than 5 active agents exist, backfill only missing slots with default baseline personas
+        if len(restored_pop) < 5:
+            baseline_pop = swarm_mgr._bootstrap_initial_population()
+            restored_ids = {a.agent_id for a in restored_pop}
+            dead_ids = set()
+            if not snapshots_df.empty:
+                dead_ids.update(snapshots_df[snapshots_df['equity'] <= 0]['agent_id'].tolist())
+            for base_agent in baseline_pop:
+                if len(restored_pop) >= 5:
+                    break
+                if base_agent.agent_id not in restored_ids and base_agent.agent_id not in dead_ids:
+                    restored_pop.append(base_agent)
+                    restored_ids.add(base_agent.agent_id)
+
+        swarm_mgr.population = restored_pop[:5]
 
         for agent in swarm_mgr.population:
             if not hasattr(agent, 'entry_prices'):
                 agent.entry_prices = {}
 
             # Restore Cash
-            agent_snap = snapshots_df[snapshots_df['agent_id'] == agent.agent_id]
-            if not agent_snap.empty:
-                agent.cash = float(agent_snap.iloc[0]['cash'])
+            if not snapshots_df.empty:
+                agent_snap = snapshots_df[snapshots_df['agent_id'] == agent.agent_id]
+                if not agent_snap.empty:
+                    agent.cash = float(agent_snap.iloc[0]['cash'])
 
             # Restore Active Holdings & Entry Prices
-            agent_pos = holdings_df[holdings_df['agent_id'] == agent.agent_id]
-            if not agent_pos.empty:
-                agent.holdings = {row['ticker']: float(row['amount']) for _, row in agent_pos.iterrows()}
-                agent.entry_prices = {row['ticker']: float(row['entry_price']) for _, row in agent_pos.iterrows()}
+            if not holdings_df.empty:
+                agent_pos = holdings_df[holdings_df['agent_id'] == agent.agent_id]
+                if not agent_pos.empty:
+                    agent.holdings = {row['ticker']: float(row['amount']) for _, row in agent_pos.iterrows()}
+                    agent.entry_prices = {row['ticker']: float(row['entry_price']) for _, row in agent_pos.iterrows()}
 
             # Recalculate Restored Equity on Startup using restored entry prices
             long_val = sum(qty * agent.entry_prices.get(tk, 0.0) for tk, qty in agent.holdings.items() if qty > 0)
@@ -101,7 +145,8 @@ def restore_agent_states_from_db(swarm_mgr, db):
             agent.equity_history = [restored_equity]
 
             # Log instant startup snapshot so TimescaleDB updates immediately
-            pnl = ((restored_equity - 100000.0) / 100000.0) * 100
+            base_cap = agent.initial_capital if getattr(agent, 'initial_capital', 0.0) > 0 else 100000.0
+            pnl = ((restored_equity - base_cap) / base_cap) * 100
             db.log_snapshot(agent.agent_id, restored_equity, agent.cash, pnl)
 
         logger.info("✅ Successfully restored agent cash, holdings, equity, and logged startup snapshots.")
@@ -184,8 +229,13 @@ async def run_consumer():
 
                         logger.info(f"\n==================== 🔔 MARKET TICK #{tick_counter} ====================")
 
-                        # Daily Ex-Dividend Payout / Debit Engine Trigger
-                        today_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                        # Daily Ex-Dividend Payout / Debit Engine Trigger with Replay Timestamp Sync
+                        tick_time_str = next((v.get("timestamp") for v in market_state.values() if isinstance(v, dict) and "timestamp" in v), None)
+                        if tick_time_str:
+                            today_date_str = str(tick_time_str)[:10]
+                        else:
+                            today_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
                         if today_date_str != last_processed_date:
                             try:
                                 db.process_daily_dividends(today_date_str)
@@ -220,15 +270,9 @@ async def run_consumer():
                         spy_price_series = pd.Series(spy_prices_history) if len(spy_prices_history) >= 200 else None
                         regime_scaler = risk_engine.calculate_regime_scaler(spy_series, spy_prices=spy_price_series)
 
-                        all_active_holdings = list({
-                            tk for agent in swarm_mgr.population 
-                            for tk, shares in agent.holdings.items() if shares != 0
-                        })
-
-                        shared_thesis = swarm.analyze_technical_state(market_state, active_holdings=all_active_holdings)
-
                         # -------------------------------------------------------------
                         # PHASE A: DUAL-SIDED HARD RISK GUARD CHECK (LONG & SHORT)
+                        # (Executed before building shared thesis to prevent immediate re-entry)
                         # -------------------------------------------------------------
                         for agent in swarm_mgr.population:
                             if not hasattr(agent, 'entry_prices'):
@@ -285,6 +329,13 @@ async def run_consumer():
 
                                         submit_safe_broker_order(broker_bridge, tk, abs(shares), action)
 
+                        all_active_holdings = list({
+                            tk for agent in swarm_mgr.population 
+                            for tk, shares in agent.holdings.items() if shares != 0
+                        })
+
+                        shared_thesis = swarm.analyze_technical_state(market_state, active_holdings=all_active_holdings)
+
                         # -------------------------------------------------------------
                         # PHASE B: CONCURRENT ASYNC STRATEGY EXECUTION
                         # -------------------------------------------------------------
@@ -324,11 +375,19 @@ async def run_consumer():
                                 target_val = current_equity * effective_alloc
                                 current_pos_qty = agent.holdings.get(ticker, 0.0)
 
-                                # 1. BUY Execution (Long Entry / Scale Up)
+                                # 1. BUY Execution (Long Entry / Scale Up with Short Proceeds Solvency Guard)
                                 if target.action == "BUY":
                                     current_long_val = max(current_pos_qty, 0.0) * raw_price
                                     delta = target_val - current_long_val
-                                    if delta > 50.0 and agent.cash >= delta:
+
+                                    # Calculate true unencumbered cash
+                                    short_liabilities = sum(
+                                        abs(qty) * agent.entry_prices.get(tk, prices.get(tk, 0.0))
+                                        for tk, qty in agent.holdings.items() if qty < 0
+                                    )
+                                    free_cash = max(0.0, agent.cash - short_liabilities)
+
+                                    if delta > 50.0 and free_cash >= delta:
                                         approx_shares = delta / raw_price
                                         exec_price = risk_engine.calculate_execution_price(raw_price, approx_shares, adv, "BUY")
                                         shares = delta / exec_price
@@ -427,7 +486,8 @@ async def run_consumer():
                         logger.info("\n🏆 --- COMPETING AGENT LEADERBOARD ---")
                         sorted_swarm = sorted(swarm_mgr.population, key=lambda a: a.equity_history[-1], reverse=True)
                         for rank, agent in enumerate(sorted_swarm, 1):
-                            pnl = ((agent.equity_history[-1] - 100000.0) / 100000.0) * 100
+                            base_cap = agent.initial_capital if getattr(agent, 'initial_capital', 0.0) > 0 else 100000.0
+                            pnl = ((agent.equity_history[-1] - base_cap) / base_cap) * 100
                             db.log_snapshot(agent.agent_id, agent.equity_history[-1], agent.cash, pnl)
 
                             active_holdings = [

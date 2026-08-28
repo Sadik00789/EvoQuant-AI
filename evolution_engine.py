@@ -15,6 +15,7 @@ class AgentGenome:
     agent_id: str
     persona_prompt: str
     generation: int = 1
+    initial_capital: float = 100000.0
     cash: float = 100000.0
     holdings: Dict[str, float] = field(default_factory=dict)
     entry_prices: Dict[str, float] = field(default_factory=dict)
@@ -28,9 +29,14 @@ class AgentGenome:
         if len(self.equity_history) < 2:
             return 0.0
 
-        recent_history = self.equity_history[-50:]
+        # Filter only positive historical equities to prevent ZeroDivisionError or negative basis
+        recent_history = [eq for eq in self.equity_history[-50:] if eq > 0]
+        if len(recent_history) < 2:
+            return 0.0
+
         current_equity = recent_history[-1]
-        pnl_pct = (current_equity - 100000.0) / 100000.0
+        base_capital = self.initial_capital if self.initial_capital > 0 else 100000.0
+        pnl_pct = (current_equity - base_capital) / base_capital
 
         returns = [
             (recent_history[i] - recent_history[i-1]) / recent_history[i-1]
@@ -48,7 +54,7 @@ class AgentGenome:
 
 class EvolutionarySwarmManager:
     def __init__(self, api_key: str = None, population_size: int = 5):
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        self.api_key = api_key if api_key is not None else (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
         self.population_size = population_size
         self.current_generation = 1
         self.population: List[AgentGenome] = self._bootstrap_initial_population()
@@ -67,6 +73,8 @@ class EvolutionarySwarmManager:
             AgentGenome(
                 agent_id=name, 
                 persona_prompt=prompt, 
+                initial_capital=100000.0,
+                cash=100000.0,
                 holdings={}, 
                 entry_prices={}, 
                 equity_history=[100000.0]
@@ -89,8 +97,9 @@ class EvolutionarySwarmManager:
         # 1. Update in-memory equity state
         if prices:
             for agent in self.population:
-                asset_val = sum(agent.holdings.get(tk, 0.0) * prices[tk] for tk in agent.holdings if tk in prices)
-                current_eq = round(agent.cash + asset_val, 2)
+                long_val = sum(qty * prices.get(tk, agent.entry_prices.get(tk, 0.0)) for tk, qty in agent.holdings.items() if qty > 0)
+                short_liability = sum(abs(qty) * prices.get(tk, agent.entry_prices.get(tk, 0.0)) for tk, qty in agent.holdings.items() if qty < 0)
+                current_eq = round(agent.cash + long_val - short_liability, 2)
                 if not agent.equity_history or agent.equity_history[-1] != current_eq:
                     agent.equity_history.append(current_eq)
 
@@ -118,8 +127,9 @@ class EvolutionarySwarmManager:
         total_recovered_equity = 0.0
 
         for dead in culled:
-            dead_asset_val = sum(dead.holdings.get(tk, 0.0) * prices[tk] for tk in dead.holdings if tk in prices)
-            dead_total_equity = max(0.0, dead.cash + dead_asset_val)
+            dead_long_val = sum(qty * prices.get(tk, dead.entry_prices.get(tk, 0.0)) for tk, qty in dead.holdings.items() if qty > 0)
+            dead_short_liability = sum(abs(qty) * prices.get(tk, dead.entry_prices.get(tk, 0.0)) for tk, qty in dead.holdings.items() if qty < 0)
+            dead_total_equity = max(0.0, dead.cash + dead_long_val - dead_short_liability)
             total_recovered_equity += dead_total_equity
 
             # Execute database liquidation & capital transfer
@@ -135,15 +145,18 @@ class EvolutionarySwarmManager:
             dead.cash = 0.0
             dead.holdings = {}
             dead.entry_prices = {}
+            dead.equity_history.append(0.0)
             logger.warning(f"  💀 CULLED & LIQUIDATED: {dead.agent_id} (Recovered Equity: ${dead_total_equity:,.2f})")
 
         # 5. Distribute inherited capital equally to offspring in memory
         share_per_offspring = round(total_recovered_equity / len(recipient_ids), 2) if recipient_ids else 0.0
 
         offspring_1.cash = share_per_offspring
+        offspring_1.initial_capital = share_per_offspring
         offspring_1.equity_history = [share_per_offspring]
 
         offspring_2.cash = share_per_offspring
+        offspring_2.initial_capital = share_per_offspring
         offspring_2.equity_history = [share_per_offspring]
 
         logger.info(f"🎁 [INHERITANCE] Offspring [{offspring_1.agent_id}] and [{offspring_2.agent_id}] inherited ${share_per_offspring:,.2f} starting cash each!")
@@ -171,62 +184,63 @@ Return ONLY a JSON object with key "new_prompt": {{"new_prompt": "string"}}
 """
 
         url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        api_key = self.api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-
-        if not api_key:
-            raise ValueError("Gemini API key is not set in environment variables (GEMINI_API_KEY or GOOGLE_API_KEY).")
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "model": "gemma-4-31b-it",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": 1024,
-            "response_format": {"type": "json_object"}
-        }
+        api_key = self.api_key if self.api_key is not None else (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
 
         mutated_prompt = parent.persona_prompt
-        max_retries = 3
-        backoff_factor = 2.0
 
-        async with httpx.AsyncClient() as client:
-            for attempt in range(max_retries):
-                try:
-                    resp = await client.post(url, json=payload, headers=headers, timeout=20.0)
+        if not api_key:
+            mutated_prompt = f"{parent.persona_prompt} (Mutated: {mutation_trait})"
+        else:
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
 
-                    if resp.status_code == 429:
-                        sleep_time = backoff_factor ** (attempt + 1)
-                        logger.warning(f"⚠️ [Rate Limit / 429] during genome mutation. Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
-                        await asyncio.sleep(sleep_time)
-                        continue
+            payload = {
+                "model": "gemma-4-31b-it",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 1024,
+                "response_format": {"type": "json_object"}
+            }
 
-                    resp.raise_for_status()
-                    data = resp.json()
-                    content = data['choices'][0]['message']['content']
-                    cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", content).strip()
-                    parsed = json.loads(cleaned)
+            max_retries = 3
+            backoff_factor = 2.0
 
-                    if "new_prompt" in parsed and parsed["new_prompt"]:
-                        mutated_prompt = parsed["new_prompt"]
-                        logger.info("✅ Genome successfully mutated via [Google AI Studio - Gemma 4 31B]")
-                        break
+            async with httpx.AsyncClient() as client:
+                for attempt in range(max_retries):
+                    try:
+                        resp = await client.post(url, json=payload, headers=headers, timeout=20.0)
 
-                except httpx.HTTPStatusError as hse:
-                    logger.warning(f"⚠️ HTTP error {hse.response.status_code} during mutation: {hse.response.text}")
-                    if hse.response.status_code in (400, 401, 403, 404):
-                        break
-                    if attempt == max_retries - 1:
-                        break
-                    await asyncio.sleep(backoff_factor ** (attempt + 1))
-                except Exception as e:
-                    logger.warning(f"⚠️ Mutation attempt failed: {e}")
-                    if attempt == max_retries - 1:
-                        break
-                    await asyncio.sleep(backoff_factor ** (attempt + 1))
+                        if resp.status_code == 429:
+                            sleep_time = backoff_factor ** (attempt + 1)
+                            logger.warning(f"⚠️ [Rate Limit / 429] during genome mutation. Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
+                            await asyncio.sleep(sleep_time)
+                            continue
+
+                        resp.raise_for_status()
+                        data = resp.json()
+                        content = data['choices'][0]['message']['content']
+                        cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", content).strip()
+                        parsed = json.loads(cleaned)
+
+                        if "new_prompt" in parsed and parsed["new_prompt"]:
+                            mutated_prompt = parsed["new_prompt"]
+                            logger.info("✅ Genome successfully mutated via [Google AI Studio - Gemma 4 31B]")
+                            break
+
+                    except httpx.HTTPStatusError as hse:
+                        logger.warning(f"⚠️ HTTP error {hse.response.status_code} during mutation: {hse.response.text}")
+                        if hse.response.status_code in (400, 401, 403, 404):
+                            break
+                        if attempt == max_retries - 1:
+                            break
+                        await asyncio.sleep(backoff_factor ** (attempt + 1))
+                    except Exception as e:
+                        logger.warning(f"⚠️ Mutation attempt failed: {e}")
+                        if attempt == max_retries - 1:
+                            break
+                        await asyncio.sleep(backoff_factor ** (attempt + 1))
 
         base_parent_name = re.sub(r'^Gen\d+_', '', parent.agent_id)
         base_parent_name = re.sub(r'_v\d+$', '', base_parent_name)
@@ -238,6 +252,7 @@ Return ONLY a JSON object with key "new_prompt": {{"new_prompt": "string"}}
             agent_id=new_id,
             persona_prompt=mutated_prompt,
             generation=self.current_generation + 1,
+            initial_capital=0.0,
             cash=0.0,  # Cash will be populated via inheritance
             holdings={},
             entry_prices={},
