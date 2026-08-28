@@ -305,6 +305,17 @@ def load_snapshots() -> pd.DataFrame:
         return pd.DataFrame()
 
 @st.cache_data(ttl=2)
+def load_active_snapshots() -> pd.DataFrame:
+    try:
+        engine = get_db_engine()
+        return pd.read_sql_query(
+            "SELECT DISTINCT ON (agent_id) agent_id, cash, equity, pnl_pct FROM agent_snapshots WHERE equity > 0 ORDER BY agent_id, timestamp DESC;",
+            engine
+        )
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=2)
 def load_trades() -> pd.DataFrame:
     try:
         engine = get_db_engine()
@@ -381,6 +392,9 @@ if auto_refresh:
 if st.sidebar.button("🔄 Manual Refresh", use_container_width=True):
     st.rerun()
 
+with st.sidebar.expander("🧬 Population View Options", expanded=False):
+    show_culled = st.checkbox("Show Historical / Culled Agents", value=False)
+
 st.sidebar.markdown("<hr class='app-divider' style='margin:20px 0;'>", unsafe_allow_html=True)
 st.sidebar.markdown(f"<h3 style='color:{ACCENT} !important; font-size:1rem;'>🛡️ Active Guardrails</h3>", unsafe_allow_html=True)
 
@@ -416,6 +430,13 @@ def render_kpi_metrics():
         return
 
     latest_snapshots = df_snapshots.sort_values('timestamp').groupby('agent_id').last().reset_index()
+    if not show_culled:
+        latest_snapshots = latest_snapshots[latest_snapshots['equity'] > 0]
+
+    if latest_snapshots.empty:
+        st.warning("⏳ No active agents detected in telemetry.")
+        return
+
     total_capital = latest_snapshots['equity'].sum()
     top_agent = latest_snapshots.sort_values('equity', ascending=False).iloc[0]
 
@@ -450,11 +471,16 @@ def render_row_1():
         return
 
     latest_snapshots = df_snapshots.sort_values('timestamp').groupby('agent_id').last().reset_index()
+    if not show_culled:
+        active_ids = latest_snapshots[latest_snapshots['equity'] > 0]['agent_id'].tolist()
+        df_snapshots = df_snapshots[df_snapshots['agent_id'].isin(active_ids)]
+        latest_snapshots = latest_snapshots[latest_snapshots['equity'] > 0]
+
     col_chart, col_leaderboard = st.columns([3, 2])
 
     with col_chart:
         st.markdown("<p class='section-title'>📈 Real-Time Agent Equity Growth</p>", unsafe_allow_html=True)
-        st.markdown("<p class='section-subtitle'>Equity trajectory across all live swarm agents</p>", unsafe_allow_html=True)
+        st.markdown("<p class='section-subtitle'>Equity trajectory across live swarm agents</p>", unsafe_allow_html=True)
 
         fig_equity = px.line(
             df_snapshots,
@@ -509,14 +535,37 @@ def render_row_1():
 
 render_row_1()
 
+# Collapsible toggle/view for historical / culled agents
+with st.expander("💀 View Historical & Culled Agent Archive", expanded=False):
+    df_snapshots_all = load_snapshots()
+    if not df_snapshots_all.empty:
+        latest_all = df_snapshots_all.sort_values('timestamp').groupby('agent_id').last().reset_index()
+        culled_df = latest_all[latest_all['equity'] <= 0][['agent_id', 'equity', 'cash', 'pnl_pct']].sort_values('agent_id')
+        if not culled_df.empty:
+            st.dataframe(
+                culled_df,
+                column_config={
+                    "agent_id": st.column_config.TextColumn("Agent ID (Culled)"),
+                    "equity": st.column_config.NumberColumn("Terminal Equity", format="$%.2f"),
+                    "cash": st.column_config.NumberColumn("Terminal Cash", format="$%.2f"),
+                    "pnl_pct": st.column_config.NumberColumn("Terminal PnL %", format="%+.2f%%"),
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No culled or liquidated agents in current epoch history.")
+    else:
+        st.info("No snapshot telemetry found.")
+
 st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
 
 # --- ROW 2: AGENT PORTFOLIO INSPECTOR ---
 st.markdown("<p class='section-title'>🔍 Agent Position & Allocation Inspector</p>", unsafe_allow_html=True)
 st.markdown("<p class='section-subtitle'>Drill into any agent's live book (Long & Short Positions)</p>", unsafe_allow_html=True)
 
-df_snaps_init = load_snapshots()
-agents_list = df_snaps_init['agent_id'].unique().tolist() if not df_snaps_init.empty else ["Agent_Alpha", "Agent_Beta", "Agent_Gamma", "Agent_Delta", "Agent_Epsilon"]
+df_active_init = load_active_snapshots() if not show_culled else load_snapshots()
+agents_list = df_active_init['agent_id'].unique().tolist() if not df_active_init.empty else ["Agent_Alpha", "Agent_Beta", "Agent_Gamma", "Agent_Delta", "Agent_Epsilon"]
 selected_agent = st.selectbox("Select Agent Persona to Inspect:", agents_list)
 
 @st.fragment(run_every=refresh_interval)

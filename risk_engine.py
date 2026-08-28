@@ -15,9 +15,18 @@ class AdvancedRiskEngine:
     4. Volatility Regime Scaler with NaN Volatility Protection & Macro Trend Guarding (SPY 200 SMA).
     5. Short Margin Collateral & Free Margin Health Evaluator.
     """
-    def __init__(self, target_volatility: float = 0.15, max_position_pct: float = 0.05):
+    def __init__(
+        self, 
+        target_volatility: float = 0.15, 
+        max_position_pct: float = 0.05, 
+        base_spread: float = 0.0001, 
+        impact_gamma: float = 0.5, 
+        **kwargs
+    ):
         self.target_volatility = target_volatility
         self.max_position_pct = max_position_pct
+        self.base_spread = base_spread
+        self.impact_gamma = impact_gamma
 
     def calculate_downside_volatility(self, returns: pd.Series, target_return: float = 0.0) -> float:
         """
@@ -136,13 +145,27 @@ class AdvancedRiskEngine:
 
         return float(np.clip(scaler, 0.25, 1.5))
 
-    def calculate_execution_price(self, raw_price: float, shares: float, adv: float, side: str) -> float:
+    def calculate_execution_price(
+        self, 
+        raw_price: float = 0.0, 
+        shares: float = 0.0, 
+        adv: float = 1.0, 
+        side: str = "BUY", 
+        mid_price: Optional[float] = None, 
+        action: Optional[str] = None, 
+        **kwargs
+    ) -> float:
         """
         Applies Square-Root Market Impact Slippage Model across Long and Short actions based on ADV.
         
         Formula:
         $$P_{exec} = P_{raw} \\cdot \\left(1 \\pm \\gamma \\cdot \\sqrt{\\frac{\\text{Order Shares}}{\\text{ADV}}}\\right)$$
         """
+        if mid_price is not None:
+            raw_price = mid_price
+        if action is not None:
+            side = action
+
         if raw_price <= 0 or adv <= 0 or shares <= 0:
             return max(raw_price, 0.01)
 
@@ -150,10 +173,10 @@ class AdvancedRiskEngine:
         slippage_pct = 0.10 * np.sqrt(participation_rate)  # 10% market impact factor
         slippage_pct = min(slippage_pct, 0.05)  # Cap maximum slippage friction at 5%
 
-        action = side.upper()
-        if action in ("BUY", "COVER"):
+        act = side.upper()
+        if act in ("BUY", "COVER"):
             return round(raw_price * (1.0 + slippage_pct), 4)
-        elif action in ("SELL", "SHORT"):
+        elif act in ("SELL", "SHORT"):
             return round(raw_price * (1.0 - slippage_pct), 4)
             
         return round(raw_price, 4)

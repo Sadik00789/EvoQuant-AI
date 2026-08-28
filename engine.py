@@ -40,8 +40,8 @@ def clean_llm_json_string(raw_content: str) -> str:
 class AlpacaExecutionBridge:
     """Direct REST API Execution Bridge for Alpaca Markets Paper/Live Trading."""
     def __init__(self, api_key: str = None, secret_key: str = None, base_url: str = None):
-        self.api_key = api_key or os.getenv("ALPACA_API_KEY")
-        self.secret_key = secret_key or os.getenv("ALPACA_SECRET_KEY")
+        self.api_key = api_key if api_key is not None else os.getenv("ALPACA_API_KEY")
+        self.secret_key = secret_key if secret_key is not None else os.getenv("ALPACA_SECRET_KEY")
         self.base_url = base_url or os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
         self.headers = {
@@ -714,9 +714,9 @@ class CrossAssetPortfolioManager:
                     return
                 loser_cash = float(row['cash'])
 
-                # 2. Fetch loser's active holdings
+                # 2. Fetch loser's active holdings with entry price
                 cur.execute("""
-                    SELECT ticker, amount FROM agent_holdings 
+                    SELECT ticker, amount, entry_price FROM agent_holdings 
                     WHERE agent_id = %s AND amount != 0;
                 """, (loser_agent_id,))
                 holdings = cur.fetchall()
@@ -727,9 +727,12 @@ class CrossAssetPortfolioManager:
                 for item in holdings:
                     ticker = item['ticker']
                     amount = float(item['amount'])
-                    price = current_prices.get(ticker, 0.0)
+                    price = current_prices.get(ticker, 0.0) or float(item.get('entry_price', 0.0) or 0.0)
+                    if price <= 0:
+                        price = 1.0
+                        logger.warning(f"⚠️ [PRICE FALLBACK] Missing price for {ticker} during culling liquidation; falling back to 1.0")
 
-                    if amount != 0 and price > 0:
+                    if amount != 0:
                         position_val = amount * price
                         liquidated_value += position_val
 
