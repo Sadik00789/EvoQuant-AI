@@ -227,6 +227,10 @@ async def run_consumer():
                         prices = {tk: data["close"] for tk, data in market_state.items()}
                         tick_counter += 1
 
+                        # Increment tenure ticks for active agents
+                        for agent in swarm_mgr.population:
+                            agent.tenure_ticks = getattr(agent, 'tenure_ticks', 0) + 1
+
                         logger.info(f"\n==================== 🔔 MARKET TICK #{tick_counter} ====================")
 
                         # Daily Ex-Dividend Payout / Debit Engine Trigger with Replay Timestamp Sync
@@ -380,9 +384,9 @@ async def run_consumer():
                                     current_long_val = max(current_pos_qty, 0.0) * raw_price
                                     delta = target_val - current_long_val
 
-                                    # Calculate true unencumbered cash
+                                    # Calculate true unencumbered cash strictly accounting for encumbered short margin
                                     short_liabilities = sum(
-                                        abs(qty) * agent.entry_prices.get(tk, prices.get(tk, 0.0))
+                                        abs(qty) * max(agent.entry_prices.get(tk, 0.0), prices.get(tk, agent.entry_prices.get(tk, 0.0)))
                                         for tk, qty in agent.holdings.items() if qty < 0
                                     )
                                     free_cash = max(0.0, agent.cash - short_liabilities)

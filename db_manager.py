@@ -59,11 +59,12 @@ class PostgresPortfolioManager:
                 except Exception as e:
                     logger.warning(f"TimescaleDB extension load note: {e}")
 
-                # 2. Accounts Table
+                # 2. Accounts Table (Tracks active/culled status)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_accounts (
                         agent_id VARCHAR(64) PRIMARY KEY,
                         cash DOUBLE PRECISION NOT NULL,
+                        is_active BOOLEAN DEFAULT TRUE,
                         updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
@@ -167,13 +168,13 @@ class PostgresPortfolioManager:
                 conn.commit()
 
     def register_agent(self, agent_id: str):
-        """Registers agent account if it doesn't already exist."""
+        """Registers agent account if it doesn't already exist and ensures active flag."""
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO agent_accounts (agent_id, cash)
-                    VALUES (%s, %s)
-                    ON CONFLICT (agent_id) DO NOTHING;
+                    INSERT INTO agent_accounts (agent_id, cash, is_active)
+                    VALUES (%s, %s, TRUE)
+                    ON CONFLICT (agent_id) DO UPDATE SET is_active = TRUE;
                 """, (agent_id, self.initial_capital))
                 conn.commit()
 
@@ -190,12 +191,20 @@ class PostgresPortfolioManager:
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO agent_accounts (agent_id, cash, updated_at)
-                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    INSERT INTO agent_accounts (agent_id, cash, is_active, updated_at)
+                    VALUES (%s, %s, TRUE, CURRENT_TIMESTAMP)
                     ON CONFLICT (agent_id) 
-                    DO UPDATE SET cash = EXCLUDED.cash, updated_at = CURRENT_TIMESTAMP;
+                    DO UPDATE SET cash = EXCLUDED.cash, is_active = TRUE, updated_at = CURRENT_TIMESTAMP;
                 """, (agent_id, new_cash))
                 conn.commit()
+
+    def get_total_swarm_capital(self) -> float:
+        """Calculates aggregate active cash capital strictly across active agents in the swarm."""
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COALESCE(SUM(cash), 0.0) as total_cash FROM agent_accounts WHERE is_active = TRUE;")
+                row = cur.fetchone()
+                return float(row['total_cash']) if row else 0.0
 
     def get_agent_holdings(self, agent_id: str) -> Dict[str, float]:
         """Fetches active non-zero holdings (Long > 0, Short < 0) for an agent."""
@@ -210,7 +219,7 @@ class PostgresPortfolioManager:
 
     def get_active_swarm_ticker_allocation(self, ticker: str) -> float:
         """
-        Calculates aggregate active allocation percentage across ALL agents for a given ticker.
+        Calculates aggregate active allocation percentage across ALL active agents for a given ticker.
         Enables swarm-level guardrail evaluation prior to order execution.
         """
         with self.pool.connection() as conn:
@@ -223,7 +232,7 @@ class PostgresPortfolioManager:
                 row = cur.fetchone()
                 gross_position_val = float(row['gross_val']) if row else 0.0
 
-                cur.execute("SELECT COALESCE(SUM(cash), 0.0) as total_cash FROM agent_accounts;")
+                cur.execute("SELECT COALESCE(SUM(cash), 0.0) as total_cash FROM agent_accounts WHERE is_active = TRUE;")
                 cash_row = cur.fetchone()
                 total_cash = float(cash_row['total_cash']) if cash_row else self.initial_capital
 

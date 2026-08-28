@@ -167,17 +167,23 @@ INSTRUCTIONS:
 
                     resp.raise_for_status()
                     data = resp.json()
-                    raw_content = data['choices'][0]['message']['content']
+                    raw_content = data['choices'][0]['message']['content'] or ""
 
                     # 1. Strip internal thinking tags (<thought>...</thought>)
-                    content_no_thoughts = re.sub(r"<thought>[\s\S]*?</thought>", "", raw_content).strip()
+                    cleaned_content = re.sub(r"<thought>[\s\S]*?</thought>", "", raw_content).strip()
 
-                    # 2. Extract valid JSON object block {...}
-                    json_match = re.search(r"\{[\s\S]*\}", content_no_thoughts)
+                    # 2. Strip Markdown code fences if present (```json ... ```)
+                    cleaned_content = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", cleaned_content).strip()
+
+                    # 3. Extract valid JSON object block {...} using re.DOTALL to strip conversational preambles/postambles
+                    json_match = re.search(r"\{.*\}", cleaned_content, re.DOTALL)
+                    if not json_match:
+                        json_match = re.search(r"\{.*\}", raw_content, re.DOTALL)
+
                     if not json_match:
                         raise ValueError(f"Could not locate JSON object pattern in response: '{raw_content[:80]}...'")
 
-                    cleaned_json_str = json_match.group(0)
+                    cleaned_json_str = json_match.group(0).strip()
                     parsed = json.loads(cleaned_json_str)
 
                     logger.info("✅ News sentiment evaluated successfully via [Google AI Studio - Gemma 4 31B]")

@@ -84,26 +84,43 @@ class AdvancedRiskEngine:
         """
         Computes Inverse-Volatility Risk Parity allocations weighted by agent conviction scores.
         Enforces strict position caps (default 5.0%) across all individual assets.
+        Residual unallocated weight strictly remains unencumbered cash (NO secondary re-normalization).
         """
         if not volatility_map:
             return {}
 
         effective_cap = max_cap if max_cap is not None else self.max_position_pct
 
-        inv_vols = {tk: 1.0 / max(vol, 0.0001) for tk, vol in volatility_map.items() if vol is not None}
+        # Check for zero or negative or invalid volatilities (Flat ATR / Zero Volatility guard)
+        valid_vols = {
+            tk: float(vol) 
+            for tk, vol in volatility_map.items() 
+            if vol is not None and not np.isnan(vol) and float(vol) > 0.0
+        }
+        if not valid_vols:
+            return {tk: 0.0 for tk in volatility_map}
+
+        inv_vols = {tk: 1.0 / vol for tk, vol in valid_vols.items()}
         total_inv_vol = sum(inv_vols.values())
 
-        if total_inv_vol <= 0:
+        if total_inv_vol <= 0 or np.isnan(total_inv_vol):
             return {tk: 0.0 for tk in volatility_map}
 
         raw_weights = {tk: inv_vols[tk] / total_inv_vol for tk in inv_vols}
 
         scaled_allocations = {}
-        for tk, weight in raw_weights.items():
-            conv = convictions.get(tk, 0.5)
+        for tk in volatility_map:
+            if tk not in raw_weights:
+                scaled_allocations[tk] = 0.0
+                continue
+            weight = raw_weights[tk]
+            conv = convictions.get(tk, 0.5) if convictions else 0.5
+            if conv is None or np.isnan(conv) or conv <= 0.0:
+                scaled_allocations[tk] = 0.0
+                continue
             alloc = weight * conv
             
-            # Hard clip to guarantee allocation <= 5.0%
+            # Strict 5% cap without secondary vector re-normalization
             clamped_alloc = min(alloc, effective_cap)
             scaled_allocations[tk] = round(clamped_alloc, 4)
 

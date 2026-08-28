@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import uuid
 import httpx
 import asyncio
 import numpy as np
@@ -21,6 +22,7 @@ class AgentGenome:
     holdings: Dict[str, float] = field(default_factory=dict)
     entry_prices: Dict[str, float] = field(default_factory=dict)
     equity_history: List[float] = field(default_factory=lambda: [100000.0])
+    tenure_ticks: int = 0
 
     def calculate_fitness(self) -> float:
         """
@@ -85,7 +87,8 @@ class EvolutionarySwarmManager:
                 cash=100000.0, 
                 holdings={}, 
                 entry_prices={}, 
-                equity_history=[100000.0]
+                equity_history=[100000.0],
+                tenure_ticks=1000
             )
             for name, prompt in baseline_personas
         ]
@@ -94,7 +97,7 @@ class EvolutionarySwarmManager:
         """
         Executes True Darwinian Selection & Capital Transfer:
         1. Recalculates exact equity state using current asset prices.
-        2. Ranks agents by risk-adjusted fitness score.
+        2. Ranks agents by risk-adjusted fitness score with tenure grace period protection.
         3. Liquidates open positions of bottom agents and recovers their equity.
         4. Mutates winning parent into offspring using Gemma 4-31B.
         5. Reallocates 100% of recovered culled equity as inherited cash for offspring.
@@ -111,18 +114,26 @@ class EvolutionarySwarmManager:
                 if not agent.equity_history or agent.equity_history[-1] != current_eq:
                     agent.equity_history.append(current_eq)
 
-        # 2. Rank agents by fitness (Sharpe proxy or relative PnL fallback)
-        self.population.sort(key=lambda x: x.calculate_fitness(), reverse=True)
-        
+        # 2. Tenure Grace Period: Protect newly spawned agents (< 1000 ticks) from immediate infant mortality
+        immune_agents = [a for a in self.population if a.tenure_ticks < 1000 and a.generation > 1]
+        mature_agents = [a for a in self.population if a not in immune_agents]
+
+        mature_agents.sort(key=lambda x: x.calculate_fitness(), reverse=True)
+        immune_agents.sort(key=lambda x: x.calculate_fitness(), reverse=True)
+
         for idx, agent in enumerate(self.population):
             logger.info(
-                f"   Rank #{idx+1} | {agent.agent_id:<25} | "
+                f"   Rank #{idx+1} | {agent.agent_id:<32} | "
                 f"Fitness: {agent.calculate_fitness():>8.4f} | "
-                f"Equity: ${agent.equity_history[-1]:,.2f}"
+                f"Equity: ${agent.equity_history[-1]:,.2f} | "
+                f"Tenure: {agent.tenure_ticks} ticks {'(Immune)' if agent in immune_agents else ''}"
             )
 
-        survivors = self.population[:3]
-        culled = self.population[3:]
+        # Select culled agents prioritizing lowest fitness among mature agents first
+        ranked_culling_candidates = list(reversed(mature_agents)) + list(reversed(immune_agents))
+        culled = ranked_culling_candidates[:2]
+        survivors = [a for a in self.population if a not in culled]
+        survivors.sort(key=lambda x: x.calculate_fitness(), reverse=True)
 
         # 3. Mutate top performer into 2 offspring
         parent = survivors[0]
@@ -131,7 +142,7 @@ class EvolutionarySwarmManager:
 
         recipient_ids = [offspring_1.agent_id, offspring_2.agent_id]
 
-        # 4. Liquidate culled agents & transfer capital
+        # 4. Liquidate culled agents & transfer capital atomically
         total_recovered_equity = 0.0
 
         for dead in culled:
@@ -156,18 +167,21 @@ class EvolutionarySwarmManager:
             dead.equity_history.append(0.0)
             logger.warning(f"  💀 CULLED & LIQUIDATED: {dead.agent_id} (Recovered Equity: ${dead_total_equity:,.2f})")
 
-        # 5. Distribute inherited capital equally to offspring in memory
-        share_per_offspring = round(total_recovered_equity / len(recipient_ids), 2) if recipient_ids else 0.0
+        # 5. Distribute inherited capital equally to offspring in memory (Atomic Zero-Sum Conservation)
+        share_per_offspring_1 = round(total_recovered_equity / 2.0, 2) if recipient_ids else 0.0
+        share_per_offspring_2 = round(total_recovered_equity - share_per_offspring_1, 2) if recipient_ids else 0.0
 
-        offspring_1.cash = share_per_offspring
-        offspring_1.initial_capital = share_per_offspring
-        offspring_1.equity_history = [share_per_offspring]
+        offspring_1.cash = share_per_offspring_1
+        offspring_1.initial_capital = share_per_offspring_1
+        offspring_1.equity_history = [share_per_offspring_1]
+        offspring_1.tenure_ticks = 0
 
-        offspring_2.cash = share_per_offspring
-        offspring_2.initial_capital = share_per_offspring
-        offspring_2.equity_history = [share_per_offspring]
+        offspring_2.cash = share_per_offspring_2
+        offspring_2.initial_capital = share_per_offspring_2
+        offspring_2.equity_history = [share_per_offspring_2]
+        offspring_2.tenure_ticks = 0
 
-        logger.info(f"🎁 [INHERITANCE] Offspring [{offspring_1.agent_id}] and [{offspring_2.agent_id}] inherited ${share_per_offspring:,.2f} starting cash each!")
+        logger.info(f"🎁 [INHERITANCE] Offspring [{offspring_1.agent_id}] (${share_per_offspring_1:,.2f}) and [{offspring_2.agent_id}] (${share_per_offspring_2:,.2f}) successfully instantiated!")
 
         # 6. Update population state
         self.current_generation += 1
@@ -263,9 +277,11 @@ Return ONLY a valid JSON object: {{"new_prompt": "string"}}
                             break
                         await asyncio.sleep(backoff_factor ** (attempt + 1))
 
+        # Monotonic Unique ID Generation using current generation, parent tag, offspring index, and UUID hash
         base_parent_name = re.sub(r'^Gen\d+_', '', parent.agent_id)
-        base_parent_name = re.sub(r'_v\d+$', '', base_parent_name)
-        new_id = f"Gen{self.current_generation + 1}_{base_parent_name}_v{offspring_num}"
+        base_parent_name = re.sub(r'_v\d+.*$', '', base_parent_name)
+        unique_suffix = uuid.uuid4().hex[:4]
+        new_id = f"Gen{self.current_generation + 1}_{base_parent_name}_v{offspring_num}_{unique_suffix}"
         
         logger.info(f"  👶 MUTATED OFFSPRING CREATED: {new_id}")
         
@@ -277,5 +293,6 @@ Return ONLY a valid JSON object: {{"new_prompt": "string"}}
             cash=0.0,
             holdings={},
             entry_prices={},
-            equity_history=[0.0]
+            equity_history=[0.0],
+            tenure_ticks=0
         )

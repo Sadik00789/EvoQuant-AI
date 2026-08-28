@@ -1,4 +1,7 @@
 import asyncio
+import re
+import json
+import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -9,9 +12,14 @@ from engine import (
     AlpacaExecutionBridge,
     CrossAssetPortfolioManager,
     RiskParityOptimizer,
+    AgentSignalDecision,
+    QualitativeSignal,
+    MultiTechnicalThesis,
+    AssetThesis,
 )
 from evolution_engine import AgentGenome, EvolutionarySwarmManager
 from risk_engine import AdvancedRiskEngine
+from sentiment_agent import NewsSentimentAgent
 from swarm_consumer import restore_agent_states_from_db
 
 
@@ -75,26 +83,60 @@ def mock_httpx_client(monkeypatch):
 # ==========================================
 
 def test_risk_parity_max_position_cap():
-    """Verify that no single asset weight exceeds the strict 15% position cap."""
-    optimizer = RiskParityOptimizer(max_position_cap=0.15)
+    """Verify that no single asset weight exceeds the strict 5% position cap without secondary normalization."""
+    optimizer = RiskParityOptimizer(max_position_cap=0.05)
     convictions = {"NVDA": 0.95, "AMD": 0.90, "AAPL": 0.85, "MSFT": 0.80}
     atrs = {"NVDA": 2.0, "AMD": 1.5, "AAPL": 1.0, "MSFT": 1.1}
 
     weights = optimizer.optimize(convictions, atrs)
 
     for ticker, weight in weights.items():
-        assert weight <= 0.15 + 1e-5, f"{ticker} weight {weight} exceeded 15% cap!"
+        assert weight <= 0.05 + 1e-5, f"{ticker} weight {weight} exceeded 5% cap!"
+    assert sum(weights.values()) <= 0.20 + 1e-5, "Unallocated weight must remain unencumbered cash (not re-normalized to 100%)"
 
 
 def test_risk_parity_zero_volatility_handling():
     """Verify that zero or negative ATR inputs do not throw DivisionByZero errors."""
-    optimizer = RiskParityOptimizer(max_position_cap=0.15)
+    optimizer = RiskParityOptimizer(max_position_cap=0.05)
     convictions = {"NVDA": 0.80, "TSLA": 0.70}
-    atrs = {"NVDA": 0.0, "TSLA": -1.5}  # Bad inputs
+    atrs = {"NVDA": 0.0, "TSLA": -1.5}
 
     weights = optimizer.optimize(convictions, atrs)
     assert isinstance(weights, dict)
-    assert sum(weights.values()) <= 1.0
+    for ticker, weight in weights.items():
+        assert weight <= 0.05 + 1e-5
+
+
+def test_strict_five_percent_cap_no_double_normalization():
+    """Verify that under high conviction variance, allocations strictly respect 5% without secondary vector re-normalization."""
+    risk_engine = AdvancedRiskEngine(max_position_pct=0.05)
+    volatility_map = {"NVDA": 0.02, "AAPL": 0.01, "MSFT": 0.015, "TSLA": 0.04}
+    convictions = {"NVDA": 1.0, "AAPL": 0.9, "MSFT": 0.8, "TSLA": 0.7}
+
+    allocations = risk_engine.calculate_risk_parity_allocations(volatility_map, convictions)
+
+    for ticker, alloc in allocations.items():
+        assert alloc <= 0.05 + 1e-5, f"Allocation for {ticker} was {alloc}, exceeding 5% cap!"
+
+    # Residual weight remains cash; sum should be <= 4 * 0.05 = 0.20
+    assert sum(allocations.values()) <= 0.20 + 1e-5, "Secondary vector re-normalization must be absent!"
+
+
+def test_zero_division_and_flat_atr_guard():
+    """Verify that flat technical indicators or uniform HOLD signals cleanly return zero weights without throwing exceptions."""
+    risk_engine = AdvancedRiskEngine()
+    
+    # All zero / flat volatilities
+    flat_vols = {"NVDA": 0.0, "TSLA": 0.0}
+    convictions = {"NVDA": 0.5, "TSLA": 0.5}
+    allocs = risk_engine.calculate_risk_parity_allocations(flat_vols, convictions)
+    assert allocs == {"NVDA": 0.0, "TSLA": 0.0}
+
+    # Flat convictions / all HOLD signals in RiskParityOptimizer
+    optimizer = RiskParityOptimizer(max_position_cap=0.05)
+    hold_convictions = {"AAPL": 0.1, "MSFT": 0.2}
+    opt_allocs = optimizer.optimize(hold_convictions, {"AAPL": 1.0, "MSFT": 1.0})
+    assert opt_allocs == {"AAPL": 0.0, "MSFT": 0.0}
 
 
 # ==========================================
@@ -185,7 +227,7 @@ def test_margin_health_evaluation():
 
 
 # ==========================================
-# 4. OBJECTIVE STANDALONE TEST CASES
+# 4. EVOLUTION & CAPITAL CONSERVATION TESTS
 # ==========================================
 
 def test_relative_fitness_calculation():
@@ -213,7 +255,7 @@ def test_relative_fitness_calculation():
 
 
 def test_darwinian_capital_conservation():
-    """Simulate a 5-agent swarm, cull worst performer, and assert total swarm equity is conserved (Delta = 0)."""
+    """Simulate a 5-agent swarm, cull worst performers, and assert total swarm equity is conserved (Delta = 0)."""
     async def _test():
         swarm_mgr = EvolutionarySwarmManager(api_key="", population_size=5)
 
@@ -252,6 +294,122 @@ def test_darwinian_capital_conservation():
     asyncio.run(_test())
 
 
+def test_zero_sum_capital_conservation_invariant():
+    """Verify zero-sum invariant (sum E_pre == sum E_post) during selection with active open long and short positions."""
+    async def _test():
+        swarm_mgr = EvolutionarySwarmManager(api_key="", population_size=5)
+        prices = {"AAPL": 150.0, "TSLA": 200.0, "NVDA": 120.0}
+
+        # Setup agents with cash, long positions, and short positions
+        # Agent 0 (Top performer): $100k cash + 200 AAPL ($30k) = $130,000 equity
+        swarm_mgr.population[0].cash = 100000.0
+        swarm_mgr.population[0].holdings = {"AAPL": 200.0}
+        swarm_mgr.population[0].entry_prices = {"AAPL": 150.0}
+        swarm_mgr.population[0].equity_history = [130000.0]
+
+        # Agent 1: $110k cash + 50 TSLA ($10k) = $120,000 equity
+        swarm_mgr.population[1].cash = 110000.0
+        swarm_mgr.population[1].holdings = {"TSLA": 50.0}
+        swarm_mgr.population[1].entry_prices = {"TSLA": 200.0}
+        swarm_mgr.population[1].equity_history = [120000.0]
+
+        # Agent 2: $115k cash
+        swarm_mgr.population[2].cash = 115000.0
+        swarm_mgr.population[2].holdings = {}
+        swarm_mgr.population[2].entry_prices = {}
+        swarm_mgr.population[2].equity_history = [115000.0]
+
+        # Agent 3 (Culled): $60k cash + 100 NVDA ($12k) = $72,000 equity
+        swarm_mgr.population[3].cash = 60000.0
+        swarm_mgr.population[3].holdings = {"NVDA": 100.0}
+        swarm_mgr.population[3].entry_prices = {"NVDA": 120.0}
+        swarm_mgr.population[3].equity_history = [72000.0]
+
+        # Agent 4 (Culled): $83k cash - 100 TSLA short ($20k liability) = $63,000 equity
+        swarm_mgr.population[4].cash = 83000.0
+        swarm_mgr.population[4].holdings = {"TSLA": -100.0}
+        swarm_mgr.population[4].entry_prices = {"TSLA": 200.0}
+        swarm_mgr.population[4].equity_history = [63000.0]
+
+        total_equity_pre = 130000.0 + 120000.0 + 115000.0 + 72000.0 + 63000.0
+        assert total_equity_pre == 500000.0
+
+        await swarm_mgr.run_culling_cycle(prices=prices)
+
+        total_equity_post = sum(a.equity_history[-1] for a in swarm_mgr.population)
+        assert abs(total_equity_post - total_equity_pre) < 1e-2, (
+            f"Zero-sum invariant broken! Pre: {total_equity_pre}, Post: {total_equity_post}"
+        )
+
+        # Culled equity ($72k + $63k = $135k) split between 2 offspring ($67.5k each)
+        offspring = swarm_mgr.population[3:]
+        assert len(offspring) == 2
+        assert offspring[0].cash + offspring[1].cash == 135000.0
+
+    asyncio.run(_test())
+
+
+def test_unique_offspring_ids_generation():
+    """Verify that mutated offspring receive unique IDs formatted with UUID suffix to eliminate collisions."""
+    async def _test():
+        swarm_mgr = EvolutionarySwarmManager(api_key="", population_size=5)
+        parent = swarm_mgr.population[0]
+        
+        offspring_a = await swarm_mgr._mutate_genome(parent, "Momentum", 1)
+        offspring_b = await swarm_mgr._mutate_genome(parent, "Mean Reversion", 2)
+
+        assert offspring_a.agent_id != offspring_b.agent_id
+        assert offspring_a.agent_id != parent.agent_id
+        # Verify format Gen{epoch}_{parent}_v{idx}_{uuid}
+        pattern = r"^Gen2_Agent_Alpha_v\d+_[0-9a-f]{4}$"
+        assert re.match(pattern, offspring_a.agent_id) is not None, f"ID {offspring_a.agent_id} does not match expected format"
+        assert re.match(pattern, offspring_b.agent_id) is not None, f"ID {offspring_b.agent_id} does not match expected format"
+
+    asyncio.run(_test())
+
+
+def test_tenure_grace_period_infant_mortality_protection():
+    """Verify newly spawned agents (< 1000 ticks) are protected from infant mortality while mature underperformers are culled."""
+    async def _test():
+        swarm_mgr = EvolutionarySwarmManager(api_key="", population_size=5)
+
+        # Mature agents (tenure = 1000 ticks)
+        swarm_mgr.population[0].agent_id = "Mature_Leader"
+        swarm_mgr.population[0].tenure_ticks = 1000
+        swarm_mgr.population[0].equity_history = [150000.0]
+
+        swarm_mgr.population[1].agent_id = "Mature_Mid"
+        swarm_mgr.population[1].tenure_ticks = 1000
+        swarm_mgr.population[1].equity_history = [120000.0]
+
+        swarm_mgr.population[2].agent_id = "Mature_Loser_1"
+        swarm_mgr.population[2].tenure_ticks = 1000
+        swarm_mgr.population[2].equity_history = [80000.0]
+
+        swarm_mgr.population[3].agent_id = "Mature_Loser_2"
+        swarm_mgr.population[3].tenure_ticks = 1000
+        swarm_mgr.population[3].equity_history = [75000.0]
+
+        # Newly spawned infant agent (tenure = 15 ticks, generation = 2) with flat/negative initial returns
+        swarm_mgr.population[4].agent_id = "Gen2_Infant_Offspring_v1_a1b2"
+        swarm_mgr.population[4].generation = 2
+        swarm_mgr.population[4].tenure_ticks = 15
+        swarm_mgr.population[4].equity_history = [70000.0]  # Lowest equity
+
+        culled_ids, recipient_ids = await swarm_mgr.run_culling_cycle(prices={})
+
+        # Infant agent MUST NOT be culled because of tenure immunity!
+        assert "Gen2_Infant_Offspring_v1_a1b2" not in culled_ids, "Infant agent was improperly culled during grace period!"
+        assert "Mature_Loser_1" in culled_ids
+        assert "Mature_Loser_2" in culled_ids
+
+    asyncio.run(_test())
+
+
+# ==========================================
+# 5. SHORT SOLVENCY & PARSING TESTS
+# ==========================================
+
 def test_short_proceeds_solvency_guard():
     """Verify an agent cannot spend short sale proceeds on long allocations when free margin is insufficient."""
     agent = AgentGenome(
@@ -269,7 +427,7 @@ def test_short_proceeds_solvency_guard():
 
     # Short Liabilities calculation
     short_liabilities = sum(
-        abs(qty) * agent.entry_prices.get(tk, prices.get(tk, 0.0))
+        abs(qty) * max(agent.entry_prices.get(tk, 0.0), prices.get(tk, agent.entry_prices.get(tk, 0.0)))
         for tk, qty in agent.holdings.items()
         if qty < 0
     )
@@ -289,6 +447,85 @@ def test_short_proceeds_solvency_guard():
     assert can_buy_unrestricted is True, "Naive cash check would unsafely allow spending short proceeds"
     assert can_buy_guarded is False, "Solvency guard must prevent spending encumbered short proceeds"
 
+
+def test_short_margin_purchasing_power_max_price():
+    """Verify that when a short moves against the agent (price increases), encumbered margin expands using max(P_entry, P_current)."""
+    agent = AgentGenome(
+        agent_id="Agent_Short_Risk",
+        persona_prompt="Short",
+        initial_capital=100000.0,
+        cash=130000.0,
+        holdings={"TSLA": -100.0},
+        entry_prices={"TSLA": 300.0},
+        equity_history=[100000.0],
+    )
+    # Price increased adversely to $350
+    adverse_prices = {"TSLA": 350.0}
+
+    encumbered_margin = sum(
+        abs(qty) * max(agent.entry_prices.get(tk, 0.0), adverse_prices.get(tk, agent.entry_prices.get(tk, 0.0)))
+        for tk, qty in agent.holdings.items()
+        if qty < 0
+    )
+    free_cash = max(0.0, agent.cash - encumbered_margin)
+
+    # 100 * 350 = 35,000 liability
+    assert encumbered_margin == 35000.0
+    # Free cash = 130,000 - 35,000 = 95,000
+    assert free_cash == 95000.0
+
+
+def test_sentiment_llm_json_resiliency():
+    """Verify regex JSON extractor strips markdown fences, conversational preambles, and thought tags."""
+    agent = NewsSentimentAgent(api_key="test_dummy_key")
+
+    raw_llm_response = """
+<thought>
+The market is showing mixed signals, but inflation concerns are easing.
+</thought>
+Here is my macroeconomic sentiment analysis for the quantitative swarm:
+```json
+{
+    "sentiment_score": 0.45,
+    "summary_reasoning": "Dovish commentary from FOMC members coupled with strong earnings in semiconductor names is bolstering risk appetites."
+}
+```
+Let me know if you need further breakdowns.
+"""
+    # 1. Strip internal thinking tags
+    cleaned_content = re.sub(r"<thought>[\s\S]*?</thought>", "", raw_llm_response).strip()
+    # 2. Strip Markdown code fences
+    cleaned_content = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", cleaned_content).strip()
+    # 3. Extract valid JSON object block
+    json_match = re.search(r"\{.*\}", cleaned_content, re.DOTALL)
+    assert json_match is not None, "Failed to match JSON pattern from raw response!"
+
+    parsed = json.loads(json_match.group(0).strip())
+    sanitized = agent._sanitize_sentiment_output(parsed)
+
+    assert sanitized["sentiment_score"] == 0.45
+    assert sanitized["risk_multiplier"] == round(1.0 + (0.45 * 0.3), 2)
+    assert "Dovish commentary" in sanitized["summary_reasoning"]
+
+
+def test_active_agent_capital_aggregation(mock_db_pool):
+    """Verify get_total_swarm_capital strictly aggregates active agents (is_active = TRUE)."""
+    mock_pool, mock_conn, mock_cursor = mock_db_pool
+    mock_cursor.fetchone.return_value = {"total_cash": 350000.0}
+
+    pm = CrossAssetPortfolioManager()
+    total_cap = pm.get_total_swarm_capital()
+
+    executed_queries = [call[0][0] for call in mock_cursor.execute.call_args_list]
+    active_query = any("WHERE is_active = TRUE" in q for q in executed_queries)
+
+    assert total_cap == 350000.0
+    assert active_query is True, "get_total_swarm_capital did not filter by WHERE is_active = TRUE"
+
+
+# ==========================================
+# 6. RECOVERY & FALLBACK TESTS
+# ==========================================
 
 def test_state_restoration_without_resurrection(monkeypatch):
     """Verify that calling restore_agent_states_from_db with 3 living agents does not resurrect culled agents with $100k balances."""
@@ -352,7 +589,6 @@ def test_cull_and_reallocate_resilient_fallback(mock_db_pool):
     """Verify cull_and_reallocate handles missing price with fallback and executes UPSERT."""
     mock_pool, mock_conn, mock_cursor = mock_db_pool
 
-    # Mock loser agent with cash $10,000 and 10 shares of UNKNOWN ticker with entry price $50
     mock_cursor.fetchone.return_value = {"cash": 10000.0}
     mock_cursor.fetchall.return_value = [
         {"ticker": "UNKNOWN_TICKER", "amount": 10.0, "entry_price": 50.0}
@@ -360,20 +596,16 @@ def test_cull_and_reallocate_resilient_fallback(mock_db_pool):
 
     pm = CrossAssetPortfolioManager()
 
-    # Cull agent with missing price in current_prices (should use entry_price 50.0 -> liquidated val = 500 -> total = 10,500)
     pm.cull_and_reallocate(
         loser_agent_id="Agent_Delta",
         recipient_agent_ids=["Gen2_Alpha_v1", "Gen2_Alpha_v2"],
         current_prices={},
     )
 
-    # Verify SQL execution calls
     executed_queries = [call[0][0] for call in mock_cursor.execute.call_args_list]
 
-    # Assert UPSERT was executed for recipients
-    upsert_found = any("DO UPDATE SET cash = EXCLUDED.cash" in q for q in executed_queries)
+    upsert_found = any("DO UPDATE SET cash = agent_accounts.cash + EXCLUDED.cash" in q for q in executed_queries)
     assert upsert_found is True, "Consolidated UPSERT not found in executed queries!"
 
-    # Assert 0.0 snapshot for loser
     snapshot_queries = [call[0] for call in mock_cursor.execute.call_args_list if "agent_snapshots" in call[0][0]]
     assert len(snapshot_queries) >= 3, "Snapshots for loser and 2 offspring should be inserted"

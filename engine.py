@@ -1,9 +1,11 @@
 import os
 import re
 import json
+import math
 import logging
 import asyncio
 import httpx
+import numpy as np
 import pandas as pd
 import requests
 from typing import Literal, Dict, Union, Any, List, Optional
@@ -180,25 +182,30 @@ class RiskParityOptimizer:
         if not convictions:
             return {}
 
-        valid_trades = {k: v for k, v in convictions.items() if v > 0.3}
+        valid_trades = {k: v for k, v in convictions.items() if v is not None and v > 0.3}
         if not valid_trades:
-            return {}
+            return {k: 0.0 for k in convictions}
 
         raw_weights = {}
         for tk, conv in valid_trades.items():
-            atr = atrs.get(tk, 1.0)
-            if atr <= 0 or atr is None:
+            atr = atrs.get(tk, 1.0) if atrs else 1.0
+            if atr is None or atr <= 0 or np.isnan(atr):
                 atr = 1.0
             raw_weights[tk] = conv / max(atr, 0.1)
 
         total_raw = sum(raw_weights.values())
-        if total_raw == 0:
-            return {}
+        if total_raw <= 0 or np.isnan(total_raw):
+            return {k: 0.0 for k in convictions}
 
-        return {
-            k: round(float(min(self.max_position_cap, v / total_raw)), 4)
-            for k, v in raw_weights.items()
-        }
+        result = {}
+        for k in convictions:
+            if k in raw_weights:
+                unclamped = raw_weights[k] / total_raw
+                # Strict 5% cap without secondary vector re-normalization
+                result[k] = round(float(min(self.max_position_cap, unclamped)), 4)
+            else:
+                result[k] = 0.0
+        return result
 
     @staticmethod
     def optimize_allocations(
@@ -209,8 +216,11 @@ class RiskParityOptimizer:
         raw_decisions = {}
         active_candidates = {}
 
+        if not signals or not signals.signals:
+            return CrossAssetRiskDecision(decisions={}, macro_reasoning="No signals provided.")
+
         for ticker, sig in signals.signals.items():
-            if sig.action in ("BUY", "SHORT") and sig.conviction > 0.3:
+            if sig.action in ("BUY", "SHORT") and sig.conviction is not None and sig.conviction > 0.3:
                 atr = 1.0
                 if isinstance(theses, dict) and ticker in theses:
                     item = theses[ticker]
@@ -218,7 +228,7 @@ class RiskParityOptimizer:
                 elif hasattr(theses, "analyses") and ticker in theses.analyses:
                     atr = theses.analyses[ticker].atr
 
-                if atr <= 0 or atr is None:
+                if atr is None or atr <= 0 or np.isnan(atr):
                     atr = 1.0
 
                 risk_score = sig.conviction / max(atr, 0.1)
@@ -227,11 +237,15 @@ class RiskParityOptimizer:
                 raw_decisions[ticker] = PortfolioAllocation(ticker=ticker, action=sig.action, allocation_pct=0.0)
 
         total_risk_score = sum(score for _, score in active_candidates.values())
-        if total_risk_score > 0:
+        if total_risk_score > 0 and not np.isnan(total_risk_score):
             for ticker, (action, score) in active_candidates.items():
                 unclamped_weight = score / total_risk_score
+                # Strictly clamped at max_position_cap; unallocated weight remains unencumbered cash
                 clamped_weight = round(float(min(max_position_cap, unclamped_weight)), 4)
                 raw_decisions[ticker] = PortfolioAllocation(ticker=ticker, action=action, allocation_pct=clamped_weight)
+        else:
+            for ticker, (action, _) in active_candidates.items():
+                raw_decisions[ticker] = PortfolioAllocation(ticker=ticker, action=action, allocation_pct=0.0)
 
         return CrossAssetRiskDecision(decisions=raw_decisions, macro_reasoning=signals.macro_reasoning)
 
@@ -542,9 +556,16 @@ class CrossAssetPortfolioManager:
                     CREATE TABLE IF NOT EXISTS agent_accounts (
                         agent_id VARCHAR(64) PRIMARY KEY,
                         cash DOUBLE PRECISION NOT NULL,
+                        is_active BOOLEAN DEFAULT TRUE,
                         updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
+
+                # Auto-migrate is_active column in existing databases
+                try:
+                    cur.execute("ALTER TABLE agent_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;")
+                except Exception as e:
+                    logger.debug(f"is_active migration notice: {e}")
 
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_holdings (
@@ -650,9 +671,9 @@ class CrossAssetPortfolioManager:
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO agent_accounts (agent_id, cash)
-                    VALUES (%s, %s)
-                    ON CONFLICT (agent_id) DO NOTHING;
+                    INSERT INTO agent_accounts (agent_id, cash, is_active)
+                    VALUES (%s, %s, TRUE)
+                    ON CONFLICT (agent_id) DO UPDATE SET is_active = TRUE;
                 """, (agent_id, self.initial_capital))
                 conn.commit()
 
@@ -667,12 +688,20 @@ class CrossAssetPortfolioManager:
         with self.pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO agent_accounts (agent_id, cash, updated_at)
-                    VALUES (%s, %s, CURRENT_TIMESTAMP)
+                    INSERT INTO agent_accounts (agent_id, cash, is_active, updated_at)
+                    VALUES (%s, %s, TRUE, CURRENT_TIMESTAMP)
                     ON CONFLICT (agent_id) 
-                    DO UPDATE SET cash = EXCLUDED.cash, updated_at = CURRENT_TIMESTAMP;
+                    DO UPDATE SET cash = EXCLUDED.cash, is_active = TRUE, updated_at = CURRENT_TIMESTAMP;
                 """, (agent_id, new_cash))
                 conn.commit()
+
+    def get_total_swarm_capital(self) -> float:
+        """Calculates aggregate active cash capital strictly across active agents in the swarm."""
+        with self.pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COALESCE(SUM(cash), 0.0) as total_cash FROM agent_accounts WHERE is_active = TRUE;")
+                row = cur.fetchone()
+                return float(row['total_cash']) if row else 0.0
 
     def get_agent_holdings(self, agent_id: str) -> Dict[str, float]:
         with self.pool.connection() as conn:
@@ -768,7 +797,7 @@ class CrossAssetPortfolioManager:
                 # 4. Zero out the loser's account cash & log $0.00 snapshot immediately
                 cur.execute("""
                     UPDATE agent_accounts 
-                    SET cash = 0.0, updated_at = CURRENT_TIMESTAMP 
+                    SET cash = 0.0, is_active = FALSE, updated_at = CURRENT_TIMESTAMP 
                     WHERE agent_id = %s;
                 """, (loser_agent_id,))
 
@@ -787,10 +816,10 @@ class CrossAssetPortfolioManager:
 
                 for recipient_id in recipient_agent_ids:
                     cur.execute("""
-                        INSERT INTO agent_accounts (agent_id, cash, updated_at)
-                        VALUES (%s, %s, CURRENT_TIMESTAMP)
+                        INSERT INTO agent_accounts (agent_id, cash, is_active, updated_at)
+                        VALUES (%s, %s, TRUE, CURRENT_TIMESTAMP)
                         ON CONFLICT (agent_id) 
-                        DO UPDATE SET cash = agent_accounts.cash + EXCLUDED.cash, updated_at = CURRENT_TIMESTAMP;
+                        DO UPDATE SET cash = agent_accounts.cash + EXCLUDED.cash, is_active = TRUE, updated_at = CURRENT_TIMESTAMP;
                     """, (recipient_id, share_per_offspring))
 
                     cur.execute("""
