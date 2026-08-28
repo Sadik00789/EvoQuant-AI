@@ -782,7 +782,7 @@ class CrossAssetPortfolioManager:
                     conn.commit()
                     return
 
-                # 5. Distribute recovered equity directly to offspring recipients (overwriting any pre-existing or default balances)
+                # 5. Distribute recovered equity additively to offspring recipients
                 share_per_offspring = round(total_recovered_equity / len(recipient_agent_ids), 2)
 
                 for recipient_id in recipient_agent_ids:
@@ -790,7 +790,7 @@ class CrossAssetPortfolioManager:
                         INSERT INTO agent_accounts (agent_id, cash, updated_at)
                         VALUES (%s, %s, CURRENT_TIMESTAMP)
                         ON CONFLICT (agent_id) 
-                        DO UPDATE SET cash = EXCLUDED.cash, updated_at = CURRENT_TIMESTAMP;
+                        DO UPDATE SET cash = agent_accounts.cash + EXCLUDED.cash, updated_at = CURRENT_TIMESTAMP;
                     """, (recipient_id, share_per_offspring))
 
                     cur.execute("""
@@ -798,7 +798,7 @@ class CrossAssetPortfolioManager:
                         VALUES (%s, %s, %s, 0.0);
                     """, (recipient_id, share_per_offspring, share_per_offspring))
                     
-                    logger.info(f"🎁 [INHERITANCE] Assigned exact inherited cash ${share_per_offspring:,.2f} from [{loser_agent_id}] ➔ [{recipient_id}]")
+                    logger.info(f"🎁 [INHERITANCE] Assigned inherited cash ${share_per_offspring:,.2f} from [{loser_agent_id}] ➔ [{recipient_id}]")
 
                 conn.commit()
 
