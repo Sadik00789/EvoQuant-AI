@@ -563,13 +563,23 @@ class CrossAssetPortfolioManager:
                         timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                         agent_id VARCHAR(64) NOT NULL,
                         ticker VARCHAR(16) NOT NULL,
-                        action VARCHAR(8) NOT NULL,
+                        action VARCHAR(32) NOT NULL,
                         shares DOUBLE PRECISION NOT NULL,
                         price DOUBLE PRECISION NOT NULL,
                         allocation_pct DOUBLE PRECISION NOT NULL,
                         reason VARCHAR(64) DEFAULT 'ALLOCATION'
                     );
                 """)
+
+                # Auto-migrate table columns in existing databases to prevent truncation errors
+                try:
+                    cur.execute("""
+                        ALTER TABLE trade_logs ALTER COLUMN action TYPE VARCHAR(32);
+                        ALTER TABLE trade_logs ALTER COLUMN reason TYPE VARCHAR(64);
+                        ALTER TABLE trade_logs ALTER COLUMN agent_id TYPE VARCHAR(64);
+                    """)
+                except Exception as e:
+                    logger.debug(f"Column resize migration notice: {e}")
 
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS dividend_schedule (
@@ -738,11 +748,11 @@ class CrossAssetPortfolioManager:
 
                         # Execute physical broker liquidation if active
                         if execution_bridge and execution_bridge.is_active():
-                            action = "SELL" if amount > 0 else "COVER"
+                            action = "SELL" if amount > 0 else "BUY"
                             execution_bridge.submit_market_order(ticker, abs(amount), action)
 
-                        # Log trade event
-                        action_str = "LIQUIDATE_LONG" if amount > 0 else "LIQUIDATE_SHORT"
+                        # Log trade event with standardized action and reason
+                        action_str = "SELL" if amount > 0 else "COVER"
                         self.log_trade(loser_agent_id, ticker, action_str, abs(amount), price, 0.0, reason="CULLING")
 
                     # Zero out loser's holding record
