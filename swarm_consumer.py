@@ -7,13 +7,18 @@ import sqlalchemy
 import redis.asyncio as redis
 import pandas as pd
 from datetime import datetime, timezone
+from typing import Dict, Any, List
 from dotenv import load_dotenv
 
 from engine import (
-    DualModelTradingSwarm, 
-    CrossAssetPortfolioManager, 
-    AlpacaExecutionBridge, 
-    logger
+    DualModelTradingSwarm,
+    CrossAssetPortfolioManager,
+    AlpacaExecutionBridge,
+    RiskParityOptimizer,
+    QualitativeSignal,
+    AgentSignalDecision,
+    CrossAssetRiskDecision,
+    logger,
 )
 from evolution_engine import EvolutionarySwarmManager, AgentGenome
 from risk_engine import AdvancedRiskEngine
@@ -22,12 +27,21 @@ from sentiment_agent import NewsSentimentAgent
 load_dotenv()
 
 EPOCH_TICK_THRESHOLD = 20  # Culling evaluation every 20 ticks (~5 hours)
-STOP_LOSS_PCT = -0.025     # Hard stop loss at -2.5%
-TAKE_PROFIT_PCT = 0.050    # Hard take profit at +5.0%
-MAX_SINGLE_POS_CAP = 0.050 # Global Single Position Cap at 5.0%
+STOP_LOSS_PCT = 0.025      # Hard stop loss at 2.5% (directional)
+TAKE_PROFIT_PCT = 0.05     # Hard take profit at 5.0% (directional)
+MAX_SINGLE_POS_CAP = 0.050  # Global Single Position Cap at 5.0%
+COOLDOWN_BARS = 4          # Post-stopout lockout: 4 bars / 1 hour
+SESSION_DRAWDOWN_PCT = 0.05  # Session circuit breaker: 5% from peak
 
 # Initialize Risk, Sentiment, and Broker Execution Engines
-risk_engine = AdvancedRiskEngine(target_volatility=0.15, max_position_pct=MAX_SINGLE_POS_CAP)
+risk_engine = AdvancedRiskEngine(
+    target_volatility=0.15,
+    max_position_pct=MAX_SINGLE_POS_CAP,
+    stop_loss_pct=STOP_LOSS_PCT,
+    take_profit_pct=TAKE_PROFIT_PCT,
+    cooldown_bars=COOLDOWN_BARS,
+    session_drawdown_pct=SESSION_DRAWDOWN_PCT,
+)
 sentiment_agent = NewsSentimentAgent()
 broker_bridge = AlpacaExecutionBridge()
 
@@ -171,6 +185,192 @@ def submit_safe_broker_order(broker, ticker: str, shares: float, action: str):
         logger.error(f"❌ [ALPACA BROKER EXCEPTION] {action} {ticker}: {e}")
 
 
+def build_tickers_snapshot(market_state: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Build 20-ticker snapshot dict for adversarial batch.
+    Each entry carries OHLCV + RSI14 + 15m Momentum (+ legacy ATR/MACD for arbiter context).
+    """
+    snap: Dict[str, Dict[str, Any]] = {}
+    for tk, data in (market_state or {}).items():
+        try:
+            close = float(data.get("close", 0.0) or 0.0)
+            snap[str(tk).upper()] = {
+                "open": float(data.get("open", close) or close),
+                "high": float(data.get("high", close) or close),
+                "low": float(data.get("low", close) or close),
+                "close": close,
+                "volume": float(data.get("volume", 0.0) or 0.0),
+                "rsi": float(data.get("rsi", 50.0) or 50.0),
+                "rsi14": float(data.get("rsi14", data.get("rsi", 50.0)) or 50.0),
+                "momentum": float(data.get("momentum", 0.0) or 0.0),
+                "momentum_15m": float(data.get("momentum_15m", data.get("momentum", 0.0)) or 0.0),
+                "macd_hist": float(data.get("macd_hist", 0.0) or 0.0),
+                "atr": float(data.get("atr", 1.0) or 1.0),
+                "rel_strength_spy": float(data.get("rel_strength_spy", 0.0) or 0.0),
+                "adv": float(data.get("adv", 1000000.0) or 1000000.0),
+                "headlines": str(data.get("headlines", data.get("news", "-")) or "-")[:200],
+            }
+        except Exception:
+            continue
+    return snap
+
+
+def compute_deterministic_signals(
+    population: List[Any],
+    market_state: Dict[str, Dict[str, Any]],
+    shared_thesis: Dict[str, Any],
+) -> Dict[str, CrossAssetRiskDecision]:
+    """
+    Deterministic cache-driven conviction adjustment (O(1) per ticker, zero LLM calls).
+    Reads sentiment from SentimentCache.get_sentiment(ticker) and fuses with RSI/Momentum/MACD.
+    Preserves per-agent heterogeneity via persona-threshold offsets.
+    """
+    decisions_map: Dict[str, CrossAssetRiskDecision] = {}
+    # Persona thresholds: aggressive vs conservative entry gates
+    persona_thresholds = {
+        "Agent_Alpha": 0.20,
+        "Agent_Beta": 0.40,
+        "Agent_Gamma": 0.25,
+        "Agent_Delta": 0.25,
+        "Agent_Epsilon": 0.30,
+    }
+    for agent in population:
+        try:
+            base_thr = 0.30
+            for key, thr in persona_thresholds.items():
+                if key.lower() in str(agent.agent_id).lower():
+                    base_thr = thr
+                    break
+            # Gen2 offspring slightly more selective
+            if getattr(agent, "generation", 1) > 1:
+                base_thr = min(0.45, base_thr + 0.05)
+
+            signals: Dict[str, QualitativeSignal] = {}
+            for ticker in shared_thesis.keys():
+                if ticker not in market_state:
+                    continue
+                md = market_state.get(ticker, {}) or {}
+                sentiment = float(sentiment_agent.cache.get_sentiment(ticker) or 0.0)
+                rsi = float(md.get("rsi14", md.get("rsi", 50.0)) or 50.0)
+                mom = float(md.get("momentum_15m", md.get("momentum", 0.0)) or 0.0)
+                macd = float(md.get("macd_hist", 0.0) or 0.0)
+                rel = float(md.get("rel_strength_spy", 0.0) or 0.0)
+
+                # Technical composite in [-1, 1]
+                tech = 0.0
+                # RSI mean-reversion + momentum
+                if rsi < 30:
+                    tech += 0.4
+                elif rsi < 45:
+                    tech += 0.15
+                elif rsi > 70:
+                    tech -= 0.4
+                elif rsi > 60:
+                    tech -= 0.15
+                # Momentum continuation
+                if mom > 0.3:
+                    tech += 0.3
+                elif mom > 0.05:
+                    tech += 0.1
+                elif mom < -0.3:
+                    tech -= 0.3
+                elif mom < -0.05:
+                    tech -= 0.1
+                # MACD trend
+                if macd > 0:
+                    tech += 0.15
+                elif macd < 0:
+                    tech -= 0.15
+                # Relative strength tilt
+                if rel > 1.0:
+                    tech += 0.1
+                elif rel < -1.0:
+                    tech -= 0.1
+                tech = max(-1.0, min(1.0, tech))
+
+                # Fuse: 55% debate sentiment + 45% technicals
+                combined = 0.55 * sentiment + 0.45 * tech
+                conviction = round(min(1.0, abs(combined)), 4)
+                pos_qty = float(agent.holdings.get(ticker, 0.0) or 0.0)
+
+                if pos_qty > 0:
+                    # Long open: hold unless bearish conviction breaches gate
+                    if combined <= -base_thr and conviction > 0.2:
+                        action = "SELL"
+                    elif combined >= base_thr:
+                        action = "BUY"
+                    else:
+                        action = "HOLD"
+                        conviction = round(conviction * 0.5, 4)
+                elif pos_qty < 0:
+                    # Short open
+                    if combined >= base_thr and conviction > 0.2:
+                        action = "COVER"
+                    elif combined <= -base_thr:
+                        action = "SHORT"
+                    else:
+                        action = "HOLD"
+                        conviction = round(conviction * 0.5, 4)
+                else:
+                    if combined >= base_thr:
+                        action = "BUY"
+                    elif combined <= -base_thr:
+                        action = "SHORT"
+                    else:
+                        action = "HOLD"
+                        conviction = 0.0
+
+                # Suppress dust convictions
+                if action in ("BUY", "SHORT") and conviction <= 0.15:
+                    action = "HOLD"
+                    conviction = 0.0
+
+                signals[ticker] = QualitativeSignal(ticker=ticker, action=action, conviction=float(conviction))
+
+            agent_decision_input = AgentSignalDecision(
+                signals=signals,
+                macro_reasoning=f"Cache-fused debate sentiment + RSI/MOM/MACD composite (thr={base_thr:.2f}).",
+            )
+            decision = RiskParityOptimizer.optimize_allocations(agent_decision_input, shared_thesis)
+            decisions_map[agent.agent_id] = decision
+        except Exception as e:
+            logger.warning(f"⚠️ Deterministic signal build failed for [{getattr(agent, 'agent_id', '?')}]: {e}")
+            decisions_map[getattr(agent, "agent_id", "unknown")] = CrossAssetRiskDecision(
+                decisions={}, macro_reasoning="Deterministic fallback: no signals."
+            )
+    return decisions_map
+
+
+async def liquidate_all_to_cash(
+    population: List[Any], prices: Dict[str, float], market_state: Dict[str, Any], db, reason: str = "SESSION_BREAKER"
+):
+    """Emergency liquidation of all open exposure to cash (session breaker)."""
+    for agent in population:
+        if not hasattr(agent, "entry_prices"):
+            agent.entry_prices = {}
+        for tk, shares in list(agent.holdings.items()):
+            if shares == 0 or tk not in prices:
+                continue
+            try:
+                current_price = float(prices[tk])
+                adv = float(market_state.get(tk, {}).get("adv", 1000000.0) or 1000000.0)
+                action = "SELL" if shares > 0 else "COVER"
+                exec_price = risk_engine.calculate_execution_price(current_price, abs(shares), adv, action)
+                if shares > 0:
+                    agent.cash += shares * exec_price
+                else:
+                    agent.cash -= abs(shares) * exec_price
+                agent.holdings[tk] = 0.0
+                agent.entry_prices[tk] = 0.0
+                db.update_agent_cash(agent.agent_id, agent.cash)
+                db.update_agent_holding(agent.agent_id, tk, 0.0, 0.0)
+                db.log_trade(agent.agent_id, tk, action, abs(shares), exec_price, 0.0, reason=reason)
+                logger.warning(f"  🛑 [{agent.agent_id}] {reason} LIQUIDATE {tk} ({action}) @ ${exec_price:.2f}")
+                submit_safe_broker_order(broker_bridge, tk, abs(shares), action)
+            except Exception as e:
+                logger.warning(f"⚠️ Liquidation failed [{agent.agent_id}] {tk}: {e}")
+
+
 async def run_consumer():
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
@@ -189,29 +389,15 @@ async def run_consumer():
     REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 
     logger.info("🤖 QUANT-UPGRADED EVOLUTIONARY SWARM ONLINE (POSTGRESQL / TIMESCALEDB ACTIVE).")
-    logger.info("⚡ ENGINE POWERED BY GEMMA 4-31B (GOOGLE AI STUDIO).")
-    logger.info("🛡️ Hard Risk Overlay Active: Stop-Loss (-2.5%) | Take-Profit (+5.0%) [LONG & SHORT]")
-    logger.info("📰 News RAG Sentiment & Dynamic Market Impact Slippage Engines Active.")
+    logger.info("⚡ ENGINE POWERED BY GEMMA 4-31B BATCHED ADVERSARIAL DEBATE (3 CALLS / 15M BAR).")
+    logger.info("🛡️ Hard Risk Overlay Active: Directional Stop-Loss (-2.5%) | Take-Profit (+5.0%) | Cooldown 4 bars | Session Breaker 5%")
+    logger.info("📰 Batched Bull/Bear Debate + SentimentCache (TTL 1200s) Active. 288 calls/day, 0.2 RPM.")
     if broker_bridge.is_active():
         logger.info("⚡ ALPACA PAPER TRADING BROKER BRIDGE ACTIVE.")
 
     tick_counter = 0
-    macro_multiplier = 1.0
     spy_prices_history = []
     last_processed_date = ""
-
-    # Initial Macro Sentiment Fetch & Database Log
-    try:
-        macro_news = await sentiment_agent.analyze_macro_sentiment_async()
-        macro_multiplier = macro_news.get("risk_multiplier", 1.0)
-        db.log_macro_regime(
-            sentiment_score=macro_news.get("sentiment_score", 0.0),
-            risk_multiplier=macro_multiplier,
-            reasoning=macro_news.get("summary_reasoning", "")
-        )
-        logger.info(f"📰 Initial News RAG Multiplier: {macro_multiplier:.2f}x | {macro_news.get('summary_reasoning', '')}")
-    except Exception as e:
-        logger.warning(f"⚠️ Initial news sentiment fetch failed: {e}")
 
     # Resilient Outer Loop with Auto-Reconnect on Redis Disconnection
     while True:
@@ -247,21 +433,21 @@ async def run_consumer():
                             except Exception as e:
                                 logger.warning(f"⚠️ Daily dividend processing note: {e}")
 
-                        # Refresh news sentiment every 4 ticks (~1 hour) OR retry immediately if currently on fallback
-                        if tick_counter % 4 == 0 or macro_multiplier == 1.0:
-                            try:
-                                macro_news = await sentiment_agent.analyze_macro_sentiment_async()
-                                new_mult = macro_news.get("risk_multiplier", 1.0)
-                                if new_mult != 1.0 or macro_multiplier == 1.0:
-                                    macro_multiplier = new_mult
-                                    db.log_macro_regime(
-                                        sentiment_score=macro_news.get("sentiment_score", 0.0),
-                                        risk_multiplier=macro_multiplier,
-                                        reasoning=macro_news.get("summary_reasoning", "")
-                                    )
-                                    logger.info(f"📰 Updated News RAG Multiplier: {macro_multiplier:.2f}x | {macro_news.get('summary_reasoning', '')}")
-                            except Exception as e:
-                                logger.warning(f"⚠️ Periodic news sentiment fetch note: {e}")
+                        # ---------------------------------------------------------
+                        # PRE-TICK DEBATE EXECUTION (exactly 3 API calls per 15m bar)
+                        # 1. run_adversarial_batch -> Bull + Bear parallel + Arbiter
+                        # 2. Populate SentimentCache with 20 scores
+                        # 3. Agents read via get_sentiment O(1)
+                        # ---------------------------------------------------------
+                        try:
+                            tickers_snapshot = build_tickers_snapshot(market_state)
+                            debate_scores = await sentiment_agent.run_adversarial_batch(tickers_snapshot)
+                            logger.info(
+                                f"🧠 [Batched Debate] Tick #{tick_counter}: cached {len(debate_scores)} scores "
+                                f"(3 calls, 0.2 RPM). Sample: {dict(list(debate_scores.items())[:3])}"
+                            )
+                        except Exception as e:
+                            logger.warning(f"⚠️ Batched debate failed on tick #{tick_counter}: {e}")
 
                         # Track SPY price history for 200 SMA Macro Guard
                         if "SPY" in market_state:
@@ -275,8 +461,8 @@ async def run_consumer():
                         regime_scaler = risk_engine.calculate_regime_scaler(spy_series, spy_prices=spy_price_series)
 
                         # -------------------------------------------------------------
-                        # PHASE A: DUAL-SIDED HARD RISK GUARD CHECK (LONG & SHORT)
-                        # (Executed before building shared thesis to prevent immediate re-entry)
+                        # PHASE A: DIRECTIONAL HARD RISK GUARD (LONG & SHORT aware)
+                        # Uses risk_engine.check_stop_loss_take_profit + cooldowns
                         # -------------------------------------------------------------
                         for agent in swarm_mgr.population:
                             if not hasattr(agent, 'entry_prices'):
@@ -284,17 +470,17 @@ async def run_consumer():
 
                             for tk, shares in list(agent.holdings.items()):
                                 if shares != 0 and tk in prices:
-                                    current_price = prices[tk]
-                                    entry_price = agent.entry_prices.get(tk, current_price)
-                                    adv = market_state.get(tk, {}).get("adv", 1000000.0)
+                                    current_price = float(prices[tk])
+                                    entry_price = float(agent.entry_prices.get(tk, current_price) or current_price)
+                                    adv = float(market_state.get(tk, {}).get("adv", 1000000.0) or 1000000.0)
 
-                                    if shares > 0:
-                                        pos_pnl = (current_price - entry_price) / entry_price
-                                    else:
-                                        pos_pnl = (entry_price - current_price) / entry_price  # Inverted PnL for Short
+                                    direction = "SHORT" if shares < 0 else "LONG"
+                                    exit_signal = risk_engine.check_stop_loss_take_profit(
+                                        entry_price, current_price, direction,
+                                        STOP_LOSS_PCT, TAKE_PROFIT_PCT,
+                                    )
 
-                                    # Hard Stop-Loss Liquidation
-                                    if pos_pnl <= STOP_LOSS_PCT:
+                                    if exit_signal in ("STOP_LOSS", "TAKE_PROFIT"):
                                         action = "SELL" if shares > 0 else "COVER"
                                         exec_price = risk_engine.calculate_execution_price(current_price, abs(shares), adv, action)
 
@@ -306,49 +492,70 @@ async def run_consumer():
                                         agent.holdings[tk] = 0.0
                                         agent.entry_prices[tk] = 0.0
 
+                                        reason = "HARD_STOP_LOSS" if exit_signal == "STOP_LOSS" else "HARD_TAKE_PROFIT"
                                         db.update_agent_cash(agent.agent_id, agent.cash)
                                         db.update_agent_holding(agent.agent_id, tk, 0.0, 0.0)
-                                        db.log_trade(agent.agent_id, tk, action, abs(shares), exec_price, 0.0, reason="HARD_STOP_LOSS")
-                                        logger.warning(f"  🚨 [{agent.agent_id}] HARD STOP-LOSS on {tk} ({action}): Exec @ ${exec_price:.2f} ({pos_pnl*100:.2f}%)")
-
-                                        submit_safe_broker_order(broker_bridge, tk, abs(shares), action)
-
-                                    # Hard Take-Profit Liquidation
-                                    elif pos_pnl >= TAKE_PROFIT_PCT:
-                                        action = "SELL" if shares > 0 else "COVER"
-                                        exec_price = risk_engine.calculate_execution_price(current_price, abs(shares), adv, action)
-
-                                        if shares > 0:
-                                            agent.cash += shares * exec_price
+                                        db.log_trade(agent.agent_id, tk, action, abs(shares), exec_price, 0.0, reason=reason)
+                                        if exit_signal == "STOP_LOSS":
+                                            # Post-stopout cooldown: lock re-entry for 4 bars / 1 hour
+                                            risk_engine.record_stopout(agent.agent_id, tk, tick_counter, COOLDOWN_BARS)
+                                            logger.warning(f"  🚨 [{agent.agent_id}] HARD STOP-LOSS on {tk} ({direction}->{action}): Exec @ ${exec_price:.2f}")
                                         else:
-                                            agent.cash -= abs(shares) * exec_price
-
-                                        agent.holdings[tk] = 0.0
-                                        agent.entry_prices[tk] = 0.0
-
-                                        db.update_agent_cash(agent.agent_id, agent.cash)
-                                        db.update_agent_holding(agent.agent_id, tk, 0.0, 0.0)
-                                        db.log_trade(agent.agent_id, tk, action, abs(shares), exec_price, 0.0, reason="HARD_TAKE_PROFIT")
-                                        logger.info(f"  🎯 [{agent.agent_id}] HARD TAKE-PROFIT on {tk} ({action}): Exec @ ${exec_price:.2f} (+{pos_pnl*100:.2f}%)")
+                                            logger.info(f"  🎯 [{agent.agent_id}] HARD TAKE-PROFIT on {tk} ({direction}->{action}): Exec @ ${exec_price:.2f}")
 
                                         submit_safe_broker_order(broker_bridge, tk, abs(shares), action)
+
+                        # Prune expired cooldowns each tick
+                        try:
+                            risk_engine.prune_expired_cooldowns(tick_counter)
+                        except Exception:
+                            pass
 
                         all_active_holdings = list({
                             tk for agent in swarm_mgr.population 
                             for tk, shares in agent.holdings.items() if shares != 0
                         })
 
+                        # Shared technical thesis (zero LLM calls, pure pandas filter)
                         shared_thesis = swarm.analyze_technical_state(market_state, active_holdings=all_active_holdings)
 
                         # -------------------------------------------------------------
-                        # PHASE B: CONCURRENT ASYNC STRATEGY EXECUTION
+                        # PHASE B: DETERMINISTIC CACHE-DRIVEN STRATEGY EXECUTION
+                        # Zero LLM calls — reads SentimentCache O(1) per ticker.
+                        # Total per-bar LLM budget remains exactly 3 (debate only).
                         # -------------------------------------------------------------
-                        decisions_map = await swarm.execute_swarm_strategies_concurrently(
-                            client=client,
-                            shared_thesis=shared_thesis,
+                        decisions_map = compute_deterministic_signals(
                             population=swarm_mgr.population,
-                            prices=prices
+                            market_state=market_state,
+                            shared_thesis=shared_thesis,
                         )
+
+                        # Session equity tracking + circuit breaker (5% peak-to-trough)
+                        try:
+                            swarm_equity_now = 0.0
+                            for agent in swarm_mgr.population:
+                                lv = sum(
+                                    qty * prices.get(tk, agent.entry_prices.get(tk, 0.0))
+                                    for tk, qty in agent.holdings.items() if qty > 0
+                                )
+                                sl = sum(
+                                    abs(qty) * prices.get(tk, agent.entry_prices.get(tk, 0.0))
+                                    for tk, qty in agent.holdings.items() if qty < 0
+                                )
+                                swarm_equity_now += float(agent.cash + lv - sl)
+                            risk_engine.update_session_peak(swarm_equity_now)
+                            if risk_engine.check_session_drawdown(swarm_equity_now):
+                                logger.error(
+                                    f"🚨 SESSION BREAKER: swarm equity ${swarm_equity_now:,.2f} "
+                                    f"≥5% below peak ${risk_engine.session_peak_equity:,.2f}. Liquidating to cash."
+                                )
+                                await liquidate_all_to_cash(
+                                    swarm_mgr.population, prices, market_state, db, reason="SESSION_BREAKER"
+                                )
+                        except Exception as e:
+                            logger.warning(f"⚠️ Session breaker check note: {e}")
+
+                        trading_halted = risk_engine.is_trading_halted()
 
                         for agent in swarm_mgr.population:
                             # SAFE EQUITY CALCULATION: Fallback to entry price if current live tick price is missing
@@ -367,6 +574,11 @@ async def run_consumer():
                             if not decision or not decision.decisions:
                                 continue
 
+                            # If breaker tripped, skip all new entries (liquidation already done)
+                            if trading_halted:
+                                logger.warning(f"  🛑 [{agent.agent_id}] Session breaker active — skipping new entries.")
+                                continue
+
                             for ticker, target in decision.decisions.items():
                                 if ticker not in prices:
                                     continue
@@ -374,7 +586,14 @@ async def run_consumer():
                                 raw_price = prices[ticker]
                                 adv = market_state.get(ticker, {}).get("adv", 1000000.0)
 
-                                raw_effective_alloc = target.allocation_pct * macro_multiplier * regime_scaler
+                                # Cooldown gate: reject re-entry for cooled-down tickers
+                                if target.action in ("BUY", "SHORT") and risk_engine.is_cooled_down(
+                                    agent.agent_id, ticker, tick_counter
+                                ):
+                                    logger.info(f"  🧊 [{agent.agent_id}] Cooldown reject: {ticker} locked until tick {risk_engine.cooldowns.get((agent.agent_id, ticker.upper()))}.")
+                                    continue
+
+                                raw_effective_alloc = target.allocation_pct * regime_scaler
                                 effective_alloc = min(raw_effective_alloc, MAX_SINGLE_POS_CAP)
                                 target_val = current_equity * effective_alloc
                                 current_pos_qty = agent.holdings.get(ticker, 0.0)

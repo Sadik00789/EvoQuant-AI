@@ -9,6 +9,7 @@ import numpy as np
 import yfinance as yf
 from curl_cffi import requests as curl_requests  # Add this import at top
 from dotenv import load_dotenv
+from typing import Dict, Any
 from alpaca.data.live import StockDataStream
 from alpaca.data.models import Bar
 from psycopg_pool import ConnectionPool
@@ -23,32 +24,23 @@ TICK_INTERVAL_MINUTES = 15
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 broker = redis.Redis(host=REDIS_HOST, port=6379, db=0)
 
-# Curated 100 Liquid US Mega/Large-Cap Stocks
-UNIVERSE = [
-    # Tech & Semiconductors (30)
-    "NVDA", "AMD", "AAPL", "MSFT", "TSLA", "META", "GOOGL", "AMZN", "NFLX", "INTC",
-    "CRM", "ORCL", "ADBE", "AVGO", "TXN", "QCOM", "CSCO", "ACN", "IBM", "AMAT",
-    "MU", "LRCX", "NOW", "PANW", "SNPS", "CDNS", "KLAC", "MCHP", "ADI", "ROP",
-    # Financials & Payments (15)
-    "JPM", "V", "MA", "BAC", "WFC", "C", "GS", "MS", "AXP", "PYPL",
-    "BLK", "SCHW", "CB", "MMC", "PGR",
-    # Healthcare & Pharma (15)
-    "UNH", "JNJ", "PFE", "ABBV", "MRK", "TMO", "ABT", "AMGN", "LLY", "DHR",
-    "BMY", "GILD", "CVS", "CI", "ISRG",
-    # Consumer & Retail (15)
-    "PG", "HD", "DIS", "COST", "PEP", "KO", "WMT", "NKE", "MCD", "SBUX",
-    "LOW", "TJX", "TGT", "EL", "BKNG",
-    # Industrials & Aerospace (10)
-    "HON", "UNP", "GE", "CAT", "BA", "DE", "LMT", "RTX", "ADP", "MMM",
-    # Energy, Utilities, Real Estate & Telecom (15)
-    "XOM", "CVX", "COP", "SLB", "EOG", "NEE", "DUK", "SO", "T", "VZ",
-    "TMUS", "PLD", "AMT", "SPGI", "MDLZ"
+# 20-Stock Liquid Universe for Batched Adversarial Sentiment (Bull/Bear)
+# Rate-limit immune: 3 API calls per 15m bar => 288 calls/day, 0.2 RPM
+TICKERS = [
+    "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL",
+    "META", "TSLA", "AMD", "INTC", "QCOM",
+    "AVGO", "SPY", "QQQ", "IWM", "GLD",
+    "SLV", "TLT", "COIN", "PLTR", "ARM",
 ]
 
-ALL_SYMBOLS = UNIVERSE + ["SPY"]
+# Backward-compatible aliases (legacy code imports UNIVERSE / ALL_SYMBOLS)
+UNIVERSE = list(TICKERS)
+ALL_SYMBOLS = list(TICKERS)
 
-history = {tk: pd.DataFrame(columns=["high", "low", "close", "volume"]) for tk in ALL_SYMBOLS}
-buffer = {}
+history: Dict[str, pd.DataFrame] = {
+    tk: pd.DataFrame(columns=["open", "high", "low", "close", "volume"]) for tk in ALL_SYMBOLS
+}
+buffer: Dict[str, Dict[str, Any]] = {}
 current_window_minute = -1
 
 
@@ -96,6 +88,42 @@ def sync_dividend_calendar():
                     print(f"✅ Dividend calendar synchronized ({synced_count} active schedules verified).")
     except Exception as e:
         print(f"⚠️ Dividend calendar sync note (DB connection deferred): {e}")
+
+
+def calculate_rsi14(df: pd.DataFrame, period: int = 14) -> float:
+    """Wilder's RSI-14 on close series. Returns 50.0 neutral on insufficient data."""
+    if df is None or len(df) < period + 1:
+        return 50.0
+    try:
+        delta = df["close"].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / (loss + 1e-9)
+        rsi = 100 - (100 / (1 + rs))
+        val = float(rsi.iloc[-1])
+        if pd.isna(val):
+            return 50.0
+        return round(val, 2)
+    except Exception:
+        return 50.0
+
+
+def calculate_momentum_15m(df: pd.DataFrame) -> float:
+    """
+    15m Momentum as 1-bar percent change * 100.
+    Positive = upward continuation, Negative = downward drift.
+    """
+    if df is None or len(df) < 2:
+        return 0.0
+    try:
+        prev = float(df["close"].iloc[-2])
+        curr = float(df["close"].iloc[-1])
+        if prev <= 0:
+            return 0.0
+        return round(((curr - prev) / prev) * 100.0, 4)
+    except Exception:
+        return 0.0
+
 
 def calculate_advanced_indicators(df: pd.DataFrame, spy_df: pd.DataFrame = None) -> dict:
     if len(df) < 15:
@@ -145,29 +173,68 @@ def calculate_advanced_indicators(df: pd.DataFrame, spy_df: pd.DataFrame = None)
     except Exception:
         return {"rsi": 50.0, "macd_hist": 0.0, "atr": 1.0, "rel_strength_spy": 0.0, "adv": 1000000.0}
 
+
+def build_15m_stats(symbol: str) -> Dict[str, Any]:
+    """
+    Build clean aggregated 15m stats for a single symbol.
+    Emits: Open, High, Low, Close, Volume, RSI14, 15m Momentum (+ legacy ATR/MACD/RS/ADV).
+    """
+    df = history.get(symbol)
+    if df is None or df.empty:
+        return {
+            "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0, "volume": 0.0,
+            "rsi": 50.0, "rsi14": 50.0, "momentum": 0.0, "momentum_15m": 0.0,
+            "macd_hist": 0.0, "atr": 1.0, "rel_strength_spy": 0.0, "adv": 1000000.0,
+        }
+    try:
+        last = df.iloc[-1]
+        spy_data = history.get("SPY", None)
+        indicators = calculate_advanced_indicators(df, spy_data)
+        rsi14 = calculate_rsi14(df, 14)
+        mom = calculate_momentum_15m(df)
+        return {
+            "open": float(last.get("open", last.get("close", 0.0))),
+            "high": float(last.get("high", 0.0)),
+            "low": float(last.get("low", 0.0)),
+            "close": float(last.get("close", 0.0)),
+            "volume": float(last.get("volume", 0.0)),
+            "rsi": indicators["rsi"],
+            "rsi14": rsi14,
+            "momentum": mom,
+            "momentum_15m": mom,
+            "macd_hist": indicators["macd_hist"],
+            "atr": indicators["atr"],
+            "rel_strength_spy": indicators["rel_strength_spy"],
+            "adv": indicators["adv"],
+        }
+    except Exception:
+        return {
+            "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0, "volume": 0.0,
+            "rsi": 50.0, "rsi14": 50.0, "momentum": 0.0, "momentum_15m": 0.0,
+            "macd_hist": 0.0, "atr": 1.0, "rel_strength_spy": 0.0, "adv": 1000000.0,
+        }
+
+
 async def on_bar(bar: Bar):
     global history, buffer, current_window_minute
     
     # 1. Store bar in rolling history dataframe (keep 100 bars for MACD stability)
-    new_row = pd.DataFrame([{"high": bar.high, "low": bar.low, "close": bar.close, "volume": bar.volume}])
+    # Alpaca Bar exposes open/high/low/close/volume/timestamp/symbol
+    bar_open = float(getattr(bar, "open", bar.close))
+    new_row = pd.DataFrame([{
+        "open": bar_open,
+        "high": float(bar.high),
+        "low": float(bar.low),
+        "close": float(bar.close),
+        "volume": float(bar.volume),
+    }])
     history[bar.symbol] = pd.concat([history[bar.symbol], new_row], ignore_index=True).tail(100)
 
     bar_minute = bar.timestamp.minute
 
-    # 2. Accumulate indicators into buffer for universe symbols
+    # 2. Accumulate clean 15m stats into buffer for 20-stock universe symbols
     if bar.symbol in UNIVERSE:
-        spy_data = history.get("SPY", None)
-        indicators = calculate_advanced_indicators(history[bar.symbol], spy_data)
-        
-        buffer[bar.symbol] = {
-            "close": bar.close,
-            "volume": bar.volume,
-            "rsi": indicators["rsi"],
-            "macd_hist": indicators["macd_hist"],
-            "atr": indicators["atr"],
-            "rel_strength_spy": indicators["rel_strength_spy"],
-            "adv": indicators["adv"]
-        }
+        buffer[bar.symbol] = build_15m_stats(bar.symbol)
 
     # 3. Broadcast ONLY when shifting into a new 15-minute interval (00, 15, 30, 45)
     if bar_minute % TICK_INTERVAL_MINUTES == 0 and current_window_minute != bar_minute:
@@ -180,7 +247,7 @@ async def on_bar(bar: Bar):
         if len(buffer) > 0:
             payload = json.dumps(buffer)
             broker.publish('market_events', payload)
-            print(f"📡 [PRODUCER] Clean 15m Close: Broadcasted full {len(buffer)}/100 stock matrix to Redis.")
+            print(f"📡 [PRODUCER] Clean 15m Close: Broadcasted full {len(buffer)}/20 stock matrix to Redis.")
             buffer.clear()
 
 if __name__ == "__main__":

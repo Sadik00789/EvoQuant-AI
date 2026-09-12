@@ -609,3 +609,172 @@ def test_cull_and_reallocate_resilient_fallback(mock_db_pool):
 
     snapshot_queries = [call[0] for call in mock_cursor.execute.call_args_list if "agent_snapshots" in call[0][0]]
     assert len(snapshot_queries) >= 3, "Snapshots for loser and 2 offspring should be inserted"
+# ------------------------------------------
+# 7. BATCHED ADVERSARIAL DEBATE 20-STOCK 3 CALLS PER BAR
+# ------------------------------------------
+
+def _make_20_snapshot():
+    from data_producer import TICKERS
+    snap = {}
+    for i, tk in enumerate(TICKERS):
+        snap[tk] = {
+            "open": 100.0 + i,
+            "high": 102.0 + i,
+            "low": 99.0 + i,
+            "close": 101.0 + i,
+            "volume": 1000000.0,
+            "rsi": 55.0,
+            "rsi14": 55.0,
+            "momentum": 0.25,
+            "momentum_15m": 0.25,
+            "macd_hist": 0.05,
+            "atr": 1.5,
+            "rel_strength_spy": 0.5,
+            "adv": 5000000.0,
+            "headlines": "Steady price action.",
+        }
+    return snap
+
+
+def test_adversarial_debate_parallel_execution():
+    """Verifies Bull and Bear prompts run concurrently and Arbiter parses into [-1.0, 1.0]."""
+    from sentiment_agent import NewsSentimentAgent
+
+    async def _test():
+        agent = NewsSentimentAgent(api_key="test_dummy_key")
+        snapshots = _make_20_snapshot()
+        bull_text = "\n".join([f"- {tk}: Bullish breakout momentum." for tk in snapshots])
+        bear_text = "\n".join([f"- {tk}: Overbought fade risk." for tk in snapshots])
+        arbiter_json = json.dumps({tk: (0.45 if i % 2 == 0 else -0.20) for i, tk in enumerate(sorted(snapshots))})
+        call_order = []
+
+        async def fake_bull(snaps):
+            call_order.append("bull_start")
+            await asyncio.sleep(0.05)
+            call_order.append("bull_end")
+            return bull_text
+
+        async def fake_bear(snaps):
+            call_order.append("bear_start")
+            await asyncio.sleep(0.05)
+            call_order.append("bear_end")
+            return bear_text
+
+        async def fake_gemini(prompt, temperature=0.1, max_tokens=2048):
+            assert "NVDA" in prompt or "AAPL" in prompt
+            return arbiter_json
+
+        with patch.object(agent, "_generate_bull_theses", side_effect=fake_bull), patch.object(
+            agent, "_generate_bear_theses", side_effect=fake_bear
+        ), patch.object(agent, "_call_gemini_text", side_effect=fake_gemini):
+            scores = await agent.run_adversarial_batch(snapshots)
+
+        assert "bull_start" in call_order and "bear_start" in call_order
+        assert call_order.index("bear_start") < call_order.index("bull_end"), (
+            f"Bull and Bear did not overlap, no gather concurrency: {call_order}"
+        )
+        assert len(scores) == 20, f"Expected 20 scores, got {len(scores)}"
+        for tk, v in scores.items():
+            assert isinstance(v, float), f"{tk} score not float"
+            assert -1.0 <= v <= 1.0, f"{tk} score {v} out of range"
+        assert agent.cache.get_sentiment("NVDA") == scores["NVDA"]
+        assert agent.cache.get_sentiment("AAPL") == scores["AAPL"]
+
+    asyncio.run(_test())
+
+
+def test_arbiter_json_fallback():
+    """Confirms invalid JSON from Arbiter falls back safely to 0.0 without raising."""
+    from sentiment_agent import NewsSentimentAgent
+
+    async def _test():
+        agent = NewsSentimentAgent(api_key="test_dummy_key")
+        snapshots = _make_20_snapshot()
+
+        async def fake_bull(snaps):
+            return "- NVDA: bullish"
+
+        async def fake_bear(snaps):
+            return "- NVDA: bearish"
+
+        async def fake_bad_gemini(prompt, temperature=0.1, max_tokens=2048):
+            return "THIS IS NOT JSON just prose, sorry!"
+
+        with patch.object(agent, "_generate_bull_theses", side_effect=fake_bull), patch.object(
+            agent, "_generate_bear_theses", side_effect=fake_bear
+        ), patch.object(agent, "_call_gemini_text", side_effect=fake_bad_gemini):
+            scores = await agent.run_adversarial_batch(snapshots)
+
+        assert isinstance(scores, dict)
+        assert len(scores) == 20
+        for tk, v in scores.items():
+            assert v == 0.0, f"{tk} should fallback to 0.0, got {v}"
+        parsed = agent._parse_arbiter_json("garbage no json here", list(snapshots.keys()))
+        assert all(val == 0.0 for val in parsed.values())
+
+    asyncio.run(_test())
+
+
+def test_sentiment_cache_ttl_expiration():
+    """Validates SentimentCache TTL 1200s: fresh reads hit, expired return 0.0."""
+    import time as _time
+    from sentiment_agent import SentimentCache
+
+    cache = SentimentCache(ttl_seconds=1200.0)
+    cache.update({"NVDA": 0.65, "AAPL": -0.35})
+    assert cache.get_sentiment("NVDA") == 0.65
+    assert cache.get_sentiment("AAPL") == -0.35
+    past = _time.time() - 1300.0
+    cache._timestamps["NVDA"] = past
+    cache._timestamps["AAPL"] = past
+    assert cache.get_sentiment("NVDA") == 0.0
+    assert cache.get_sentiment("AAPL") == 0.0
+    assert cache.get_fallback("NVDA") == 0.65
+
+
+def test_directional_stops():
+    """Validates exact stop-loss and take-profit trip conditions for Long and Short."""
+    engine = AdvancedRiskEngine(stop_loss_pct=0.025, take_profit_pct=0.05)
+    assert engine.check_stop_loss_take_profit(100.0, 97.5, "LONG") == "STOP_LOSS"
+    assert engine.check_stop_loss_take_profit(100.0, 97.49, "LONG") == "STOP_LOSS"
+    assert engine.check_stop_loss_take_profit(100.0, 98.0, "LONG") is None
+    assert engine.check_stop_loss_take_profit(100.0, 105.0, "LONG") == "TAKE_PROFIT"
+    assert engine.check_stop_loss_take_profit(100.0, 105.5, "LONG") == "TAKE_PROFIT"
+    assert engine.check_stop_loss_take_profit(100.0, 102.0, "LONG") is None
+    assert engine.check_stop_loss_take_profit(100.0, 102.5, "SHORT") == "STOP_LOSS"
+    assert engine.check_stop_loss_take_profit(100.0, 103.0, "SHORT") == "STOP_LOSS"
+    assert engine.check_stop_loss_take_profit(100.0, 102.0, "SHORT") is None
+    assert engine.check_stop_loss_take_profit(100.0, 95.0, "SHORT") == "TAKE_PROFIT"
+    assert engine.check_stop_loss_take_profit(100.0, 94.0, "SHORT") == "TAKE_PROFIT"
+    assert engine.check_stop_loss_take_profit(100.0, 98.0, "SHORT") is None
+    assert engine.check_position_exit(100.0, 97.0, shares=10.0) == "STOP_LOSS"
+    assert engine.check_position_exit(100.0, 103.0, shares=-10.0) == "STOP_LOSS"
+    assert engine.check_position_exit(100.0, 105.5, shares=10.0) == "TAKE_PROFIT"
+    assert engine.check_position_exit(100.0, 94.5, shares=-10.0) == "TAKE_PROFIT"
+
+
+def test_cooldown_reentry_rejection():
+    """Validates cooled-down ticker orders are rejected until window expires."""
+    engine = AdvancedRiskEngine(cooldown_bars=4)
+    expiry = engine.record_stopout("Agent_Alpha", "NVDA", current_tick=10)
+    assert expiry == 14
+    assert engine.cooldowns[("Agent_Alpha", "NVDA")] == 14
+    for t in (10, 11, 12, 13):
+        assert engine.is_cooled_down("Agent_Alpha", "NVDA", t) is True
+        assert engine.should_allow_entry("Agent_Alpha", "NVDA", t) is False
+    assert engine.is_cooled_down("Agent_Alpha", "NVDA", 14) is False
+    assert engine.should_allow_entry("Agent_Alpha", "NVDA", 14) is True
+    assert engine.should_allow_entry("Agent_Alpha", "AAPL", 11) is True
+    assert engine.should_allow_entry("Agent_Beta", "NVDA", 11) is True
+
+
+def test_session_circuit_breaker():
+    """Validates 5 percent peak-to-trough breaker halts new entries."""
+    engine = AdvancedRiskEngine(session_drawdown_pct=0.05)
+    assert engine.check_session_drawdown(500000.0) is False
+    assert engine.update_session_peak(520000.0) == 520000.0
+    assert engine.check_session_drawdown(504400.0) is False
+    assert engine.is_trading_halted() is False
+    assert engine.check_session_drawdown(494000.0) is True
+    assert engine.is_trading_halted() is True
+    assert engine.should_allow_entry("Agent_Alpha", "NVDA", 99) is False
