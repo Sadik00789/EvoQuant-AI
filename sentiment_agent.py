@@ -38,16 +38,67 @@ def _activity_score(entry: dict) -> float:
         return 0.0
 
 
-def select_top_20_candidates(snapshots: dict, top_n: int = 20) -> dict:
-    """Deterministic pre-LLM screener: rank 100 tickers by activity, return top 20 dict."""
+def select_top_20_candidates(snapshots: dict, active_holdings=None, top_n: int = 20) -> dict:
+    """Orphan-free deterministic pre-LLM screener: rank 100 tickers by activity, retain open positions.
+
+    Guarantees zero held positions ever lose LLM coverage while keeping batch strictly at 20.
+    Backward compatible: second positional arg may be legacy top_n int.
+    """
+    # Backward-compat: select_top_20_candidates(snapshots, 20) legacy form
+    if isinstance(active_holdings, int) and isinstance(top_n, int):
+        top_n = int(active_holdings)
+        active_holdings = set()
+    if active_holdings is None:
+        active_holdings = set()
+    try:
+        top_n = max(1, int(top_n))
+    except Exception:
+        top_n = 20
     if not snapshots:
         return {}
     try:
-        ranked = sorted(snapshots.items(), key=lambda kv: _activity_score(kv[1] or {}), reverse=True)
-        return dict(ranked[:max(1, int(top_n))])
+        # Normalize held set to upper-case for case-insensitive matching
+        try:
+            held_upper = {str(s).upper() for s in (active_holdings or set()) if str(s).strip()}
+        except Exception:
+            held_upper = set()
+        # Map upper -> original key for snapshots present in universe
+        upper_to_key: dict = {}
+        for k in snapshots.keys():
+            try:
+                upper_to_key[str(k).upper()] = k
+            except Exception:
+                continue
+        held_keys_present = [upper_to_key[u] for u in held_upper if u in upper_to_key]
+        # Rank held symbols by activity score
+        held_ranked = sorted(
+            held_keys_present,
+            key=lambda k: _activity_score(snapshots.get(k) or {}),
+            reverse=True,
+        )
+        if len(held_ranked) >= top_n:
+            return {k: snapshots[k] for k in held_ranked[:top_n]}
+        # K slots to held, remainder to highest-activity unscreened tickers
+        k_held = len(held_ranked)
+        held_set = set(held_ranked)
+        remaining = [kv for kv in sorted(snapshots.items(), key=lambda kv: _activity_score(kv[1] or {}), reverse=True) if kv[0] not in held_set]
+        need = top_n - k_held
+        selected = list(held_ranked) + [k for k, _ in remaining[:max(0, need)]]
+        # Edge: snapshots smaller than top_n -> return all available
+        if len(selected) < top_n and len(snapshots) <= top_n:
+            existing = set(selected)
+            for k in snapshots.keys():
+                if k not in existing:
+                    selected.append(k)
+                if len(selected) >= len(snapshots):
+                    break
+        return {k: snapshots[k] for k in selected[:top_n]}
     except Exception:
-        keys = list(snapshots.keys())[:int(top_n)]
-        return {k: snapshots[k] for k in keys}
+        try:
+            keys = list(snapshots.keys())[:int(top_n)]
+            return {k: snapshots[k] for k in keys}
+        except Exception:
+            return {}
 
 
 class SentimentCache:

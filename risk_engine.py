@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger("AdvancedRiskEngine")
@@ -20,15 +21,16 @@ class AdvancedRiskEngine:
     8. Session Circuit Breaker (5% peak-to-trough drawdown -> halt + liquidate).
     """
     def __init__(
-        self, 
-        target_volatility: float = 0.15, 
-        max_position_pct: float = 0.05, 
-        base_spread: float = 0.0001, 
+        self,
+        target_volatility: float = 0.15,
+        max_position_pct: float = 0.05,
+        base_spread: float = 0.0001,
         impact_gamma: float = 0.5,
         stop_loss_pct: float = 0.025,
         take_profit_pct: float = 0.05,
         cooldown_bars: int = 4,
         session_drawdown_pct: float = 0.05,
+        cooldown_seconds: float = 3600.0,
         **kwargs
     ):
         self.target_volatility = target_volatility
@@ -39,13 +41,21 @@ class AdvancedRiskEngine:
         self.take_profit_pct = float(take_profit_pct)
         self.cooldown_bars = int(cooldown_bars)
         self.session_drawdown_pct = float(session_drawdown_pct)
+        self.cooldown_seconds = float(cooldown_seconds if cooldown_seconds is not None else kwargs.get("cooldown_secs", 3600.0))
 
-        # Post-stopout cooldowns: (agent_id, ticker) -> expiry_tick (inclusive lockout)
+        # Post-stopout cooldowns: (agent_id, ticker) -> expiry_tick (inclusive lockout) [legacy tick API]
         self.cooldowns: Dict[Tuple[str, str], int] = {}
-        # Session breaker state
+        # Timestamp-based cooldowns: (agent_id, ticker) -> expiry epoch seconds (1-hour lockout)
+        self.cooldown_until: Dict[Tuple[str, str], float] = {}
+        # Session breaker state + rolling daily reset clock
         self.session_peak_equity: Optional[float] = None
         self.circuit_breaker_tripped: bool = False
         self.trading_halted: bool = False
+        self.last_session_reset: float = float(time.time())
+        try:
+            self.last_session_date: Optional[str] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        except Exception:
+            self.last_session_date = None
 
     # ------------------------------------------------------------------
     # Directional Stop-Loss / Take-Profit
@@ -115,48 +125,183 @@ class AdvancedRiskEngine:
         )
 
     # ------------------------------------------------------------------
-    # Post-Stopout Symbol Cooldowns
+    # Post-Stopout Symbol Cooldowns (timestamp-based, tick wrapper for compat)
     # ------------------------------------------------------------------
-    def record_stopout(self, agent_id: str, ticker: str, current_tick: int, bars: Optional[int] = None) -> int:
-        """Assign cooldowns[(agent_id, T)] = current_tick + 4 (1 hour lockout). Returns expiry tick."""
+    def _resolve_timestamp(self, current_tick: Any = None, current_timestamp: Optional[float] = None) -> float:
+        """Canonical clock: explicit timestamp > epoch-like tick > wall-clock fallback."""
+        if current_timestamp is not None:
+            try:
+                return float(current_timestamp)
+            except Exception:
+                pass
+        try:
+            v = float(current_tick)
+            if v >= 1e9:
+                return v
+        except Exception:
+            pass
+        return float(time.time())
+
+    def _resolve_tick(self, current_tick: Any, current_timestamp: Optional[float] = None) -> Optional[int]:
+        """Return tick int if caller is in tick domain, else None."""
+        if current_timestamp is not None:
+            return None
+        try:
+            v = float(current_tick)
+            if v < 1e9:
+                return int(v)
+        except Exception:
+            return None
+        return None
+
+    def record_stopout(self, agent_id: str, ticker: str, current_tick: int = 0, bars: Optional[int] = None, current_timestamp: Optional[float] = None, lockout_seconds: Optional[float] = None) -> int:
+        """Assign tick + timestamp cooldowns. Returns legacy expiry tick for compat. Domains isolated unless timestamp given."""
         b = int(bars) if bars is not None else self.cooldown_bars
-        expiry = int(current_tick) + b
+        try:
+            tick_base = int(float(current_tick)) if float(current_tick) < 1e9 else 0
+        except Exception:
+            tick_base = 0
+        expiry = tick_base + b
         self.cooldowns[(str(agent_id), str(ticker).upper())] = expiry
-        logger.warning(f"🧊 Cooldown set: [{agent_id}] {ticker} locked until tick {expiry} (current {current_tick}).")
+        # Only populate timestamp domain when caller is in timestamp domain (explicit ts or epoch tick)
+        _is_ts_domain = current_timestamp is not None
+        try:
+            if float(current_tick) >= 1e9:
+                _is_ts_domain = True
+        except Exception:
+            pass
+        if _is_ts_domain:
+            ts = self._resolve_timestamp(current_tick, current_timestamp)
+            lock = float(lockout_seconds) if lockout_seconds is not None else float(self.cooldown_seconds)
+            self.cooldown_until[(str(agent_id), str(ticker).upper())] = float(ts) + float(lock)
+            logger.warning(f"Cooldown set: [{agent_id}] {ticker} locked until tick {expiry} / ts {float(ts) + float(lock):.0f}.")
+        else:
+            logger.warning(f"Cooldown set: [{agent_id}] {ticker} locked until tick {expiry}.")
         return expiry
 
-    def is_cooled_down(self, agent_id: str, ticker: str, current_tick: int) -> bool:
+    def record_stopout_ts(self, agent_id: str, ticker: str, current_timestamp: float, lockout_seconds: Optional[float] = None) -> float:
+        """Timestamp-native stopout: cooldown_until = now + 3600s. Returns expiry epoch."""
+        lock = float(lockout_seconds) if lockout_seconds is not None else float(self.cooldown_seconds)
+        expiry_ts = float(current_timestamp) + float(lock)
+        self.cooldown_until[(str(agent_id), str(ticker).upper())] = expiry_ts
+        return expiry_ts
+
+    def is_cooled_down(self, agent_id: str, ticker: str, current_tick: Any = 0, current_timestamp: Optional[float] = None) -> bool:
         """True if (agent, ticker) is still inside cooldown window and re-entry must be rejected."""
-        expiry = self.cooldowns.get((str(agent_id), str(ticker).upper()))
+        key = (str(agent_id), str(ticker).upper())
+        # Timestamp domain takes precedence when timestamp supplied or tick is epoch-like
+        use_ts = current_timestamp is not None
+        try:
+            if float(current_tick) >= 1e9:
+                use_ts = True
+        except Exception:
+            pass
+        if use_ts:
+            ts = self._resolve_timestamp(current_tick, current_timestamp)
+            expiry_ts = self.cooldown_until.get(key)
+            if expiry_ts is None:
+                return False
+            if float(ts) < float(expiry_ts):
+                return True
+            try:
+                del self.cooldown_until[key]
+            except KeyError:
+                pass
+            return False
+        expiry = self.cooldowns.get(key)
         if expiry is None:
             return False
-        if int(current_tick) < int(expiry):
-            return True
-        # Expired -> prune
         try:
-            del self.cooldowns[(str(agent_id), str(ticker).upper())]
+            tick_now = int(float(current_tick))
+        except Exception:
+            return False
+        if tick_now < int(expiry):
+            return True
+        try:
+            del self.cooldowns[key]
         except KeyError:
             pass
         return False
 
-    def should_allow_entry(self, agent_id: str, ticker: str, current_tick: int) -> bool:
+    def should_allow_entry(self, agent_id: str, ticker: str, current_tick: Any = 0, current_timestamp: Optional[float] = None) -> bool:
         """Combined gate: rejects if circuit breaker halted OR symbol on cooldown."""
         if self.trading_halted or self.circuit_breaker_tripped:
             return False
-        if self.is_cooled_down(agent_id, ticker, current_tick):
+        if self.is_cooled_down(agent_id, ticker, current_tick, current_timestamp=current_timestamp):
             return False
         return True
 
-    def prune_expired_cooldowns(self, current_tick: int) -> None:
-        expired = [k for k, v in self.cooldowns.items() if int(current_tick) >= int(v)]
+    def prune_expired_cooldowns(self, current_tick: Any = 0, current_timestamp: Optional[float] = None) -> None:
+        use_ts = current_timestamp is not None
+        try:
+            if float(current_tick) >= 1e9:
+                use_ts = True
+        except Exception:
+            pass
+        if use_ts:
+            ts = self._resolve_timestamp(current_tick, current_timestamp)
+            expired = [k for k, v in self.cooldown_until.items() if float(ts) >= float(v)]
+            for k in expired:
+                try:
+                    del self.cooldown_until[k]
+                except KeyError:
+                    pass
+            return
+        try:
+            tick_now = int(float(current_tick))
+        except Exception:
+            return
+        expired = [k for k, v in self.cooldowns.items() if tick_now >= int(v)]
         for k in expired:
-            del self.cooldowns[k]
+            try:
+                del self.cooldowns[k]
+            except KeyError:
+                pass
+        # Opportunistically prune expired timestamp locks via wall-clock
+        now = float(time.time())
+        for k in [k for k, v in list(self.cooldown_until.items()) if now >= float(v)]:
+            try:
+                del self.cooldown_until[k]
+            except KeyError:
+                pass
 
     # ------------------------------------------------------------------
-    # Session Circuit Breaker (5% peak-to-trough)
+    # Session Circuit Breaker (5% peak-to-trough) with rolling daily reset
     # ------------------------------------------------------------------
-    def update_session_peak(self, current_equity: float) -> float:
-        """Track running session peak equity. Returns current peak."""
+    def _maybe_roll_session(self, current_timestamp: Optional[float] = None, current_equity: Optional[float] = None) -> bool:
+        """Rolling daily reset: if >=86400s elapsed or UTC day changed, reset peak + halt. Returns True if rolled."""
+        try:
+            now_ts = float(current_timestamp) if current_timestamp is not None else float(time.time())
+        except Exception:
+            return False
+        try:
+            today = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        except Exception:
+            today = None
+        elapsed = now_ts - float(self.last_session_reset or now_ts)
+        day_changed = today is not None and self.last_session_date is not None and today != self.last_session_date
+        if elapsed >= 86400.0 or day_changed:
+            try:
+                eq = float(current_equity) if current_equity is not None else float(self.session_peak_equity or 0.0)
+            except Exception:
+                eq = float(self.session_peak_equity or 0.0)
+            if eq > 0:
+                self.session_peak_equity = eq
+            self.circuit_breaker_tripped = False
+            self.trading_halted = False
+            self.last_session_reset = now_ts
+            if today is not None:
+                self.last_session_date = today
+            logger.info(f"Session breaker auto-reset: new peak ${float(self.session_peak_equity or 0.0):,.2f} on {today}.")
+            return True
+        return False
+
+    def update_session_peak(self, current_equity: float, current_timestamp: Optional[float] = None) -> float:
+        """Track running session peak equity with rolling daily reset. Returns current peak."""
+        try:
+            self._maybe_roll_session(current_timestamp, current_equity)
+        except Exception:
+            pass
         try:
             eq = float(current_equity)
         except Exception:
@@ -165,19 +310,18 @@ class AdvancedRiskEngine:
             self.session_peak_equity = eq
         return float(self.session_peak_equity)
 
-    def check_session_drawdown(self, current_equity: float) -> bool:
-        """
-        If swarm equity drops >= 5% from session peak, trip breaker:
-        lock swarm from new positions (trading_halted=True).
-        Returns True if breaker is tripped (either newly or previously).
-        """
+    def check_session_drawdown(self, current_equity: float, current_timestamp: Optional[float] = None) -> bool:
+        """If swarm equity drops >= 5pct from session peak, trip breaker. Auto-unhalts on daily rollover."""
+        try:
+            self._maybe_roll_session(current_timestamp, current_equity)
+        except Exception:
+            pass
         if self.circuit_breaker_tripped:
             return True
         try:
             eq = float(current_equity)
         except Exception:
             return False
-        # Initialize peak on first call
         if self.session_peak_equity is None:
             self.session_peak_equity = eq
             return False
@@ -206,14 +350,40 @@ class AdvancedRiskEngine:
         self.circuit_breaker_tripped = False
         self.trading_halted = False
         if new_peak is not None:
-            self.session_peak_equity = float(new_peak)
+            try:
+                self.session_peak_equity = float(new_peak)
+            except Exception:
+                pass
+
+    def reset_circuit_breaker(self, current_equity: Optional[float] = None) -> Dict[str, Any]:
+        """Explicit dashboard/manual recovery: unhalt, reset peak to current equity, stamp session clock."""
+        try:
+            now_ts = float(time.time())
+        except Exception:
+            now_ts = 0.0
+        self.circuit_breaker_tripped = False
+        self.trading_halted = False
+        if current_equity is not None:
+            try:
+                self.session_peak_equity = float(current_equity)
+            except Exception:
+                pass
+        self.last_session_reset = now_ts
+        try:
+            self.last_session_date = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+        logger.info(f"Circuit breaker manually reset @ ${float(self.session_peak_equity or 0.0):,.2f}.")
+        return self.get_session_status()
 
     def get_session_status(self) -> Dict[str, Any]:
         return {
             "session_peak_equity": self.session_peak_equity,
             "circuit_breaker_tripped": self.circuit_breaker_tripped,
             "trading_halted": self.is_trading_halted(),
-            "active_cooldowns": len(self.cooldowns),
+            "active_cooldowns": len(self.cooldowns) + len(self.cooldown_until),
+            "last_session_reset": float(getattr(self, "last_session_reset", 0.0) or 0.0),
+            "last_session_date": getattr(self, "last_session_date", None),
         }
 
     def calculate_downside_volatility(self, returns: pd.Series, target_return: float = 0.0) -> float:
@@ -387,10 +557,10 @@ class AdvancedRiskEngine:
         return round(raw_price, 4)
 
     def evaluate_margin_health(
-        self, 
-        cash: float, 
-        holdings: Dict[str, float], 
-        prices: Dict[str, float], 
+        self,
+        cash: float,
+        holdings: Dict[str, float],
+        prices: Dict[str, float],
         initial_margin_req: float = 1.50
     ) -> Dict[str, Any]:
         """
@@ -412,3 +582,52 @@ class AdvancedRiskEngine:
             "free_margin": round(free_margin, 2),
             "margin_call_triggered": free_margin < 0.0
         }
+
+    def short_margin_requirement(self, shares: float, current_price: float, requirement: float = 1.50) -> float:
+        """Directional margin: |shares| * price * 1.50."""
+        try:
+            return round(abs(float(shares)) * float(current_price) * float(requirement), 2)
+        except Exception:
+            return 0.0
+
+    def can_open_short(self, available_cash: float, shares: float, current_price: float, requirement: float = 1.50) -> bool:
+        """Prevent short orders if available_cash < Short Margin Requirement."""
+        try:
+            return float(available_cash) >= self.short_margin_requirement(shares, current_price, requirement)
+        except Exception:
+            return False
+
+    def calculate_total_equity(self, cash: float, holdings: Dict[str, float], entry_prices: Dict[str, float], prices: Dict[str, float]) -> float:
+        """Mark-to-market symmetric equity: cash + longs(shares*price) + shorts(entry_val - current_val)."""
+        try:
+            total = float(cash)
+        except Exception:
+            total = 0.0
+        for tk, qty in (holdings or {}).items():
+            try:
+                q = float(qty)
+                if q == 0:
+                    continue
+                px = float(prices.get(tk, (entry_prices or {}).get(tk, 0.0)) or 0.0)
+                if q > 0:
+                    total += q * px
+                else:
+                    entry = float((entry_prices or {}).get(tk, px) or px)
+                    total += abs(q) * entry - abs(q) * px
+                    # Note: cash already includes short proceeds; this yields cash + longs - short_liability + short_pnl symmetry
+                    # Equivalent to cash + long_val - short_liability when entry==proceeds basis, plus drift PnL
+            except Exception:
+                continue
+        return round(total, 2)
+
+    def calculate_position_pnl(self, shares: float, entry_price: float, current_price: float) -> float:
+        """Symmetric PnL: shares * (current - entry) for longs, shares*(entry - current) magnitude for shorts."""
+        try:
+            q = float(shares)
+            e = float(entry_price)
+            c = float(current_price)
+            if q >= 0:
+                return round(q * (c - e), 2)
+            return round(abs(q) * (e - c), 2)
+        except Exception:
+            return 0.0

@@ -12,6 +12,42 @@ from typing import List, Dict, Any, Optional
 logger = logging.getLogger("EvolutionEngine")
 
 
+def _derive_lineage_root(agent_id: str, persona_prompt: str = "") -> str:
+    """Backfill lineage_root as Agent_Alpha/Beta/Gamma/Delta/Epsilon based on closest persona/id match."""
+    try:
+        aid = str(agent_id or "")
+        low = aid.lower()
+        for root in ("Agent_Alpha", "Agent_Beta", "Agent_Gamma", "Agent_Delta", "Agent_Epsilon"):
+            if root.lower() in low:
+                return root
+        # GenX_Parent fragments: Gen2_Agent_Alpha_v1_abcd -> Agent_Alpha
+        for root in ("Alpha", "Beta", "Gamma", "Delta", "Epsilon"):
+            if root.lower() in low:
+                return f"Agent_{root}"
+        p = str(persona_prompt or "").lower()
+        if "mean-reversion" in p or "mean reversion" in p or "contrarian" in p:
+            return "Agent_Gamma"
+        if "volatility" in p or "macd" in p:
+            return "Agent_Delta"
+        if "conservative" in p or "risk manager" in p:
+            return "Agent_Beta"
+        if "aggressive" in p or "growth" in p or "momentum" in p:
+            return "Agent_Alpha"
+        if "macro" in p or "balanced" in p or "index" in p:
+            return "Agent_Epsilon"
+    except Exception:
+        pass
+    return "Agent_Alpha"
+
+
+def _mutate_trait(value: float, min_val: float, max_val: float, sigma: float = 0.02) -> float:
+    """Gaussian perturbation with hard clipping: trait_new = clip(parent + N(0,0.02), min, max)."""
+    try:
+        return float(np.clip(float(value) + float(np.random.normal(0, sigma)), float(min_val), float(max_val)))
+    except Exception:
+        return float(np.clip(float(value), float(min_val), float(max_val)))
+
+
 @dataclass
 class AgentGenome:
     agent_id: str
@@ -23,43 +59,114 @@ class AgentGenome:
     entry_prices: Dict[str, float] = field(default_factory=dict)
     equity_history: List[float] = field(default_factory=lambda: [100000.0])
     tenure_ticks: int = 0
+    lineage_root: str = "Agent_Alpha"
+    is_elite: bool = False
+    sentiment_weight: float = 0.55
+    technical_weight: float = 0.45
+    stop_loss_pct: float = 0.025
+    take_profit_pct: float = 0.050
+
+    def __post_init__(self):
+        # Backfill lineage for legacy agents constructed without explicit root
+        try:
+            if not getattr(self, "lineage_root", None):
+                self.lineage_root = _derive_lineage_root(self.agent_id, self.persona_prompt)
+            # Normalize bare roots like Alpha -> Agent_Alpha
+            lr = str(self.lineage_root or "").strip()
+            if lr in ("Alpha", "Beta", "Gamma", "Delta", "Epsilon"):
+                self.lineage_root = f"Agent_{lr}"
+                lr = self.lineage_root
+            if not lr:
+                self.lineage_root = _derive_lineage_root(self.agent_id, self.persona_prompt)
+        except Exception:
+            self.lineage_root = "Agent_Alpha"
+        # Clamp evolvable traits into bounds and renormalize weights to sum 1.0
+        try:
+            self.sentiment_weight = float(np.clip(float(self.sentiment_weight), 0.20, 0.80))
+            self.technical_weight = float(np.clip(float(self.technical_weight), 0.20, 0.80))
+            s = float(self.sentiment_weight) + float(self.technical_weight)
+            if s > 0:
+                self.sentiment_weight = round(float(self.sentiment_weight) / s, 4)
+                self.technical_weight = round(1.0 - float(self.sentiment_weight), 4)
+            self.stop_loss_pct = float(np.clip(float(self.stop_loss_pct), 0.015, 0.045))
+            self.take_profit_pct = float(np.clip(float(self.take_profit_pct), 0.030, 0.090))
+        except Exception:
+            pass
+
+    def max_drawdown(self) -> float:
+        """Peak-to-trough max drawdown in [0,1)."""
+        try:
+            hist = [float(x) for x in (self.equity_history or []) if float(x) > 0]
+            if len(hist) < 2:
+                return 0.0
+            peak = hist[0]
+            mdd = 0.0
+            for v in hist[1:]:
+                if v > peak:
+                    peak = v
+                elif peak > 0:
+                    dd = (peak - v) / peak
+                    if dd > mdd:
+                        mdd = dd
+            return float(np.clip(mdd, 0.0, 0.99))
+        except Exception:
+            return 0.0
+
+    def sortino_ratio(self) -> float:
+        """Sortino proxy: mean(return) / downside_deviation with 0.0001 floor."""
+        try:
+            hist = [float(x) for x in (self.equity_history or [])[-50:] if float(x) > 0]
+            if len(hist) < 2:
+                base = float(self.initial_capital) if float(self.initial_capital) > 0 else 100000.0
+                return (hist[-1] - base) / base if hist else 0.0
+            rets = [(hist[i] - hist[i - 1]) / hist[i - 1] for i in range(1, len(hist)) if hist[i - 1] > 0]
+            if not rets:
+                return 0.0
+            avg = sum(rets) / len(rets)
+            downside = [r for r in rets if r < 0]
+            if not downside:
+                # No downside: reward consistency, scale by avg
+                return round(avg / 0.0001 if avg != 0 else 0.0, 4)
+            var = sum(x * x for x in downside) / len(rets)
+            dd = max(var ** 0.5, 0.0001)
+            return float(avg / dd)
+        except Exception:
+            return 0.0
 
     def calculate_fitness(self) -> float:
         """
-        Calculates risk-adjusted fitness score (Sharpe proxy) over rolling history window.
-        Prevents division spikes when volatility is near zero.
-        If history contains fewer than 2 points, falls back directly to relative PnL percentage.
+        Strict fitness = Sortino_Ratio * (1 - Max_Drawdown).
+        Falls back to relative PnL when history is degenerate. Preserves sign for elitism ranking.
         """
         if not self.equity_history:
             return 0.0
-
-        # Filter only positive historical equities to prevent ZeroDivisionError or negative basis
-        recent_history = [eq for eq in self.equity_history[-50:] if eq > 0]
-        if not recent_history:
+        recent = [eq for eq in self.equity_history[-50:] if eq is not None]
+        recent = [float(x) for x in recent if isinstance(x, (int, float)) and float(x) > 0]
+        if not recent:
             return 0.0
-
-        current_equity = recent_history[-1]
-        base_capital = self.initial_capital if self.initial_capital > 0 else 100000.0
-        pnl_pct = (current_equity - base_capital) / base_capital
-
-        # Fallback to direct relative PnL if insufficient return variance data exists
-        if len(recent_history) < 2:
-            return round(pnl_pct, 4)
-
-        returns = [
-            (recent_history[i] - recent_history[i - 1]) / recent_history[i - 1]
-            for i in range(1, len(recent_history))
-            if recent_history[i - 1] > 0
-        ]
-        if not returns:
-            return round(pnl_pct, 4)
-
-        avg_return = sum(returns) / len(returns)
-        variance = sum((r - avg_return) ** 2 for r in returns) / len(returns)
-        std_dev = variance ** 0.5
-
-        fitness = pnl_pct / max(std_dev, 0.0001)
-        return round(fitness, 4)
+        base = float(self.initial_capital) if float(self.initial_capital) > 0 else 100000.0
+        pnl_pct = (recent[-1] - base) / base if base > 0 else 0.0
+        if len(recent) < 2:
+            return round(float(pnl_pct), 4)
+        try:
+            sortino = float(self.sortino_ratio())
+            # sortino_ratio already rounded in no-downside path; normalize otherwise
+            mdd = float(self.max_drawdown())
+            fitness = float(sortino) * (1.0 - float(mdd))
+            # Guard NaN/inf, fallback to Sharpe-style PnL/vol
+            if not np.isfinite(fitness):
+                raise ValueError("non-finite fitness")
+            # If sortino collapsed to 0 but PnL nonzero (flat vol), fallback to PnL to preserve ordering
+            if fitness == 0.0 and pnl_pct != 0.0:
+                rets = [(recent[i] - recent[i - 1]) / recent[i - 1] for i in range(1, len(recent)) if recent[i - 1] > 0]
+                if rets:
+                    avg = sum(rets) / len(rets)
+                    var = sum((r - avg) ** 2 for r in rets) / len(rets)
+                    std = max(var ** 0.5, 0.0001)
+                    fitness = float(pnl_pct) / float(std) * (1.0 - float(mdd))
+            return round(float(fitness), 4)
+        except Exception:
+            return round(float(pnl_pct), 4)
 
 
 class EvolutionarySwarmManager:
@@ -70,127 +177,283 @@ class EvolutionarySwarmManager:
         self.population: List[AgentGenome] = self._bootstrap_initial_population()
 
     def _bootstrap_initial_population(self) -> List[AgentGenome]:
-        """Initializes 5 baseline agent genomes aligned with the Risk Parity Optimizer."""
+        """Initializes 5 baseline agent genomes with distinct lineage roots and evolvable traits."""
         baseline_personas = [
-            ("Agent_Alpha", "You are an Aggressive Growth Trader. Focus on high-momentum breakouts, outperforming SPY, and strong MACD expansion. Output high conviction (0.8-1.0) on top technical setups."),
-            ("Agent_Beta", "You are a Conservative Risk Manager. Prioritize capital preservation, low volatility, and tight drawdown control. Issue buy/short signals with high conviction on clear setups."),
-            ("Agent_Gamma", "You are a Mean-Reversion Trader. Exploit overbought (RSI>70) for short entries and oversold (RSI<30) extremes for buys."),
-            ("Agent_Delta", "You are a Volatility Specialist. Exploit MACD trend divergences, shorting weak breakdowns and buying strong regime shifts."),
-            ("Agent_Epsilon", "You are a Macro Balanced Indexer. Maintain broad multi-asset portfolio with long/short tactical overlays and moderate conviction scores.")
+            ("Agent_Alpha", "You are an Aggressive Growth Trader. Focus on high-momentum breakouts, outperforming SPY, and strong MACD expansion. Output high conviction (0.8-1.0) on top technical setups.", 0.55, 0.45, 0.025, 0.050),
+            ("Agent_Beta", "You are a Conservative Risk Manager. Prioritize capital preservation, low volatility, and tight drawdown control. Issue buy/short signals with high conviction on clear setups.", 0.45, 0.55, 0.020, 0.040),
+            ("Agent_Gamma", "You are a Mean-Reversion Trader. Exploit overbought (RSI>70) for short entries and oversold (RSI<30) extremes for buys.", 0.50, 0.50, 0.025, 0.055),
+            ("Agent_Delta", "You are a Volatility Specialist. Exploit MACD trend divergences, shorting weak breakdowns and buying strong regime shifts.", 0.55, 0.45, 0.030, 0.060),
+            ("Agent_Epsilon", "You are a Macro Balanced Indexer. Maintain broad multi-asset portfolio with long/short tactical overlays and moderate conviction scores.", 0.60, 0.40, 0.022, 0.045),
         ]
-        
         return [
             AgentGenome(
-                agent_id=name, 
-                persona_prompt=prompt, 
+                agent_id=name,
+                persona_prompt=prompt,
+                lineage_root=name,
+                generation=1,
                 initial_capital=100000.0,
-                cash=100000.0, 
-                holdings={}, 
-                entry_prices={}, 
+                cash=100000.0,
+                holdings={},
+                entry_prices={},
                 equity_history=[100000.0],
-                tenure_ticks=1000
+                tenure_ticks=1000,
+                is_elite=False,
+                sentiment_weight=sw,
+                technical_weight=tw,
+                stop_loss_pct=sl,
+                take_profit_pct=tp,
             )
-            for name, prompt in baseline_personas
+            for name, prompt, sw, tw, sl, tp in baseline_personas
         ]
 
-    async def run_culling_cycle(self, prices: dict = None, risk_engine = None, db = None, execution_bridge = None):
+    def _lineage_counts(self, agents: List[AgentGenome]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for a in agents:
+            try:
+                root = str(getattr(a, "lineage_root", "") or _derive_lineage_root(a.agent_id, a.persona_prompt))
+            except Exception:
+                root = "Agent_Alpha"
+            counts[root] = counts.get(root, 0) + 1
+        return counts
+
+    def _would_violate_cap(self, agents: List[AgentGenome], candidate_root: str, cap: int = 2) -> bool:
+        try:
+            counts = self._lineage_counts(agents)
+            return counts.get(str(candidate_root), 0) >= cap
+        except Exception:
+            return False
+
+    def _create_immigrant(self, immigrant_num: int, cash: float = 0.0) -> AgentGenome:
+        """Orthogonal immigrant injection when lineage cap blocks elite offspring."""
+        if immigrant_num % 2 == 1:
+            # Archetype A: Mean-Reverting Contrarian (fades RSI >75 / <25)
+            persona = ("You are a Mean-Reverting Contrarian immigrant. Fade extreme RSI >75 with shorts and RSI <25 with buys. "
+                       "Demand RSI confirmation, use tight 1.5pct stops, avoid chasing momentum, prefer reversals to VWAP.")
+            root = "Immigrant_Contrarian"
+            sw, tw, sl, tp = 0.35, 0.65, 0.015, 0.035
+        else:
+            # Archetype B: Low-Beta Volatility Hedger (favors GLD/TLT, tight stops)
+            persona = ("You are a Low-Beta Volatility Hedger immigrant. Favor defensive GLD/TLT, low-beta quality, tight stops, "
+                       "small size, hedge equity beta, prioritize capital preservation over growth.")
+            root = "Immigrant_Hedger"
+            sw, tw, sl, tp = 0.40, 0.60, 0.015, 0.030
+        unique_suffix = uuid.uuid4().hex[:4]
+        new_id = f"Gen{self.current_generation + 1}_Immigrant_v{immigrant_num}_{unique_suffix}"
+        return AgentGenome(
+            agent_id=new_id,
+            persona_prompt=persona,
+            lineage_root=root,
+            generation=self.current_generation + 1,
+            initial_capital=float(cash),
+            cash=float(cash),
+            holdings={},
+            entry_prices={},
+            equity_history=[float(cash)],
+            tenure_ticks=0,
+            is_elite=False,
+            sentiment_weight=sw,
+            technical_weight=tw,
+            stop_loss_pct=sl,
+            take_profit_pct=tp,
+        )
+
+    def _liquidate_agent_to_cash(self, agent: AgentGenome, prices: dict, db=None, execution_bridge=None, reason: str = "CULLING") -> float:
+        """Clean position liquidation: market sell/cover at snapshot prices, credit cash, log trades. Returns recovered equity."""
+        try:
+            prices = prices or {}
+            for tk, shares in list((agent.holdings or {}).items()):
+                try:
+                    qty = float(shares or 0.0)
+                    if qty == 0:
+                        continue
+                    px = float(prices.get(tk, agent.entry_prices.get(tk, 0.0) or 0.0) or 0.0)
+                    if px <= 0:
+                        px = float(agent.entry_prices.get(tk, 1.0) or 1.0)
+                    if qty > 0:
+                        agent.cash = float(agent.cash) + qty * px
+                        action = "SELL"
+                    else:
+                        agent.cash = float(agent.cash) - abs(qty) * px
+                        action = "COVER"
+                    if db is not None:
+                        try:
+                            db.log_trade(agent.agent_id, tk, action, abs(qty), px, 0.0, reason=reason)
+                        except Exception:
+                            pass
+                    if execution_bridge is not None:
+                        try:
+                            if hasattr(execution_bridge, "is_active") and execution_bridge.is_active():
+                                execution_bridge.submit_market_order(tk, abs(qty), action)
+                        except Exception:
+                            pass
+                    agent.holdings[tk] = 0.0
+                    try:
+                        agent.entry_prices[tk] = 0.0
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+            long_val = sum(qty * prices.get(tk, agent.entry_prices.get(tk, 0.0) or 0.0) for tk, qty in (agent.holdings or {}).items() if qty > 0)
+            short_liab = sum(abs(qty) * prices.get(tk, agent.entry_prices.get(tk, 0.0) or 0.0) for tk, qty in (agent.holdings or {}).items() if qty < 0)
+            return max(0.0, round(float(agent.cash) + float(long_val) - float(short_liab), 2))
+        except Exception:
+            try:
+                return max(0.0, float(agent.cash))
+            except Exception:
+                return 0.0
+
+    async def run_culling_cycle(self, prices: dict = None, risk_engine=None, db=None, execution_bridge=None):
         """
-        Executes True Darwinian Selection & Capital Transfer:
-        1. Recalculates exact equity state using current asset prices.
-        2. Ranks agents by risk-adjusted fitness score with tenure grace period protection.
-        3. Liquidates open positions of bottom agents and recovers their equity.
-        4. Mutates winning parent into offspring using Gemma 4-31B.
-        5. Reallocates 100% of recovered culled equity as inherited cash for offspring.
+        Strict-elitism Darwinian selection with lineage capping and immigrant injection:
+        1. Recalculates equity, ranks by fitness = Sortino*(1-MaxDD).
+        2. #1 agent is elite: never liquidated, exempt from culling.
+        3. Enforces max 2 agents per lineage_root; forces alternate parent if cap violated.
+        4. Injects orthogonal immigrants when slots cannot be filled without violating cap.
+        5. Clean liquidation + 100pct cash transfer to offspring (zero-sum).
         """
         logger.info(f"🧬 --- EXECUTING DARWINIAN CULLING & INHERITANCE (GEN {self.current_generation}) ---")
         prices = prices or {}
-
-        # 1. Update in-memory equity state
+        # Backfill lineage for legacy agents
+        for a in self.population:
+            try:
+                if not getattr(a, "lineage_root", None):
+                    a.lineage_root = _derive_lineage_root(a.agent_id, a.persona_prompt)
+                a.is_elite = False
+            except Exception:
+                pass
+        # 1. Update in-memory equity state (mark-to-market symmetric)
         if prices:
             for agent in self.population:
-                long_val = sum(qty * prices.get(tk, agent.entry_prices.get(tk, 0.0)) for tk, qty in agent.holdings.items() if qty > 0)
-                short_liability = sum(abs(qty) * prices.get(tk, agent.entry_prices.get(tk, 0.0)) for tk, qty in agent.holdings.items() if qty < 0)
-                current_eq = round(agent.cash + long_val - short_liability, 2)
-                if not agent.equity_history or agent.equity_history[-1] != current_eq:
-                    agent.equity_history.append(current_eq)
-
-        # 2. Tenure Grace Period: Protect newly spawned agents (< 1000 ticks) from immediate infant mortality
-        immune_agents = [a for a in self.population if a.tenure_ticks < 1000 and a.generation > 1]
-        mature_agents = [a for a in self.population if a not in immune_agents]
-
-        mature_agents.sort(key=lambda x: x.calculate_fitness(), reverse=True)
-        immune_agents.sort(key=lambda x: x.calculate_fitness(), reverse=True)
-
-        for idx, agent in enumerate(self.population):
+                try:
+                    long_val = sum(qty * prices.get(tk, agent.entry_prices.get(tk, 0.0)) for tk, qty in agent.holdings.items() if qty > 0)
+                    short_liability = sum(abs(qty) * prices.get(tk, agent.entry_prices.get(tk, 0.0)) for tk, qty in agent.holdings.items() if qty < 0)
+                    current_eq = round(agent.cash + long_val - short_liability, 2)
+                    if not agent.equity_history or agent.equity_history[-1] != current_eq:
+                        agent.equity_history.append(current_eq)
+                except Exception:
+                    continue
+        # 2. Rank by fitness; mark strict elite
+        ranked = sorted(self.population, key=lambda x: x.calculate_fitness(), reverse=True)
+        elite = ranked[0] if ranked else None
+        if elite is not None:
+            elite.is_elite = True
+            for a in ranked[1:]:
+                a.is_elite = False
+        # Tenure grace: immune infants, but elite always immune even if mature
+        immune_agents = [a for a in ranked if a.tenure_ticks < 1000 and a.generation > 1]
+        mature_agents = [a for a in ranked if a not in immune_agents]
+        for idx, agent in enumerate(ranked):
             logger.info(
                 f"   Rank #{idx+1} | {agent.agent_id:<32} | "
                 f"Fitness: {agent.calculate_fitness():>8.4f} | "
                 f"Equity: ${agent.equity_history[-1]:,.2f} | "
-                f"Tenure: {agent.tenure_ticks} ticks {'(Immune)' if agent in immune_agents else ''}"
+                f"Lineage: {getattr(agent, 'lineage_root', '?')} | "
+                f"Tenure: {agent.tenure_ticks} ticks {'(Elite)' if getattr(agent, 'is_elite', False) else ('(Immune)' if agent in immune_agents else '')}"
             )
-
-        # Select culled agents prioritizing lowest fitness among mature agents first
-        ranked_culling_candidates = list(reversed(mature_agents)) + list(reversed(immune_agents))
-        culled = ranked_culling_candidates[:2]
+        # 3. Select culled: lowest fitness among mature non-elite first, never elite
+        candidates = [a for a in list(reversed(mature_agents)) + list(reversed(immune_agents)) if not getattr(a, "is_elite", False)]
+        # Fallback: if all mature are elite/immune edge, cull lowest non-elite overall
+        if len(candidates) < 2:
+            extra = [a for a in reversed(ranked) if not getattr(a, "is_elite", False) and a not in candidates]
+            candidates += extra
+        culled = candidates[:2]
         survivors = [a for a in self.population if a not in culled]
         survivors.sort(key=lambda x: x.calculate_fitness(), reverse=True)
-
-        # 3. Mutate top performer into 2 offspring
-        parent = survivors[0]
-        offspring_1 = await self._mutate_genome(parent, "Higher Risk Sensitivity & Volatility Protection", 1)
-        offspring_2 = await self._mutate_genome(parent, "Exploit Short-term Momentum Breakouts & Breakdown Shorts", 2)
-
+        # 4. Parent selection with lineage cap (max 2 per root)
+        elite_parent = survivors[0] if survivors else ranked[0]
+        second_parent = None
+        for cand in survivors[1:]:
+            if not self._would_violate_cap([s for s in survivors if s is not elite_parent] + [elite_parent], getattr(cand, "lineage_root", "")):
+                # Simulate post-birth counts: survivors + 2 offspring from elite lineage
+                sim = list(survivors) + [elite_parent]
+                # If both offspring inherit elite root, check cap
+                elite_root = str(getattr(elite_parent, "lineage_root", ""))
+                counts = self._lineage_counts(sim)
+                # offspring would add 2 to elite_root
+                if counts.get(elite_root, 0) + 1 > 2:
+                    # Force alternate lineage for second parent
+                    if str(getattr(cand, "lineage_root", "")) != elite_root:
+                        second_parent = cand
+                        break
+                    continue
+                second_parent = cand
+                break
+        if second_parent is None:
+            for cand in survivors[1:]:
+                if str(getattr(cand, "lineage_root", "")) != str(getattr(elite_parent, "lineage_root", "")):
+                    second_parent = cand
+                    break
+        if second_parent is None and len(survivors) > 1:
+            second_parent = survivors[1]
+        elif second_parent is None:
+            second_parent = elite_parent
+        # 5. Spawn offspring, respecting cap via immigrants
+        offspring_1 = await self._mutate_genome(elite_parent, "Higher Risk Sensitivity & Volatility Protection", 1)
+        # Decide offspring_2: elite clone vs alternate parent vs immigrant
+        elite_root = str(getattr(elite_parent, "lineage_root", ""))
+        surv_roots = self._lineage_counts(survivors)
+        # Projected count if offspring_2 also from elite
+        proj_elite = surv_roots.get(elite_root, 0) + 2  # off1 + off2 both elite
+        if proj_elite > 2:
+            # Try alternate parent offspring
+            alt_root = str(getattr(second_parent, "lineage_root", ""))
+            proj_alt = surv_roots.get(alt_root, 0) + 1
+            if alt_root != elite_root and proj_alt <= 2:
+                offspring_2 = await self._mutate_genome(second_parent, "Exploit Short-term Momentum Breakouts & Breakdown Shorts", 2)
+            else:
+                # Orthogonal immigrant injection
+                offspring_2 = self._create_immigrant(2, cash=0.0)
+                logger.warning(f"  🧬 Lineage cap blocked elite clone; injected orthogonal {offspring_2.lineage_root} [{offspring_2.agent_id}]")
+        else:
+            offspring_2 = await self._mutate_genome(second_parent if second_parent is not elite_parent else elite_parent, "Exploit Short-term Momentum Breakouts & Breakdown Shorts", 2)
+        # Final safety: if survivors + offspring violate cap, convert off2 to immigrant
+        final_counts = self._lineage_counts(survivors + [offspring_1, offspring_2])
+        if any(v > 2 for v in final_counts.values()):
+            offspring_2 = self._create_immigrant(2, cash=0.0)
+            logger.warning(f"  🧬 Post-hoc lineage enforcement; replaced with {offspring_2.lineage_root} [{offspring_2.agent_id}]")
         recipient_ids = [offspring_1.agent_id, offspring_2.agent_id]
-
-        # 4. Liquidate culled agents & transfer capital atomically
+        # 6. Clean liquidation + capital transfer (zero-sum)
         total_recovered_equity = 0.0
-
         for dead in culled:
-            dead_long_val = sum(qty * prices.get(tk, dead.entry_prices.get(tk, 0.0)) for tk, qty in dead.holdings.items() if qty > 0)
-            dead_short_liability = sum(abs(qty) * prices.get(tk, dead.entry_prices.get(tk, 0.0)) for tk, qty in dead.holdings.items() if qty < 0)
-            dead_total_equity = max(0.0, dead.cash + dead_long_val - dead_short_liability)
+            dead_total_equity = self._liquidate_agent_to_cash(dead, prices, db=None, execution_bridge=None, reason="CULLING")
             total_recovered_equity += dead_total_equity
-
-            # Execute database liquidation & capital transfer
             if db:
-                db.cull_and_reallocate(
-                    loser_agent_id=dead.agent_id,
-                    recipient_agent_ids=recipient_ids,
-                    current_prices=prices,
-                    execution_bridge=execution_bridge
-                )
-
-            # Zero out memory state for culled agent
+                try:
+                    db.cull_and_reallocate(
+                        loser_agent_id=dead.agent_id,
+                        recipient_agent_ids=recipient_ids,
+                        current_prices=prices,
+                        execution_bridge=execution_bridge
+                    )
+                except Exception as e:
+                    logger.warning(f"Cull DB note [{dead.agent_id}]: {e}")
             dead.cash = 0.0
             dead.holdings = {}
             dead.entry_prices = {}
             dead.equity_history.append(0.0)
+            dead.is_elite = False
             logger.warning(f"  💀 CULLED & LIQUIDATED: {dead.agent_id} (Recovered Equity: ${dead_total_equity:,.2f})")
-
-        # 5. Distribute inherited capital equally to offspring in memory (Atomic Zero-Sum Conservation)
         share_per_offspring_1 = round(total_recovered_equity / 2.0, 2) if recipient_ids else 0.0
         share_per_offspring_2 = round(total_recovered_equity - share_per_offspring_1, 2) if recipient_ids else 0.0
-
         offspring_1.cash = share_per_offspring_1
         offspring_1.initial_capital = share_per_offspring_1
         offspring_1.equity_history = [share_per_offspring_1]
         offspring_1.tenure_ticks = 0
-
+        offspring_1.is_elite = False
         offspring_2.cash = share_per_offspring_2
         offspring_2.initial_capital = share_per_offspring_2
         offspring_2.equity_history = [share_per_offspring_2]
         offspring_2.tenure_ticks = 0
-
+        offspring_2.is_elite = False
         logger.info(f"🎁 [INHERITANCE] Offspring [{offspring_1.agent_id}] (${share_per_offspring_1:,.2f}) and [{offspring_2.agent_id}] (${share_per_offspring_2:,.2f}) successfully instantiated!")
-
-        # 6. Update population state
         self.current_generation += 1
         self.population = survivors + [offspring_1, offspring_2]
-
         if db:
             for agent in self.population:
-                db.register_agent(agent.agent_id)
-        
+                try:
+                    db.register_agent(agent.agent_id)
+                except Exception:
+                    pass
         logger.info(f"🎉 Generation {self.current_generation} successfully spawned with 5 active agents!")
         return [dead.agent_id for dead in culled], recipient_ids
 
@@ -282,17 +545,45 @@ Return ONLY a valid JSON object: {{"new_prompt": "string"}}
         base_parent_name = re.sub(r'_v\d+.*$', '', base_parent_name)
         unique_suffix = uuid.uuid4().hex[:4]
         new_id = f"Gen{self.current_generation + 1}_{base_parent_name}_v{offspring_num}_{unique_suffix}"
-        
         logger.info(f"  👶 MUTATED OFFSPRING CREATED: {new_id}")
-        
+        # Evolvable quantitative traits via Gaussian perturbations, renormalized to sum 1.0
+        try:
+            parent_sw = float(getattr(parent, "sentiment_weight", 0.55))
+            parent_tw = float(getattr(parent, "technical_weight", 0.45))
+            parent_sl = float(getattr(parent, "stop_loss_pct", 0.025))
+            parent_tp = float(getattr(parent, "take_profit_pct", 0.050))
+        except Exception:
+            parent_sw, parent_tw, parent_sl, parent_tp = 0.55, 0.45, 0.025, 0.050
+        child_sw = _mutate_trait(parent_sw, 0.20, 0.80, sigma=0.02)
+        child_tw = _mutate_trait(parent_tw, 0.20, 0.80, sigma=0.02)
+        s = child_sw + child_tw
+        if s > 0:
+            child_sw = round(child_sw / s, 4)
+            child_tw = round(1.0 - child_sw, 4)
+        child_sl = _mutate_trait(parent_sl, 0.015, 0.045, sigma=0.02)
+        # Take-profit uses smaller sigma relative to wider range to avoid excessive jumps
+        try:
+            child_tp = float(np.clip(float(parent_tp) + float(np.random.normal(0, 0.02)), 0.030, 0.090))
+        except Exception:
+            child_tp = float(np.clip(float(parent_tp), 0.030, 0.090))
+        try:
+            parent_root = str(getattr(parent, "lineage_root", "") or _derive_lineage_root(parent.agent_id, parent.persona_prompt))
+        except Exception:
+            parent_root = "Agent_Alpha"
         return AgentGenome(
             agent_id=new_id,
             persona_prompt=mutated_prompt,
+            lineage_root=parent_root,
             generation=self.current_generation + 1,
             initial_capital=0.0,
             cash=0.0,
             holdings={},
             entry_prices={},
             equity_history=[0.0],
-            tenure_ticks=0
+            tenure_ticks=0,
+            is_elite=False,
+            sentiment_weight=round(float(child_sw), 4),
+            technical_weight=round(float(child_tw), 4),
+            stop_loss_pct=round(float(child_sl), 4),
+            take_profit_pct=round(float(child_tp), 4),
         )

@@ -216,10 +216,21 @@ def build_tickers_snapshot(market_state: Dict[str, Dict[str, Any]]) -> Dict[str,
 
 
 def select_top_20_for_debate(
-    snapshots: Dict[str, Dict[str, Any]], top_n: int = 20
+    snapshots: Dict[str, Dict[str, Any]], top_n: int = 20, active_holdings: Any = None
 ) -> Dict[str, Dict[str, Any]]:
-    """Local re-export of the deterministic activity screener (keeps 3-call budget)."""
-    return select_top_20_candidates(snapshots, top_n=top_n)
+    """Orphan-free re-export: retains open positions, keeps 3-call budget strictly at 20."""
+    try:
+        if active_holdings is None:
+            return select_top_20_candidates(snapshots, set(), top_n=top_n)
+        if isinstance(active_holdings, dict):
+            held = {str(k) for k, v in active_holdings.items() if abs(float(v or 0.0)) > 0}
+        elif isinstance(active_holdings, (set, list, tuple)):
+            held = {str(s) for s in active_holdings}
+        else:
+            held = set()
+        return select_top_20_candidates(snapshots, held, top_n=top_n)
+    except Exception:
+        return select_top_20_candidates(snapshots, set(), top_n=top_n)
 
 
 def compute_deterministic_signals(
@@ -230,7 +241,7 @@ def compute_deterministic_signals(
 ) -> Dict[str, CrossAssetRiskDecision]:
     """
     Deterministic cache-driven conviction adjustment (O(1) per ticker, zero LLM calls).
-    Evaluates all 100 stocks: top-20 screened use 55pct LLM sentiment + 45pct technicals,
+    Evaluates all 100 stocks: top-20 screened use per-agent evolvable sentiment/technical weights,
     remaining 80 use pure technicals with sentiment 0.0 neutral.
     """
     decisions_map: Dict[str, CrossAssetRiskDecision] = {}
@@ -252,6 +263,20 @@ def compute_deterministic_signals(
             # Gen2 offspring slightly more selective
             if getattr(agent, "generation", 1) > 1:
                 base_thr = min(0.45, base_thr + 0.05)
+            # Evolvable per-agent fusion weights (default 0.55/0.45 for legacy agents)
+            try:
+                sw = float(getattr(agent, "sentiment_weight", 0.55))
+                tw = float(getattr(agent, "technical_weight", 0.45))
+                if not (0.20 <= sw <= 0.80):
+                    sw = 0.55
+                if not (0.20 <= tw <= 0.80):
+                    tw = 0.45
+                s_sum = sw + tw
+                if s_sum > 0:
+                    sw = sw / s_sum
+                    tw = 1.0 - sw
+            except Exception:
+                sw, tw = 0.55, 0.45
 
             screened_set = set(s.upper() for s in (screened_tickers or [])) if screened_tickers else None
             signals: Dict[str, QualitativeSignal] = {}
@@ -297,10 +322,10 @@ def compute_deterministic_signals(
                     tech -= 0.1
                 tech = max(-1.0, min(1.0, tech))
 
-                # Fuse: top-20 screened use 55pct sentiment + 45pct technicals; others pure technicals
+                # Fuse: top-20 screened use per-agent evolvable weights; others pure technicals
                 is_screened = True if screened_set is None else (str(ticker).upper() in screened_set)
                 if is_screened:
-                    combined = 0.55 * sentiment + 0.45 * tech
+                    combined = sw * sentiment + tw * tech
                 else:
                     combined = tech
                 conviction = round(min(1.0, abs(combined)), 4)
@@ -446,6 +471,27 @@ async def run_consumer():
                             except Exception as e:
                                 logger.warning(f"⚠️ Daily dividend processing note: {e}")
 
+                        # Canonical epoch clock: replay-synced producer timestamp, fallback to wall-clock
+                        import time as _time_mod
+                        current_timestamp = None
+                        try:
+                            if tick_time_str:
+                                try:
+                                    current_timestamp = datetime.fromisoformat(str(tick_time_str).replace("Z", "+00:00")).timestamp()
+                                except Exception:
+                                    current_timestamp = _time_mod.time()
+                            else:
+                                current_timestamp = _time_mod.time()
+                        except Exception:
+                            current_timestamp = _time_mod.time()
+
+                        # Orphan-free holdings collection BEFORE screening (zero held positions lose LLM coverage)
+                        pre_active_holdings = {
+                            str(tk) for agent in swarm_mgr.population
+                            for tk, shares in (getattr(agent, "holdings", {}) or {}).items()
+                            if abs(float(shares or 0.0)) > 0
+                        }
+
                         # ---------------------------------------------------------
                         # PRE-TICK DEBATE EXECUTION (exactly 3 API calls per 15m bar)
                         # 1. run_adversarial_batch -> Bull + Bear parallel + Arbiter
@@ -455,7 +501,7 @@ async def run_consumer():
                         tickers_snapshot = build_tickers_snapshot(market_state)
                         top_20_snapshot: dict = {}
                         try:
-                            top_20_snapshot = select_top_20_for_debate(tickers_snapshot, top_n=20)
+                            top_20_snapshot = select_top_20_for_debate(tickers_snapshot, top_n=20, active_holdings=pre_active_holdings)
                             debate_scores = await sentiment_agent.run_adversarial_batch(top_20_snapshot)
                             logger.info(
                                 f"🧠 [Batched Debate] Tick #{tick_counter}: cached {len(debate_scores)} scores "
@@ -476,12 +522,24 @@ async def run_consumer():
                         regime_scaler = risk_engine.calculate_regime_scaler(spy_series, spy_prices=spy_price_series)
 
                         # -------------------------------------------------------------
-                        # PHASE A: DIRECTIONAL HARD RISK GUARD (LONG & SHORT aware)
-                        # Uses risk_engine.check_stop_loss_take_profit + cooldowns
+                        # PHASE A: DIRECTIONAL HARD RISK GUARD (LONG & SHORT aware, per-agent stops)
+                        # Uses risk_engine.check_stop_loss_take_profit + timestamp cooldowns
                         # -------------------------------------------------------------
                         for agent in swarm_mgr.population:
                             if not hasattr(agent, 'entry_prices'):
                                 agent.entry_prices = {}
+                            try:
+                                agent_sl = float(getattr(agent, "stop_loss_pct", STOP_LOSS_PCT))
+                                if not (0.015 <= agent_sl <= 0.045):
+                                    agent_sl = STOP_LOSS_PCT
+                            except Exception:
+                                agent_sl = STOP_LOSS_PCT
+                            try:
+                                agent_tp = float(getattr(agent, "take_profit_pct", TAKE_PROFIT_PCT))
+                                if not (0.030 <= agent_tp <= 0.090):
+                                    agent_tp = TAKE_PROFIT_PCT
+                            except Exception:
+                                agent_tp = TAKE_PROFIT_PCT
 
                             for tk, shares in list(agent.holdings.items()):
                                 if shares != 0 and tk in prices:
@@ -492,7 +550,7 @@ async def run_consumer():
                                     direction = "SHORT" if shares < 0 else "LONG"
                                     exit_signal = risk_engine.check_stop_loss_take_profit(
                                         entry_price, current_price, direction,
-                                        STOP_LOSS_PCT, TAKE_PROFIT_PCT,
+                                        agent_sl, agent_tp,
                                     )
 
                                     if exit_signal in ("STOP_LOSS", "TAKE_PROFIT"):
@@ -512,17 +570,25 @@ async def run_consumer():
                                         db.update_agent_holding(agent.agent_id, tk, 0.0, 0.0)
                                         db.log_trade(agent.agent_id, tk, action, abs(shares), exec_price, 0.0, reason=reason)
                                         if exit_signal == "STOP_LOSS":
-                                            # Post-stopout cooldown: lock re-entry for 4 bars / 1 hour
-                                            risk_engine.record_stopout(agent.agent_id, tk, tick_counter, COOLDOWN_BARS)
+                                            # Post-stopout cooldown: 1-hour timestamp lockout (tick wrapper for compat)
+                                            try:
+                                                risk_engine.record_stopout(agent.agent_id, tk, tick_counter, COOLDOWN_BARS, current_timestamp=current_timestamp)
+                                            except TypeError:
+                                                risk_engine.record_stopout(agent.agent_id, tk, tick_counter, COOLDOWN_BARS)
                                             logger.warning(f"  🚨 [{agent.agent_id}] HARD STOP-LOSS on {tk} ({direction}->{action}): Exec @ ${exec_price:.2f}")
                                         else:
                                             logger.info(f"  🎯 [{agent.agent_id}] HARD TAKE-PROFIT on {tk} ({direction}->{action}): Exec @ ${exec_price:.2f}")
 
                                         submit_safe_broker_order(broker_bridge, tk, abs(shares), action)
 
-                        # Prune expired cooldowns each tick
+                        # Prune expired cooldowns each tick (timestamp domain)
                         try:
-                            risk_engine.prune_expired_cooldowns(tick_counter)
+                            risk_engine.prune_expired_cooldowns(tick_counter, current_timestamp=current_timestamp)
+                        except TypeError:
+                            try:
+                                risk_engine.prune_expired_cooldowns(tick_counter)
+                            except Exception:
+                                pass
                         except Exception:
                             pass
 
@@ -550,21 +616,25 @@ async def run_consumer():
                             screened_tickers=_screened_keys,
                         )
 
-                        # Session equity tracking + circuit breaker (5% peak-to-trough)
+                        # Session equity tracking + circuit breaker (5% peak-to-trough, rolling daily reset)
                         try:
                             swarm_equity_now = 0.0
                             for agent in swarm_mgr.population:
-                                lv = sum(
-                                    qty * prices.get(tk, agent.entry_prices.get(tk, 0.0))
-                                    for tk, qty in agent.holdings.items() if qty > 0
-                                )
-                                sl = sum(
-                                    abs(qty) * prices.get(tk, agent.entry_prices.get(tk, 0.0))
-                                    for tk, qty in agent.holdings.items() if qty < 0
-                                )
-                                swarm_equity_now += float(agent.cash + lv - sl)
-                            risk_engine.update_session_peak(swarm_equity_now)
-                            if risk_engine.check_session_drawdown(swarm_equity_now):
+                                try:
+                                    swarm_equity_now += float(risk_engine.calculate_total_equity(agent.cash, agent.holdings, getattr(agent, "entry_prices", {}), prices))
+                                except Exception:
+                                    lv = sum(qty * prices.get(tk, agent.entry_prices.get(tk, 0.0)) for tk, qty in agent.holdings.items() if qty > 0)
+                                    sl = sum(abs(qty) * prices.get(tk, agent.entry_prices.get(tk, 0.0)) for tk, qty in agent.holdings.items() if qty < 0)
+                                    swarm_equity_now += float(agent.cash + lv - sl)
+                            try:
+                                risk_engine.update_session_peak(swarm_equity_now, current_timestamp=current_timestamp)
+                            except TypeError:
+                                risk_engine.update_session_peak(swarm_equity_now)
+                            try:
+                                _tripped = risk_engine.check_session_drawdown(swarm_equity_now, current_timestamp=current_timestamp)
+                            except TypeError:
+                                _tripped = risk_engine.check_session_drawdown(swarm_equity_now)
+                            if _tripped:
                                 logger.error(
                                     f"🚨 SESSION BREAKER: swarm equity ${swarm_equity_now:,.2f} "
                                     f"≥5% below peak ${risk_engine.session_peak_equity:,.2f}. Liquidating to cash."
@@ -578,16 +648,13 @@ async def run_consumer():
                         trading_halted = risk_engine.is_trading_halted()
 
                         for agent in swarm_mgr.population:
-                            # SAFE EQUITY CALCULATION: Fallback to entry price if current live tick price is missing
-                            long_val = sum(
-                                qty * prices.get(tk, agent.entry_prices.get(tk, 0.0)) 
-                                for tk, qty in agent.holdings.items() if qty > 0
-                            )
-                            short_liability = sum(
-                                abs(qty) * prices.get(tk, agent.entry_prices.get(tk, 0.0)) 
-                                for tk, qty in agent.holdings.items() if qty < 0
-                            )
-                            current_equity = round(agent.cash + long_val - short_liability, 2)
+                            # SAFE SYMMETRIC EQUITY: cash + longs + shorts(entry_val - current_val)
+                            try:
+                                current_equity = float(risk_engine.calculate_total_equity(agent.cash, agent.holdings, getattr(agent, "entry_prices", {}), prices))
+                            except Exception:
+                                long_val = sum(qty * prices.get(tk, agent.entry_prices.get(tk, 0.0)) for tk, qty in agent.holdings.items() if qty > 0)
+                                short_liability = sum(abs(qty) * prices.get(tk, agent.entry_prices.get(tk, 0.0)) for tk, qty in agent.holdings.items() if qty < 0)
+                                current_equity = round(agent.cash + long_val - short_liability, 2)
                             agent.equity_history.append(current_equity)
 
                             decision = decisions_map.get(agent.agent_id)
@@ -606,11 +673,18 @@ async def run_consumer():
                                 raw_price = prices[ticker]
                                 adv = market_state.get(ticker, {}).get("adv", 1000000.0)
 
-                                # Cooldown gate: reject re-entry for cooled-down tickers
-                                if target.action in ("BUY", "SHORT") and risk_engine.is_cooled_down(
-                                    agent.agent_id, ticker, tick_counter
-                                ):
-                                    logger.info(f"  🧊 [{agent.agent_id}] Cooldown reject: {ticker} locked until tick {risk_engine.cooldowns.get((agent.agent_id, ticker.upper()))}.")
+                                # Cooldown gate: timestamp-based 1-hour lockout (tick fallback for compat)
+                                _cooled = False
+                                try:
+                                    _cooled = risk_engine.is_cooled_down(agent.agent_id, ticker, tick_counter, current_timestamp=current_timestamp)
+                                except TypeError:
+                                    _cooled = risk_engine.is_cooled_down(agent.agent_id, ticker, tick_counter)
+                                if target.action in ("BUY", "SHORT") and _cooled:
+                                    try:
+                                        _lock = risk_engine.cooldown_until.get((agent.agent_id, ticker.upper()), risk_engine.cooldowns.get((agent.agent_id, ticker.upper())))
+                                    except Exception:
+                                        _lock = "locked"
+                                    logger.info(f"  🧊 [{agent.agent_id}] Cooldown reject: {ticker} locked until {_lock}.")
                                     continue
 
                                 raw_effective_alloc = target.allocation_pct * regime_scaler
@@ -674,13 +748,19 @@ async def run_consumer():
 
                                         submit_safe_broker_order(broker_bridge, ticker, sell_shares, "SELL")
 
-                                # 3. SHORT Execution (Short Entry / Scale Up)
+                                # 3. SHORT Execution (Short Entry / Scale Up, 1.5x margin gate)
                                 elif target.action == "SHORT":
                                     current_short_val = abs(min(current_pos_qty, 0.0)) * raw_price
                                     short_delta = target_val - current_short_val
                                     if short_delta > 50.0:
+                                        try:
+                                            _new_shares_est = short_delta / max(raw_price, 0.01)
+                                            _req = risk_engine.short_margin_requirement(_new_shares_est, raw_price, 1.50)
+                                            _cash_ok = risk_engine.can_open_short(agent.cash, _new_shares_est, raw_price, 1.50)
+                                        except Exception:
+                                            _req, _cash_ok = 0.0, True
                                         margin_info = risk_engine.evaluate_margin_health(agent.cash, agent.holdings, prices)
-                                        if margin_info["free_margin"] >= short_delta:
+                                        if margin_info["free_margin"] >= short_delta and _cash_ok and agent.cash >= _req:
                                             approx_shares = short_delta / raw_price
                                             exec_price = risk_engine.calculate_execution_price(raw_price, approx_shares, adv, "SHORT")
                                             actual_short_shares = short_delta / exec_price

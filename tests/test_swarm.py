@@ -896,3 +896,149 @@ def test_unscreened_ticker_sentiment_fallback():
         assert len(out) == 1
     import asyncio as _asyncio
     _asyncio.run(_test())
+
+
+# ------------------------------------------
+# 9. MISSION HARDENING INVARIANTS
+# ------------------------------------------
+
+def test_screener_retains_open_positions():
+    """Tickers with active holdings are preserved in 20-stock batch even if activity is zero."""
+    from sentiment_agent import select_top_20_candidates
+    snap = _make_100_snapshot()
+    # Force two held tickers to zero activity (flat momentum, zero volume)
+    held = set(list(snap.keys())[:2])
+    for tk in held:
+        snap[tk]["momentum"] = 0.0
+        snap[tk]["momentum_15m"] = 0.0
+        snap[tk]["volume"] = 0.0
+        snap[tk]["atr"] = 0.1
+    top20 = select_top_20_candidates(snap, held, top_n=20)
+    assert len(top20) == 20
+    for tk in held:
+        assert tk in top20, f"Held {tk} orphaned from LLM batch!"
+    # Overflow: >=20 holdings -> top 20 by activity among held only
+    many_held = set(list(snap.keys())[:25])
+    top20_many = select_top_20_candidates(snap, many_held, top_n=20)
+    assert len(top20_many) == 20
+    assert set(top20_many.keys()).issubset(many_held)
+    # Backward compat: legacy positional top_n still works
+    legacy = select_top_20_candidates(snap, 20)
+    assert len(legacy) == 20
+
+
+def test_elitism_preserves_top_agent():
+    """#1 performer is never culled and preserves equity across epochs."""
+    async def _test():
+        mgr = EvolutionarySwarmManager(api_key="", population_size=5)
+        mgr.population[0].agent_id = "Agent_Alpha"
+        mgr.population[0].cash = 200000.0
+        mgr.population[0].equity_history = [100000.0, 150000.0, 180000.0, 200000.0]
+        mgr.population[0].tenure_ticks = 1000
+        for i in range(1, 5):
+            mgr.population[i].cash = 80000.0 - i * 1000
+            mgr.population[i].equity_history = [100000.0, 90000.0, 80000.0 - i * 1000]
+            mgr.population[i].tenure_ticks = 1000
+        elite_equity = mgr.population[0].equity_history[-1]
+        culled_ids, _ = await mgr.run_culling_cycle(prices={})
+        assert "Agent_Alpha" not in culled_ids
+        elites = [a for a in mgr.population if a.agent_id == "Agent_Alpha"]
+        assert len(elites) == 1
+        assert elites[0].is_elite is True
+        assert elites[0].equity_history[-1] == elite_equity
+        assert elites[0].cash == elite_equity
+    asyncio.run(_test())
+
+
+def test_lineage_cap_enforcement():
+    """No single ancestor lineage exceeds 2 agents after 3 evolutionary cycles."""
+    async def _test():
+        mgr = EvolutionarySwarmManager(api_key="", population_size=5)
+        for cycle in range(3):
+            for a in mgr.population:
+                a.tenure_ticks = 1000
+            # Force fitness spread so culling is deterministic
+            ranked_cash = [140000.0, 120000.0, 110000.0, 80000.0, 70000.0]
+            for a, c in zip(sorted(mgr.population, key=lambda x: x.agent_id), ranked_cash):
+                a.cash = c
+                a.holdings = {}
+                a.entry_prices = {}
+                a.equity_history = [100000.0, c]
+            await mgr.run_culling_cycle(prices={})
+            assert len(mgr.population) == 5
+            counts = {}
+            for a in mgr.population:
+                r = getattr(a, "lineage_root", "unknown")
+                counts[r] = counts.get(r, 0) + 1
+            for root, n in counts.items():
+                assert n <= 2, f"Lineage {root} has {n} agents after cycle {cycle+1}: {counts}"
+    asyncio.run(_test())
+
+
+def test_timestamp_cooldown():
+    """Cooldown respects real-time epoch intervals rather than tick counts."""
+    eng = AdvancedRiskEngine(cooldown_bars=4)
+    t0 = 1700000000.0
+    eng.record_stopout_ts("Agent_Alpha", "NVDA", t0)
+    assert eng.cooldown_until[("Agent_Alpha", "NVDA")] == t0 + 3600.0
+    assert eng.is_cooled_down("Agent_Alpha", "NVDA", t0 + 100, current_timestamp=t0 + 100) is True
+    assert eng.should_allow_entry("Agent_Alpha", "NVDA", t0 + 100, current_timestamp=t0 + 100) is False
+    assert eng.is_cooled_down("Agent_Alpha", "NVDA", t0 + 3599, current_timestamp=t0 + 3599) is True
+    assert eng.should_allow_entry("Agent_Alpha", "NVDA", t0 + 3601, current_timestamp=t0 + 3601) is True
+    assert eng.is_cooled_down("Agent_Alpha", "NVDA", t0 + 3600, current_timestamp=t0 + 3600) is False
+    # Tick-domain backward compat still intact
+    eng2 = AdvancedRiskEngine(cooldown_bars=4)
+    assert eng2.record_stopout("Agent_Beta", "AAPL", current_tick=10) == 14
+    assert eng2.is_cooled_down("Agent_Beta", "AAPL", 13) is True
+    assert eng2.is_cooled_down("Agent_Beta", "AAPL", 14) is False
+
+
+def test_circuit_breaker_daily_reset():
+    """Trading automatically unhalts when session clock rolls over + manual reset works."""
+    eng = AdvancedRiskEngine(session_drawdown_pct=0.05)
+    t0 = 1700000000.0
+    eng.last_session_reset = t0
+    try:
+        from datetime import datetime, timezone as _tz
+        eng.last_session_date = datetime.fromtimestamp(t0, tz=_tz.utc).strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    assert eng.check_session_drawdown(500000.0, current_timestamp=t0) is False
+    assert eng.check_session_drawdown(470000.0, current_timestamp=t0 + 100) is True
+    assert eng.is_trading_halted() is True
+    # Rollover after 86400s auto-resets even though drawdown persists
+    assert eng.check_session_drawdown(470000.0, current_timestamp=t0 + 86400.0 + 10) is False
+    assert eng.is_trading_halted() is False
+    # Manual reset path
+    eng.check_session_drawdown(440000.0, current_timestamp=t0 + 86500.0)
+    # Force trip again from new peak
+    eng.session_peak_equity = 500000.0
+    eng.circuit_breaker_tripped = True
+    eng.trading_halted = True
+    status = eng.reset_circuit_breaker(480000.0)
+    assert eng.is_trading_halted() is False
+    assert eng.session_peak_equity == 480000.0
+    assert status["trading_halted"] is False
+
+
+def test_short_position_equity_symmetry():
+    """5pct gain on short yields identical equity expansion as 5pct gain on long."""
+    eng = AdvancedRiskEngine()
+    # Long: 100 sh @100 -> 105 (+5pct)
+    long_eq = eng.calculate_total_equity(100000.0, {"AAPL": 100.0}, {"AAPL": 100.0}, {"AAPL": 105.0})
+    # Short: proceeds 100*100=10000 added to cash -> cash 110000, entry 100, current 95 (-5pct price = +5pct short)
+    short_eq = eng.calculate_total_equity(110000.0, {"AAPL": -100.0}, {"AAPL": 100.0}, {"AAPL": 95.0})
+    # Long equity: 100000 + 10500 = 110500
+    assert long_eq == 110500.0
+    # Short equity: 110000 + (10000-9500)=110500 symmetric
+    assert short_eq == 110500.0
+    assert long_eq == short_eq
+    # Margin requirement 1.5x
+    assert eng.short_margin_requirement(100.0, 100.0, 1.50) == 15000.0
+    assert eng.can_open_short(15000.0, 100.0, 100.0) is True
+    assert eng.can_open_short(14999.0, 100.0, 100.0) is False
+    # Evolvable genome bounds + renormalization
+    g = AgentGenome(agent_id="Agent_Alpha", persona_prompt="test", sentiment_weight=0.9, technical_weight=0.9)
+    assert 0.20 <= g.sentiment_weight <= 0.80
+    assert 0.20 <= g.technical_weight <= 0.80
+    assert abs((g.sentiment_weight + g.technical_weight) - 1.0) < 1e-6
