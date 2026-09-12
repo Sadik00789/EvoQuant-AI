@@ -778,3 +778,121 @@ def test_session_circuit_breaker():
     assert engine.check_session_drawdown(494000.0) is True
     assert engine.is_trading_halted() is True
     assert engine.should_allow_entry("Agent_Alpha", "NVDA", 99) is False
+
+# ------------------------------------------
+# 8. TOP-20 DYNAMIC SCREENER 100 TO 20
+# ------------------------------------------
+
+def _make_100_snapshot():
+    from data_producer import UNIVERSE
+    snap = {}
+    for i, tk in enumerate(UNIVERSE):
+        # Activity gradient: momentum grows with i, volume grows with i
+        snap[tk] = {
+            "open": 100.0 + i,
+            "high": 102.0 + i,
+            "low": 99.0 + i,
+            "close": 101.0 + i,
+            "volume": 100000.0 + i * 50000.0,
+            "rsi": 55.0,
+            "rsi14": 55.0,
+            "momentum": 0.05 + i * 0.02,
+            "momentum_15m": 0.05 + i * 0.02,
+            "macd_hist": 0.05,
+            "atr": 1.5,
+            "rel_strength_spy": 0.5,
+            "adv": 5000000.0,
+            "headlines": "Steady.",
+        }
+    return snap
+
+
+def test_top_20_screener_selection():
+    """Feeds 100 mock snapshots and asserts exactly 20 highest-activity tickers filtered."""
+    from sentiment_agent import select_top_20_candidates
+    from data_producer import UNIVERSE
+    assert len(UNIVERSE) == 100, f"UNIVERSE must be 100, got {len(UNIVERSE)}"
+    snap = _make_100_snapshot()
+    top20 = select_top_20_candidates(snap, top_n=20)
+    assert len(top20) == 20, f"Expected 20, got {len(top20)}"
+    # Highest activity = highest index (largest momentum x volume)
+    import math
+    def _score(e):
+        return abs(e["momentum_15m"]) * math.log1p(e["volume"])
+    ranked_all = sorted(snap.items(), key=lambda kv: _score(kv[1]), reverse=True)
+    expected_keys = [k for k, _ in ranked_all[:20]]
+    assert set(top20.keys()) == set(expected_keys)
+
+
+def test_batched_debate_receives_only_20():
+    """Confirms LLM payload only contains 20 items even when producer provides 100."""
+    from sentiment_agent import NewsSentimentAgent, select_top_20_candidates
+    async def _test():
+        agent = NewsSentimentAgent(api_key="test_dummy_key")
+        snap100 = _make_100_snapshot()
+        assert len(snap100) == 100
+        top20 = select_top_20_candidates(snap100, top_n=20)
+        assert len(top20) == 20
+        seen_payload_size = {}
+        orig_bull = agent._generate_bull_theses
+        orig_bear = agent._generate_bear_theses
+        async def wrap_bull(s):
+            seen_payload_size["n"] = len(s)
+            return "- NVDA: bullish"
+        async def wrap_bear(s):
+            assert len(s) == 20
+            return "- NVDA: bearish"
+        async def fake_arb(prompt, temperature=0.1, max_tokens=2048):
+            import json as _json
+            # Arbiter prompt must mention only screened tickers count via JSON keys
+            return _json.dumps({tk: 0.1 for tk in top20.keys()})
+        from unittest.mock import patch as _patch
+        with _patch.object(agent, "_generate_bull_theses", side_effect=wrap_bull), _patch.object(
+            agent, "_generate_bear_theses", side_effect=wrap_bear
+        ), _patch.object(agent, "_call_gemini_text", side_effect=fake_arb):
+            scores = await agent.run_adversarial_batch(top20)
+        assert seen_payload_size["n"] == 20
+        assert len(scores) == 20
+    import asyncio as _asyncio
+    _asyncio.run(_test())
+
+
+def test_unscreened_ticker_sentiment_fallback():
+    """Verifies non-screened tickers return 0.0 neutral gracefully."""
+    from sentiment_agent import NewsSentimentAgent, select_top_20_candidates
+    async def _test():
+        agent = NewsSentimentAgent(api_key="test_dummy_key")
+        snap100 = _make_100_snapshot()
+        top20 = select_top_20_candidates(snap100, top_n=20)
+        unscreened = [k for k in snap100.keys() if k not in top20][0]
+        # Before debate, unscreened returns 0.0
+        assert agent.cache.get_sentiment(unscreened) == 0.0
+        # After debate on top20 only, unscreened still 0.0, screened has score
+        async def fake_bull(s):
+            return "bull"
+        async def fake_bear(s):
+            return "bear"
+        async def fake_arb(prompt, temperature=0.1, max_tokens=2048):
+            import json as _json
+            return _json.dumps({tk: 0.5 for tk in top20.keys()})
+        from unittest.mock import patch as _patch
+        with _patch.object(agent, "_generate_bull_theses", side_effect=fake_bull), _patch.object(
+            agent, "_generate_bear_theses", side_effect=fake_bear
+        ), _patch.object(agent, "_call_gemini_text", side_effect=fake_arb):
+            await agent.run_adversarial_batch(top20)
+        assert agent.cache.get_sentiment(unscreened) == 0.0
+        screened_one = list(top20.keys())[0]
+        assert agent.cache.get_sentiment(screened_one) == 0.5
+        # compute signals over 100: screened fused, unscreened pure technical no crash
+        from swarm_consumer import compute_deterministic_signals
+        from evolution_engine import EvolutionarySwarmManager
+        mgr = EvolutionarySwarmManager(api_key="", population_size=2)
+        fake_market = {k: {"close": 100.0, "rsi14": 55.0, "momentum_15m": 0.2, "macd_hist": 0.05, "adv": 1000000.0} for k in snap100.keys()}
+        thesis = {k: {"price": 100.0, "rsi": 55.0, "macd_hist": 0.05, "rel_strength": 0.0, "atr": 1.5} for k in snap100.keys()}
+        # Monkey-patch global sentiment cache used by compute to our agent cache
+        import swarm_consumer as _sc
+        _sc.sentiment_agent.cache = agent.cache
+        out = _sc.compute_deterministic_signals(mgr.population[:1], fake_market, thesis, screened_tickers=set(top20.keys()))
+        assert len(out) == 1
+    import asyncio as _asyncio
+    _asyncio.run(_test())

@@ -22,7 +22,7 @@ from engine import (
 )
 from evolution_engine import EvolutionarySwarmManager, AgentGenome
 from risk_engine import AdvancedRiskEngine
-from sentiment_agent import NewsSentimentAgent
+from sentiment_agent import NewsSentimentAgent, select_top_20_candidates
 
 load_dotenv()
 
@@ -187,7 +187,7 @@ def submit_safe_broker_order(broker, ticker: str, shares: float, action: str):
 
 def build_tickers_snapshot(market_state: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """
-    Build 20-ticker snapshot dict for adversarial batch.
+    Build 100-ticker snapshot dict from producer matrix.
     Each entry carries OHLCV + RSI14 + 15m Momentum (+ legacy ATR/MACD for arbiter context).
     """
     snap: Dict[str, Dict[str, Any]] = {}
@@ -215,15 +215,23 @@ def build_tickers_snapshot(market_state: Dict[str, Dict[str, Any]]) -> Dict[str,
     return snap
 
 
+def select_top_20_for_debate(
+    snapshots: Dict[str, Dict[str, Any]], top_n: int = 20
+) -> Dict[str, Dict[str, Any]]:
+    """Local re-export of the deterministic activity screener (keeps 3-call budget)."""
+    return select_top_20_candidates(snapshots, top_n=top_n)
+
+
 def compute_deterministic_signals(
     population: List[Any],
     market_state: Dict[str, Dict[str, Any]],
     shared_thesis: Dict[str, Any],
+    screened_tickers: Any = None,
 ) -> Dict[str, CrossAssetRiskDecision]:
     """
     Deterministic cache-driven conviction adjustment (O(1) per ticker, zero LLM calls).
-    Reads sentiment from SentimentCache.get_sentiment(ticker) and fuses with RSI/Momentum/MACD.
-    Preserves per-agent heterogeneity via persona-threshold offsets.
+    Evaluates all 100 stocks: top-20 screened use 55pct LLM sentiment + 45pct technicals,
+    remaining 80 use pure technicals with sentiment 0.0 neutral.
     """
     decisions_map: Dict[str, CrossAssetRiskDecision] = {}
     # Persona thresholds: aggressive vs conservative entry gates
@@ -245,8 +253,9 @@ def compute_deterministic_signals(
             if getattr(agent, "generation", 1) > 1:
                 base_thr = min(0.45, base_thr + 0.05)
 
+            screened_set = set(s.upper() for s in (screened_tickers or [])) if screened_tickers else None
             signals: Dict[str, QualitativeSignal] = {}
-            for ticker in shared_thesis.keys():
+            for ticker in market_state.keys():
                 if ticker not in market_state:
                     continue
                 md = market_state.get(ticker, {}) or {}
@@ -288,8 +297,12 @@ def compute_deterministic_signals(
                     tech -= 0.1
                 tech = max(-1.0, min(1.0, tech))
 
-                # Fuse: 55% debate sentiment + 45% technicals
-                combined = 0.55 * sentiment + 0.45 * tech
+                # Fuse: top-20 screened use 55pct sentiment + 45pct technicals; others pure technicals
+                is_screened = True if screened_set is None else (str(ticker).upper() in screened_set)
+                if is_screened:
+                    combined = 0.55 * sentiment + 0.45 * tech
+                else:
+                    combined = tech
                 conviction = round(min(1.0, abs(combined)), 4)
                 pos_qty = float(agent.holdings.get(ticker, 0.0) or 0.0)
 
@@ -439,9 +452,11 @@ async def run_consumer():
                         # 2. Populate SentimentCache with 20 scores
                         # 3. Agents read via get_sentiment O(1)
                         # ---------------------------------------------------------
+                        tickers_snapshot = build_tickers_snapshot(market_state)
+                        top_20_snapshot: dict = {}
                         try:
-                            tickers_snapshot = build_tickers_snapshot(market_state)
-                            debate_scores = await sentiment_agent.run_adversarial_batch(tickers_snapshot)
+                            top_20_snapshot = select_top_20_for_debate(tickers_snapshot, top_n=20)
+                            debate_scores = await sentiment_agent.run_adversarial_batch(top_20_snapshot)
                             logger.info(
                                 f"🧠 [Batched Debate] Tick #{tick_counter}: cached {len(debate_scores)} scores "
                                 f"(3 calls, 0.2 RPM). Sample: {dict(list(debate_scores.items())[:3])}"
@@ -524,10 +539,15 @@ async def run_consumer():
                         # Zero LLM calls — reads SentimentCache O(1) per ticker.
                         # Total per-bar LLM budget remains exactly 3 (debate only).
                         # -------------------------------------------------------------
+                        try:
+                            _screened_keys = set((top_20_snapshot or {}).keys())
+                        except Exception:
+                            _screened_keys = set()
                         decisions_map = compute_deterministic_signals(
                             population=swarm_mgr.population,
                             market_state=market_state,
                             shared_thesis=shared_thesis,
+                            screened_tickers=_screened_keys,
                         )
 
                         # Session equity tracking + circuit breaker (5% peak-to-trough)

@@ -24,6 +24,32 @@ CANONICAL_TICKERS = [
 ]
 
 
+def _activity_score(entry: dict) -> float:
+    """Activity = |Momentum_15m| x log(1+Volume), fallback to ATR x |Momentum| if volume flat."""
+    try:
+        import math as _math
+        mom = abs(float(entry.get("momentum_15m", entry.get("momentum", 0.0)) or 0.0))
+        vol = float(entry.get("volume", 0.0) or 0.0)
+        atr = float(entry.get("atr", 1.0) or 1.0)
+        if vol > 0:
+            return mom * _math.log1p(vol)
+        return mom * max(atr, 0.1) * 10.0
+    except Exception:
+        return 0.0
+
+
+def select_top_20_candidates(snapshots: dict, top_n: int = 20) -> dict:
+    """Deterministic pre-LLM screener: rank 100 tickers by activity, return top 20 dict."""
+    if not snapshots:
+        return {}
+    try:
+        ranked = sorted(snapshots.items(), key=lambda kv: _activity_score(kv[1] or {}), reverse=True)
+        return dict(ranked[:max(1, int(top_n))])
+    except Exception:
+        keys = list(snapshots.keys())[:int(top_n)]
+        return {k: snapshots[k] for k in keys}
+
+
 class SentimentCache:
     """
     O(1) per-ticker sentiment store with 1200s TTL (covers 15-minute bar window).

@@ -24,8 +24,32 @@ TICK_INTERVAL_MINUTES = 15
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 broker = redis.Redis(host=REDIS_HOST, port=6379, db=0)
 
-# 20-Stock Liquid Universe for Batched Adversarial Sentiment (Bull/Bear)
-# Rate-limit immune: 3 API calls per 15m bar => 288 calls/day, 0.2 RPM
+# Full 100-stock liquid US Mega/Large-Cap universe (restored).
+# A deterministic pre-LLM screener selects the top 20 most active
+# candidates per 15m bar for the 3-call Bull/Bear/Arbiter debate.
+UNIVERSE = [
+    # Tech & Semiconductors (30)
+    "NVDA", "AMD", "AAPL", "MSFT", "TSLA", "META", "GOOGL", "AMZN", "NFLX", "INTC",
+    "CRM", "ORCL", "ADBE", "AVGO", "TXN", "QCOM", "CSCO", "ACN", "IBM", "AMAT",
+    "MU", "LRCX", "NOW", "PANW", "SNPS", "CDNS", "KLAC", "MCHP", "ADI", "ROP",
+    # Financials & Payments (15)
+    "JPM", "V", "MA", "BAC", "WFC", "C", "GS", "MS", "AXP", "PYPL",
+    "BLK", "SCHW", "CB", "MMC", "PGR",
+    # Healthcare & Pharma (15)
+    "UNH", "JNJ", "PFE", "ABBV", "MRK", "TMO", "ABT", "AMGN", "LLY", "DHR",
+    "BMY", "GILD", "CVS", "CI", "ISRG",
+    # Consumer & Retail (15)
+    "PG", "HD", "DIS", "COST", "PEP", "KO", "WMT", "NKE", "MCD", "SBUX",
+    "LOW", "TJX", "TGT", "EL", "BKNG",
+    # Industrials & Aerospace (10)
+    "HON", "UNP", "GE", "CAT", "BA", "DE", "LMT", "RTX", "ADP", "MMM",
+    # Energy, Utilities, Real Estate & Telecom (15)
+    "XOM", "CVX", "COP", "SLB", "EOG", "NEE", "DUK", "SO", "T", "VZ",
+    "TMUS", "PLD", "AMT", "SPGI", "MDLZ"
+]
+
+# Canonical 20-ticker debate fallback order (used when screener input is empty
+# and by unit tests that build a 20-stock mock snapshot).
 TICKERS = [
     "NVDA", "AAPL", "MSFT", "AMZN", "GOOGL",
     "META", "TSLA", "AMD", "INTC", "QCOM",
@@ -33,9 +57,9 @@ TICKERS = [
     "SLV", "TLT", "COIN", "PLTR", "ARM",
 ]
 
-# Backward-compatible aliases (legacy code imports UNIVERSE / ALL_SYMBOLS)
-UNIVERSE = list(TICKERS)
-ALL_SYMBOLS = list(TICKERS)
+# Track full universe plus SPY benchmark for relative-strength calculations.
+# SPY is appended only if not already present in UNIVERSE.
+ALL_SYMBOLS = list(dict.fromkeys(UNIVERSE + ["SPY"]))
 
 history: Dict[str, pd.DataFrame] = {
     tk: pd.DataFrame(columns=["open", "high", "low", "close", "volume"]) for tk in ALL_SYMBOLS
@@ -178,6 +202,7 @@ def build_15m_stats(symbol: str) -> Dict[str, Any]:
     """
     Build clean aggregated 15m stats for a single symbol.
     Emits: Open, High, Low, Close, Volume, RSI14, 15m Momentum (+ legacy ATR/MACD/RS/ADV).
+    Works for all 100 tickers in UNIVERSE plus SPY benchmark.
     """
     df = history.get(symbol)
     if df is None or df.empty:
@@ -228,13 +253,19 @@ async def on_bar(bar: Bar):
         "close": float(bar.close),
         "volume": float(bar.volume),
     }])
+    if bar.symbol not in history:
+        history[bar.symbol] = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
     history[bar.symbol] = pd.concat([history[bar.symbol], new_row], ignore_index=True).tail(100)
 
     bar_minute = bar.timestamp.minute
 
-    # 2. Accumulate clean 15m stats into buffer for 20-stock universe symbols
+    # 2. Accumulate clean 15m stats into buffer for full 100-stock universe symbols
     if bar.symbol in UNIVERSE:
         buffer[bar.symbol] = build_15m_stats(bar.symbol)
+    elif bar.symbol == "SPY":
+        # Track SPY internally for rel-strength but do not broadcast it as a tradeable
+        # signal here; SPY benchmark history is still maintained above.
+        pass
 
     # 3. Broadcast ONLY when shifting into a new 15-minute interval (00, 15, 30, 45)
     if bar_minute % TICK_INTERVAL_MINUTES == 0 and current_window_minute != bar_minute:
@@ -247,7 +278,7 @@ async def on_bar(bar: Bar):
         if len(buffer) > 0:
             payload = json.dumps(buffer)
             broker.publish('market_events', payload)
-            print(f"📡 [PRODUCER] Clean 15m Close: Broadcasted full {len(buffer)}/20 stock matrix to Redis.")
+            print(f"📡 [PRODUCER] Clean 15m Close: Broadcasted full {len(buffer)}/100 stock matrix to Redis.")
             buffer.clear()
 
 if __name__ == "__main__":
