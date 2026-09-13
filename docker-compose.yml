@@ -120,7 +120,7 @@ services:
     container_name: evoquant_dashboard
     command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
     ports:
-      - "127.0.0.1:8501:8501"
+      - "8501:8501"
     environment:
       - PYTHONUNBUFFERED=1
       - POSTGRES_HOST=timescaledb
