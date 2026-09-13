@@ -76,7 +76,7 @@ EvoQuant-AI operates as a containerized microservice architecture using a decoup
 
 ## 🧰 Tech Stack
 
-- **Language & Runtime:** Python 3.14-slim
+- **Language & Runtime:** Python 3.12-slim (pinned, non-root container user)
 - **Containerization:** Docker & Docker Compose V2
 - **Storage Layer:** PostgreSQL 16 / TimescaleDB (psycopg3, SQLAlchemy)
 - **In-Memory Messaging:** Redis (alpine)
@@ -93,18 +93,29 @@ EvoQuant-AI/
 ├── .streamlit/
 │   └── config.toml             # Streamlit dark theme settings
 ├── tests/
-│   └── test_swarm.py           # Unit & integration test suite
+│   ├── test_swarm.py           # Core unit & integration test suite
+│   └── test_hardening.py       # Aggregation, allocation, broker, dividend, payload tests
+├── plans/
+│   └── evoquant-critical-fixes-plan.md  # Audit findings & remediation roadmap
 ├── .env.example                 # Environment variables template
 ├── .gitignore                   # Git exclusions (blocks .env and cache)
-├── Dockerfile                   # Multi-stage container build definition
-├── docker-compose.yml           # Orchestration spec for all 5 services
-├── requirements.txt             # Python dependency manifests
-├── data_producer.py             # Market WebSocket stream ingestion
-├── swarm_consumer.py            # Swarm trade decision, Adversarial Debate Loop & logging worker
-├── engine.py                    # Cross-asset portfolio manager, short/cover execution, dividend rules & Alpaca bridge & DB connector
+├── Dockerfile                   # Pinned, non-root container build definition
+├── docker-compose.yml           # Orchestration spec with Redis auth + healthchecks
+├── requirements.txt             # Python dependency manifests (pruned)
+├── config.py                    # Centralized environment-driven settings
+├── metrics.py                   # Lightweight operational metrics registry
+├── data_producer.py             # Market ingestion with true 15m bar aggregation
+├── swarm_consumer.py            # Streams consumer, risk overlay, allocation & execution
+├── engine.py                    # Portfolio manager, evolution schemas & debate engine
 ├── evolution_engine.py          # Darwinian strategy evolution & tournament logic
-├── risk_engine.py               # Convex risk parity, downside semi-variance, short-side exposure & macro guard
-├── sentiment_agent.py           # RSS/News RAG sentiment evaluation agent
+├── risk_engine.py               # Directional stops, cooldowns, session breaker, regime scaler
+├── portfolio_risk.py            # Canonical allocator: risk parity + gross/net/sector/CVaR caps
+├── broker.py                    # Async, idempotent Alpaca bridge + per-agent sub-accounts
+├── dividend_guard.py            # Ex-dividend, short liability & borrow-cost checks
+├── news_fetcher.py              # Per-ticker + macro headline enrichment
+├── sentiment_agent.py           # Batched bull/bear/arbiter debate & sentiment cache
+├── backtest.py                  # Point-in-time long/short backtester with walk-forward
+├── db_manager.py                # Compatibility shim to the canonical DB manager
 ├── dashboard.py                 # Streamlit frontend terminal
 └── README.md                    # Project documentation
 ```
@@ -141,16 +152,30 @@ Edit `.env` and fill in your API credentials:
 # Primary LLM API Key (Google AI Studio)
 GEMINI_API_KEY=your_google_ai_studio_api_key_here
 
-# PostgreSQL / TimescaleDB
+# PostgreSQL / TimescaleDB (password now REQUIRED)
 POSTGRES_HOST=timescaledb
 POSTGRES_PORT=5432
 POSTGRES_DB=evoquant_db
 POSTGRES_USER=evoquant
-POSTGRES_PASSWORD=evoquant_secret_pass
+POSTGRES_PASSWORD=change_me_to_a_strong_password
 
-# Optional Broker Execution
+# Redis (password now REQUIRED; datastore is not publicly exposed)
+REDIS_PASSWORD=change_me_to_a_strong_password
+
+# Broker Execution (Alpaca paper)
 ALPACA_API_KEY=your_alpaca_key
 ALPACA_SECRET_KEY=your_alpaca_secret_key
+
+# Per-agent paper sub-accounts (JSON) so each agent trades an isolated book.
+# ALPACA_SUBACCOUNTS={"Agent_Alpha":{"key":"K1","secret":"S1"},"Agent_Beta":{"key":"K2","secret":"S2"}}
+
+# Safety / behavior flags
+SHADOW_MODE=false
+MAX_GROSS_EXPOSURE=1.00
+MAX_NET_EXPOSURE=0.60
+MAX_SECTOR_EXPOSURE=0.30
+CVAR_BUDGET=0.04
+```
 
 
 ### 4. Build and Launch the Stack

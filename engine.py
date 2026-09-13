@@ -661,8 +661,25 @@ class CrossAssetPortfolioManager:
                 """)
 
                 cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_div_schedule_ex_date 
+                    CREATE INDEX IF NOT EXISTS idx_div_schedule_ex_date
                     ON dividend_schedule (ex_date);
+                """)
+
+                # Evolved genome persistence so traits/personas survive restarts
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS agent_genomes (
+                        agent_id VARCHAR(64) PRIMARY KEY,
+                        persona_prompt TEXT,
+                        lineage_root VARCHAR(64),
+                        generation INTEGER DEFAULT 1,
+                        sentiment_weight DOUBLE PRECISION DEFAULT 0.55,
+                        technical_weight DOUBLE PRECISION DEFAULT 0.45,
+                        stop_loss_pct DOUBLE PRECISION DEFAULT 0.025,
+                        take_profit_pct DOUBLE PRECISION DEFAULT 0.050,
+                        tenure_ticks INTEGER DEFAULT 0,
+                        initial_capital DOUBLE PRECISION DEFAULT 100000.0,
+                        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                    );
                 """)
 
                 conn.commit()
@@ -920,9 +937,56 @@ class CrossAssetPortfolioManager:
                 """, (sentiment_score, risk_multiplier, reasoning))
                 conn.commit()
 
-    def fetch_dataframe(self, query: str, params: tuple = None) -> pd.DataFrame:
-        with self.pool.connection() as conn:
-            return pd.read_sql_query(query, conn, params=params)
+    def save_agent_genome(self, agent):
+        """Persist an agent's evolved traits and persona (upsert)."""
+        try:
+            with self.pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO agent_genomes (
+                            agent_id, persona_prompt, lineage_root, generation,
+                            sentiment_weight, technical_weight, stop_loss_pct,
+                            take_profit_pct, tenure_ticks, initial_capital, updated_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (agent_id) DO UPDATE SET
+                            persona_prompt = EXCLUDED.persona_prompt,
+                            lineage_root = EXCLUDED.lineage_root,
+                            generation = EXCLUDED.generation,
+                            sentiment_weight = EXCLUDED.sentiment_weight,
+                            technical_weight = EXCLUDED.technical_weight,
+                            stop_loss_pct = EXCLUDED.stop_loss_pct,
+                            take_profit_pct = EXCLUDED.take_profit_pct,
+                            tenure_ticks = EXCLUDED.tenure_ticks,
+                            initial_capital = EXCLUDED.initial_capital,
+                            updated_at = CURRENT_TIMESTAMP;
+                    """, (
+                        getattr(agent, "agent_id", None),
+                        getattr(agent, "persona_prompt", ""),
+                        getattr(agent, "lineage_root", "Agent_Alpha"),
+                        int(getattr(agent, "generation", 1) or 1),
+                        float(getattr(agent, "sentiment_weight", 0.55) or 0.55),
+                        float(getattr(agent, "technical_weight", 0.45) or 0.45),
+                        float(getattr(agent, "stop_loss_pct", 0.025) or 0.025),
+                        float(getattr(agent, "take_profit_pct", 0.050) or 0.050),
+                        int(getattr(agent, "tenure_ticks", 0) or 0),
+                        float(getattr(agent, "initial_capital", 100000.0) or 100000.0),
+                    ))
+                    conn.commit()
+        except Exception as e:
+            logger.warning(f"⚠️ save_agent_genome failed for {getattr(agent, 'agent_id', '?')}: {e}")
+
+    def load_agent_genomes(self) -> dict:
+        """Return {agent_id: trait dict} for all persisted genomes."""
+        out: dict = {}
+        try:
+            df = self.fetch_dataframe("SELECT * FROM agent_genomes;")
+            if df is None or df.empty:
+                return out
+            for _, row in df.iterrows():
+                out[str(row["agent_id"])] = dict(row)
+        except Exception as e:
+            logger.warning(f"⚠️ load_agent_genomes failed: {e}")
+        return out
 
     def close(self):
         self.pool.close()

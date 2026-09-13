@@ -1,10 +1,17 @@
 services:
   redis:
-    platform: linux/amd64
-    image: redis:alpine
+    image: redis:7-alpine
     container_name: evoquant_redis
-    ports:
-      - "6379:6379"
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}", "--appendonly", "yes"]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: always
     logging:
       driver: "json-file"
@@ -13,23 +20,23 @@ services:
         max-file: "3"
 
   timescaledb:
-    platform: linux/amd64
     image: timescale/timescaledb:latest-pg16
     container_name: evoquant_timescaledb
     restart: always
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-evoquant}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-evoquant_secret_pass}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-evoquant_db}
     ports:
-      - "5432:5432"
+      # Bind to loopback only; the datastore must not be publicly reachable.
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-evoquant} -d ${POSTGRES_DB:-evoquant_db}"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
     logging:
       driver: "json-file"
       options:
@@ -43,16 +50,18 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
       - POSTGRES_HOST=timescaledb
       - POSTGRES_PORT=5432
       - POSTGRES_DB=${POSTGRES_DB:-evoquant_db}
       - POSTGRES_USER=${POSTGRES_USER:-evoquant}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-evoquant_secret_pass}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       - ALPACA_API_KEY=${ALPACA_API_KEY}
       - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
       timescaledb:
         condition: service_healthy
     restart: always
@@ -69,19 +78,34 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
       - POSTGRES_HOST=timescaledb
       - POSTGRES_PORT=5432
       - POSTGRES_DB=${POSTGRES_DB:-evoquant_db}
       - POSTGRES_USER=${POSTGRES_USER:-evoquant}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-evoquant_secret_pass}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       - ALPACA_API_KEY=${ALPACA_API_KEY}
       - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
       - ALPACA_BASE_URL=${ALPACA_BASE_URL:-https://paper-api.alpaca.markets}
-      # Google AI Studio Primary API Key
+      - ALPACA_SUBACCOUNTS=${ALPACA_SUBACCOUNTS}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      # --- Risk / behavior controls ---
+      - SHADOW_MODE=${SHADOW_MODE:-false}
+      - SENTIMENT_ENABLED=${SENTIMENT_ENABLED:-true}
+      - HEADLINES_ENABLED=${HEADLINES_ENABLED:-true}
+      - REGIME_SCALER_ENABLED=${REGIME_SCALER_ENABLED:-true}
+      - MAX_POSITION_CAP=${MAX_POSITION_CAP:-0.05}
+      - MAX_GROSS_EXPOSURE=${MAX_GROSS_EXPOSURE:-1.00}
+      - MAX_NET_EXPOSURE=${MAX_NET_EXPOSURE:-0.60}
+      - MAX_SECTOR_EXPOSURE=${MAX_SECTOR_EXPOSURE:-0.30}
+      - CVAR_BUDGET=${CVAR_BUDGET:-0.04}
+      - STOP_LOSS_PCT=${STOP_LOSS_PCT:-0.025}
+      - TAKE_PROFIT_PCT=${TAKE_PROFIT_PCT:-0.050}
+      - SESSION_DRAWDOWN_PCT=${SESSION_DRAWDOWN_PCT:-0.05}
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
       timescaledb:
         condition: service_healthy
     restart: always
@@ -96,14 +120,14 @@ services:
     container_name: evoquant_dashboard
     command: streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8501:8501"
     environment:
       - PYTHONUNBUFFERED=1
       - POSTGRES_HOST=timescaledb
       - POSTGRES_PORT=5432
       - POSTGRES_DB=${POSTGRES_DB:-evoquant_db}
       - POSTGRES_USER=${POSTGRES_USER:-evoquant}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-evoquant_secret_pass}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     depends_on:
       timescaledb:
         condition: service_healthy

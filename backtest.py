@@ -1,213 +1,353 @@
+"""
+Point-in-time event backtester mirroring the live decision stack (Phase 6).
+
+Unlike the previous long-only, fixed-cadence simulation, this version:
+  * trades both longs and shorts,
+  * uses the same canonical portfolio-risk allocator as live (per-name, sector,
+    gross, net exposure caps),
+  * applies a volatility regime scaler with a SPY 200-SMA macro guard,
+  * models per-side transaction costs (slippage + fees),
+  * enforces directional stop-loss / take-profit,
+  * slices data strictly at or before each timestamp (no look-ahead),
+  * reports walk-forward fold statistics.
+
+It is intentionally deterministic and LLM-free so it can validate the
+technical/risk core that the live system actually executes.
+"""
+
+from __future__ import annotations
+
 import math
+from typing import Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from typing import Dict, List, Tuple
 
-# Import existing Risk Parity engine components
-from engine import RiskParityOptimizer
+from portfolio_risk import canonical_allocate
 
-# Matched 100 Liquid US Mega/Large-Cap Stocks
 UNIVERSE = [
-    # Tech & Semiconductors (30)
     "NVDA", "AMD", "AAPL", "MSFT", "TSLA", "META", "GOOGL", "AMZN", "NFLX", "INTC",
     "CRM", "ORCL", "ADBE", "AVGO", "TXN", "QCOM", "CSCO", "ACN", "IBM", "AMAT",
     "MU", "LRCX", "NOW", "PANW", "SNPS", "CDNS", "KLAC", "MCHP", "ADI", "ROP",
-    # Financials & Payments (15)
     "JPM", "V", "MA", "BAC", "WFC", "C", "GS", "MS", "AXP", "PYPL",
     "BLK", "SCHW", "CB", "MMC", "PGR",
-    # Healthcare & Pharma (15)
     "UNH", "JNJ", "PFE", "ABBV", "MRK", "TMO", "ABT", "AMGN", "LLY", "DHR",
     "BMY", "GILD", "CVS", "CI", "ISRG",
-    # Consumer & Retail (15)
     "PG", "HD", "DIS", "COST", "PEP", "KO", "WMT", "NKE", "MCD", "SBUX",
     "LOW", "TJX", "TGT", "EL", "BKNG",
-    # Industrials & Aerospace (10)
     "HON", "UNP", "GE", "CAT", "BA", "DE", "LMT", "RTX", "ADP", "MMM",
-    # Energy, Utilities, Real Estate & Telecom (15)
     "XOM", "CVX", "COP", "SLB", "EOG", "NEE", "DUK", "SO", "T", "VZ",
-    "TMUS", "PLD", "AMT", "SPGI", "MDLZ", "SPY"
+    "TMUS", "PLD", "AMT", "SPGI", "MDLZ", "SPY",
 ]
 
-class EventDrivenBacktester:
-    def __init__(self, initial_capital: float = 100000.0, start_date: str = "2024-01-01", end_date: str = "2026-01-01", slippage: float = 0.0002):
+
+class PointInTimeBacktester:
+    def __init__(
+        self,
+        initial_capital: float = 100000.0,
+        start_date: str = "2020-01-01",
+        end_date: str = "2026-01-01",
+        slippage: float = 0.0005,
+        fee_bps: float = 1.0,
+        stop_loss_pct: float = 0.025,
+        take_profit_pct: float = 0.050,
+        target_volatility: float = 0.15,
+        rebalance_every: int = 1,
+        conviction_threshold: float = 0.30,
+        max_position_cap: float = 0.05,
+        max_gross_exposure: float = 1.0,
+        max_net_exposure: float = 0.6,
+        max_sector_exposure: float = 0.30,
+    ):
         self.initial_capital = initial_capital
         self.start_date = start_date
         self.end_date = end_date
         self.slippage = slippage
-        # Position cap set to 5% per stock given 100-stock diversification
-        self.optimizer = RiskParityOptimizer(max_position_cap=0.05)
+        self.fee_rate = fee_bps / 10000.0
+        self.stop_loss_pct = stop_loss_pct
+        self.take_profit_pct = take_profit_pct
+        self.target_volatility = target_volatility
+        self.rebalance_every = max(1, rebalance_every)
+        self.conviction_threshold = conviction_threshold
+        self.max_position_cap = max_position_cap
+        self.max_gross_exposure = max_gross_exposure
+        self.max_net_exposure = max_net_exposure
+        self.max_sector_exposure = max_sector_exposure
         self.data: Dict[str, pd.DataFrame] = {}
 
+    # ------------------------------------------------------------------
     def fetch_historical_data(self):
-        print(f"📥 Downloading historical price data for {len(UNIVERSE)} assets ({self.start_date} to {self.end_date})...")
-        raw_data = yf.download(UNIVERSE, start=self.start_date, end=self.end_date, interval="1d", progress=False)
-        
-        # Safely unpack MultiIndex columns per ticker
+        print(f"📥 Downloading daily data for {len(UNIVERSE)} assets ({self.start_date} → {self.end_date})...")
+        raw = yf.download(UNIVERSE, start=self.start_date, end=self.end_date, interval="1d", progress=False, auto_adjust=True)
         for tk in UNIVERSE:
             try:
                 df = pd.DataFrame({
-                    'open': raw_data['Open'][tk],
-                    'high': raw_data['High'][tk],
-                    'low': raw_data['Low'][tk],
-                    'close': raw_data['Close'][tk],
-                    'volume': raw_data['Volume'][tk]
+                    "open": raw["Open"][tk],
+                    "high": raw["High"][tk],
+                    "low": raw["Low"][tk],
+                    "close": raw["Close"][tk],
+                    "volume": raw["Volume"][tk],
                 }).dropna()
                 self.data[tk] = df
             except KeyError:
-                print(f"⚠️ Warning: Could not download data for {tk}")
-        print("✅ Market data download complete.")
+                continue
+        print("✅ Download complete.")
 
-    def calculate_technical_state(self, tk_data: pd.DataFrame, current_time: pd.Timestamp) -> dict:
-        """Point-in-Time Technical Analysis using strictly label-based slicing [:current_time]."""
-        sub_df = tk_data.loc[:current_time]
-        if len(sub_df) < 26:
-            return {}
-
-        close = sub_df['close']
+    @staticmethod
+    def _wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
         delta = close.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / (loss.replace(0, 1e-6))
-        rsi = float((100 - (100 / (1 + rs))).iloc[-1])
+        gain = delta.where(delta > 0, 0.0)
+        loss = -delta.where(delta < 0, 0.0)
+        avg_gain = gain.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+        avg_loss = loss.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+        rs = avg_gain / (avg_loss + 1e-9)
+        return 100.0 - (100.0 / (1.0 + rs))
 
-        # ATR 14 calculation
+    def _technical_state(self, tk: str, spy: pd.DataFrame, t: pd.Timestamp) -> Dict[str, float]:
+        df = self.data.get(tk)
+        if df is None or t not in df.index:
+            return {}
+        sub = df.loc[:t]
+        spy_sub = spy.loc[:t] if spy is not None else None
+        if len(sub) < 30:
+            return {}
+        close = sub["close"]
+        rsi = self._wilder_rsi(close).iloc[-1]
         prev_close = close.shift(1)
-        tr1 = sub_df['high'] - sub_df['low']
-        tr2 = (sub_df['high'] - prev_close).abs()
-        tr3 = (sub_df['low'] - prev_close).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = float(tr.rolling(14).mean().iloc[-1])
-
+        tr = pd.concat([
+            sub["high"] - sub["low"],
+            (sub["high"] - prev_close).abs(),
+            (sub["low"] - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        atr = float(tr.ewm(alpha=1.0 / 14, adjust=False, min_periods=14).mean().iloc[-1])
+        mom = float((close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100) if len(close) >= 2 else 0.0
+        rel = 0.0
+        if spy_sub is not None and len(spy_sub) >= 12 and len(close) >= 12:
+            sret = (close.iloc[-1] - close.iloc[-12]) / close.iloc[-12]
+            bret = (spy_sub["close"].iloc[-1] - spy_sub["close"].iloc[-12]) / spy_sub["close"].iloc[-12]
+            rel = float((sret - bret) * 100)
         return {
             "close": float(close.iloc[-1]),
-            "rsi": round(rsi, 2),
-            "atr": max(round(atr, 2), 0.01)
+            "rsi": 50.0 if pd.isna(rsi) else float(rsi),
+            "atr": max(atr, 0.01),
+            "momentum": mom,
+            "rel_strength_spy": rel,
         }
 
+    @staticmethod
+    def _regime_scaler(spy: pd.DataFrame, t: pd.Timestamp, target_vol: float) -> float:
+        try:
+            sub = spy.loc[:t]
+            if len(sub) < 20:
+                return 1.0
+            rets = sub["close"].pct_change().dropna()
+            vol = rets.std() * math.sqrt(252)
+            if not np.isfinite(vol) or vol <= 0:
+                return 1.0
+            scaler = target_vol / max(vol, 0.05)
+            if len(sub) >= 200:
+                sma = sub["close"].rolling(200).mean().iloc[-1]
+                if not pd.isna(sma) and sub["close"].iloc[-1] < sma:
+                    scaler *= 0.5
+            return float(np.clip(scaler, 0.25, 1.5))
+        except Exception:
+            return 1.0
+
+    def _conviction(self, state: Dict[str, float]) -> Tuple[str, float]:
+        rsi = state["rsi"]
+        mom = state["momentum"]
+        rel = state["rel_strength_spy"]
+        tech = 0.0
+        if rsi < 30:
+            tech += 0.4
+        elif rsi < 45:
+            tech += 0.15
+        elif rsi > 70:
+            tech -= 0.4
+        elif rsi > 60:
+            tech -= 0.15
+        if mom > 0.5:
+            tech += 0.3
+        elif mom > 0.05:
+            tech += 0.1
+        elif mom < -0.5:
+            tech -= 0.3
+        elif mom < -0.05:
+            tech -= 0.1
+        if rel > 1.0:
+            tech += 0.1
+        elif rel < -1.0:
+            tech -= 0.1
+        tech = max(-1.0, min(1.0, tech))
+        if tech >= self.conviction_threshold:
+            return "BUY", abs(tech)
+        if tech <= -self.conviction_threshold:
+            return "SHORT", abs(tech)
+        return "HOLD", 0.0
+
+    # ------------------------------------------------------------------
     def run(self):
         self.fetch_historical_data()
-        tradeable_universe = [tk for tk in UNIVERSE if tk in self.data and tk != "SPY"]
-        timestamps = self.data["SPY"].index[30:]  # Skip warm-up period
-        
+        spy = self.data.get("SPY")
+        if spy is None or spy.empty:
+            print("❌ SPY data unavailable; aborting.")
+            return
+        tradeable = [tk for tk in UNIVERSE if tk in self.data and tk != "SPY"]
+        timestamps = list(spy.index[30:])
+
         cash = self.initial_capital
-        holdings: Dict[str, float] = {tk: 0.0 for tk in tradeable_universe}
-        entry_prices: Dict[str, float] = {tk: 0.0 for tk in tradeable_universe}
+        holdings: Dict[str, float] = {tk: 0.0 for tk in tradeable}
+        entry_prices: Dict[str, float] = {tk: 0.0 for tk in tradeable}
         equity_curve: List[float] = []
+        trading_days: List[pd.Timestamp] = []
+        turnover = 0.0
 
-        print(f"🚀 Executing Point-in-Time Backtest Simulation across {len(tradeable_universe)} stocks...")
+        print(f"🚀 Running point-in-time backtest across {len(tradeable)} names...")
 
-        for t_idx, current_time in enumerate(timestamps):
-            # 1. Update Portfolio Valuations
-            current_prices = {}
-            for tk in holdings:
-                if current_time in self.data[tk].index:
-                    current_prices[tk] = float(self.data[tk].loc[current_time, 'close'])
+        for t_idx, t in enumerate(timestamps):
+            prices: Dict[str, float] = {}
+            for tk in tradeable:
+                if t in self.data[tk].index:
+                    prices[tk] = float(self.data[tk].loc[t, "close"])
                 else:
-                    current_prices[tk] = entry_prices[tk]
+                    prices[tk] = entry_prices.get(tk, 0.0)
 
-            total_stock_value = sum(holdings[tk] * current_prices.get(tk, 0.0) for tk in holdings)
-            current_equity = cash + total_stock_value
+            long_val = sum(holdings[tk] * prices.get(tk, 0.0) for tk in tradeable if holdings[tk] > 0)
+            short_liab = sum(abs(holdings[tk]) * prices.get(tk, 0.0) for tk in tradeable if holdings[tk] < 0)
+            short_entry_val = sum(abs(holdings[tk]) * entry_prices.get(tk, 0.0) for tk in tradeable if holdings[tk] < 0)
+            current_equity = cash + long_val - short_liab + short_entry_val
             equity_curve.append(current_equity)
+            trading_days.append(t)
 
-            # 2. Hard Risk Overlays (ATR Trailing Stop / Risk Management)
+            # Directional stops.
             for tk, shares in list(holdings.items()):
-                if shares > 0 and tk in current_prices and entry_prices[tk] > 0:
-                    price = current_prices[tk]
-                    pnl_pct = (price - entry_prices[tk]) / entry_prices[tk]
-                    
-                    if pnl_pct <= -0.025 or pnl_pct >= 0.05:
-                        # Liquidate position with slippage friction
-                        cash += shares * price * (1 - self.slippage)
-                        holdings[tk] = 0.0
-                        entry_prices[tk] = 0.0
+                if shares == 0 or prices.get(tk, 0.0) <= 0 or entry_prices.get(tk, 0.0) <= 0:
+                    continue
+                px = prices[tk]
+                e = entry_prices[tk]
+                if shares > 0:
+                    move = (px - e) / e
+                    hit = move <= -self.stop_loss_pct or move >= self.take_profit_pct
+                else:
+                    move = (e - px) / e
+                    hit = move <= -self.stop_loss_pct or move >= self.take_profit_pct
+                if hit:
+                    notional = abs(shares) * px
+                    cost = notional * (self.slippage + self.fee_rate)
+                    cash += (shares * px) - cost if shares > 0 else (shares * px) - cost
+                    turnover += notional
+                    holdings[tk] = 0.0
+                    entry_prices[tk] = 0.0
 
-            # 3. Simulate Technical Indicator Rebalancing Every 5 Days
-            if t_idx % 5 == 0:
-                convictions = {}
-                atrs = {}
-
-                for tk in holdings:
-                    if current_time in self.data[tk].index:
-                        metrics = self.calculate_technical_state(self.data[tk], current_time)
-                        if metrics:
-                            atrs[tk] = metrics["atr"]
-                            if metrics["rsi"] < 35:
-                                convictions[tk] = 0.85
-                            elif metrics["rsi"] > 65:
-                                convictions[tk] = 0.10
-                            else:
-                                convictions[tk] = 0.45
-
-                # 4. Run Risk Parity Optimizer
-                target_weights = self.optimizer.optimize(convictions, atrs)
-
-                # Separate into Sells first (free up cash), then Buys
-                sells = []
-                buys = []
-
-                for tk, target_w in target_weights.items():
-                    if tk not in holdings or current_prices.get(tk, 0) <= 0:
+            # Rebalance.
+            if t_idx % self.rebalance_every == 0:
+                convictions: Dict[str, float] = {}
+                directions: Dict[str, str] = {}
+                atr_map: Dict[str, float] = {}
+                for tk in tradeable:
+                    st = self._technical_state(tk, spy, t)
+                    if not st:
                         continue
-                    price = current_prices[tk]
-                    target_alloc_dollars = current_equity * target_w
-                    current_pos_dollars = holdings[tk] * price
-                    diff_dollars = target_alloc_dollars - current_pos_dollars
+                    action, conv = self._conviction(st)
+                    directions[tk] = action
+                    convictions[tk] = conv
+                    atr_map[tk] = st["atr"]
 
-                    if diff_dollars < 0:
-                        sells.append((tk, abs(diff_dollars), price))
-                    elif diff_dollars > 0:
-                        buys.append((tk, diff_dollars, price))
+                regime = self._regime_scaler(spy, t, self.target_volatility)
+                target_weights = canonical_allocate(
+                    convictions, atr_map, directions,
+                    max_position_cap=self.max_position_cap,
+                    max_gross_exposure=self.max_gross_exposure,
+                    max_net_exposure=self.max_net_exposure,
+                    max_sector_exposure=self.max_sector_exposure,
+                    min_conviction=self.conviction_threshold,
+                    regime_scaler=regime,
+                )
 
-                # Step 4a: Execute Sells First (Liquidate cash)
-                for tk, diff_dollars, price in sells:
-                    sell_shares = diff_dollars / price
-                    actual_sell_shares = min(holdings[tk], sell_shares)
-                    holdings[tk] -= actual_sell_shares
-                    cash += (actual_sell_shares * price) * (1 - self.slippage)
-                    if holdings[tk] <= 1e-6:
-                        holdings[tk] = 0.0
+                for tk, w in target_weights.items():
+                    px = prices.get(tk, 0.0)
+                    if px <= 0:
+                        continue
+                    want = (w * current_equity) / px
+                    have = holdings.get(tk, 0.0)
+                    delta = want - have
+                    if abs(delta * px) < 25.0:
+                        continue
+                    notional = abs(delta) * px
+                    cost = notional * (self.slippage + self.fee_rate)
+                    cash += (have - want) * px - cost
+                    turnover += notional
+                    if abs(want) < 1e-9:
                         entry_prices[tk] = 0.0
+                    elif abs(have) < 1e-9 or ((have > 0) != (want > 0)):
+                        entry_prices[tk] = px
+                    elif abs(want) > abs(have):
+                        entry_prices[tk] = ((abs(have) * entry_prices.get(tk, px)) + abs(delta) * px) / abs(want)
+                    holdings[tk] = 0.0 if abs(want) < 1e-9 else want
 
-                # Step 4b: Execute Buys Second
-                for tk, diff_dollars, price in buys:
-                    alloc_dollars = min(diff_dollars, cash)
-                    if alloc_dollars > 0:
-                        bought_dollars_after_slippage = alloc_dollars * (1 - self.slippage)
-                        new_shares = bought_dollars_after_slippage / price
-                        total_shares = holdings[tk] + new_shares
-                        
-                        entry_prices[tk] = ((holdings[tk] * entry_prices[tk]) + bought_dollars_after_slippage) / total_shares if total_shares > 0 else price
-                        holdings[tk] = total_shares
-                        cash -= alloc_dollars
+        eq = pd.Series(equity_curve, index=pd.DatetimeIndex(trading_days))
+        metrics = self._metrics(eq, turnover)
+        self._print_metrics(metrics)
+        self._walk_forward(eq)
+        return metrics
 
-        # 5. Compute Final Performance Statistics
-        eq_series = pd.Series(equity_curve)
-        returns = eq_series.pct_change().dropna()
-        total_return = (eq_series.iloc[-1] - self.initial_capital) / self.initial_capital
-        cagr = ((eq_series.iloc[-1] / self.initial_capital) ** (252 / len(eq_series))) - 1
-        sharpe = (returns.mean() / returns.std()) * math.sqrt(252) if returns.std() > 0 else 0
-        max_drawdown = ((eq_series.cummax() - eq_series) / eq_series.cummax()).max()
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _metrics(eq: pd.Series, turnover: float) -> Dict[str, float]:
+        if eq.empty or len(eq) < 2:
+            return {}
+        rets = eq.pct_change().dropna()
+        total_return = (eq.iloc[-1] - eq.iloc[0]) / eq.iloc[0]
+        years = max(len(eq) / 252.0, 1e-9)
+        cagr = (eq.iloc[-1] / eq.iloc[0]) ** (1.0 / years) - 1.0
+        sharpe = (rets.mean() / rets.std()) * math.sqrt(252) if rets.std() > 0 else 0.0
+        downside = rets[rets < 0]
+        sortino = (rets.mean() / downside.std()) * math.sqrt(252) if len(downside) > 1 and downside.std() > 0 else 0.0
+        mdd = ((eq.cummax() - eq) / eq.cummax()).max()
+        return {
+            "final_equity": float(eq.iloc[-1]),
+            "total_return": float(total_return),
+            "cagr": float(cagr),
+            "sharpe": float(sharpe),
+            "sortino": float(sortino),
+            "max_drawdown": float(mdd),
+            "turnover": float(turnover),
+        }
 
+    def _print_metrics(self, m: Dict[str, float]):
+        if not m:
+            print("No metrics produced.")
+            return
         print("\n================ 📊 BACKTEST PERFORMANCE SUMMARY ================")
-        print(f"Universe Size:           {len(tradeable_universe)} Assets")
-        print(f"Initial Capital:         ${self.initial_capital:,.2f}")
-        print(f"Final Equity:            ${eq_series.iloc[-1]:,.2f}")
-        print(f"Total Cumulative Return: {total_return * 100:+.2f}%")
-        print(f"CAGR (Annualized):       {cagr * 100:+.2f}%")
-        print(f"Sharpe Ratio:            {sharpe:.2f}")
-        print(f"Max Drawdown:            {max_drawdown * 100:.2f}%")
+        print(f"Final Equity:      ${m['final_equity']:,.2f}")
+        print(f"Total Return:      {m['total_return']*100:+.2f}%")
+        print(f"CAGR:              {m['cagr']*100:+.2f}%")
+        print(f"Sharpe:            {m['sharpe']:.2f}")
+        print(f"Sortino:           {m['sortino']:.2f}")
+        print(f"Max Drawdown:      {m['max_drawdown']*100:.2f}%")
+        print(f"Turnover (notional): ${m['turnover']:,.0f}")
         print("==================================================================")
+
+    def _walk_forward(self, eq: pd.Series, folds: int = 4):
+        if eq.empty or len(eq) < folds * 20:
+            return
+        print("\n================ 🔁 WALK-FORWARD FOLDS ================")
+        size = len(eq) // folds
+        for i in range(folds):
+            seg = eq.iloc[i * size:(i + 1) * size]
+            if len(seg) < 2:
+                continue
+            m = self._metrics(seg, turnover=0.0)
+            print(
+                f"Fold {i+1} [{seg.index[0].date()} → {seg.index[-1].date()}]: "
+                f"ret {m['total_return']*100:+.2f}% | Sharpe {m['sharpe']:.2f} | MaxDD {m['max_drawdown']*100:.2f}%"
+            )
+        print("=======================================================")
+
 
 if __name__ == "__main__":
     end_date = pd.Timestamp.now().strftime("%Y-%m-%d")
     start_date = (pd.Timestamp.now() - pd.DateOffset(years=5)).strftime("%Y-%m-%d")
-
-    print(f"📅 Running Backtest Window: {start_date} ➔ {end_date}")
-
-    tester = EventDrivenBacktester(
-        initial_capital=100000.0,
-        start_date=start_date,
-        end_date=end_date
-    )
-    tester.run()
+    print(f"📅 Backtest window: {start_date} → {end_date}")
+    PointInTimeBacktester(start_date=start_date, end_date=end_date).run()
