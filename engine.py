@@ -575,7 +575,8 @@ class CrossAssetPortfolioManager:
         min_pool_size: int = 2,
         max_pool_size: int = 10,
         initial_capital: float = 100000.0,
-        max_position_cap: float = 0.05
+        max_position_cap: float = 0.05,
+        margin_requirement: float = 0.50,
     ):
         self.host = host or os.getenv("POSTGRES_HOST", "localhost")
         self.port = int(port or os.getenv("POSTGRES_PORT", 5432))
@@ -584,6 +585,13 @@ class CrossAssetPortfolioManager:
         self.password = password or os.getenv("POSTGRES_PASSWORD", "evoquant_secret_pass")
         self.initial_capital = initial_capital
         self.max_position_cap = max_position_cap
+        self.margin_requirement = margin_requirement
+
+        self.cash = float(initial_capital)
+        self.holdings: Dict[str, float] = {}
+        self.short_positions: Dict[str, Dict[str, float]] = {}
+        self.last_prices: Dict[str, float] = {}
+        self.entry_prices: Dict[str, float] = {}
 
         conninfo = f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.dbname}"
 
@@ -595,17 +603,151 @@ class CrossAssetPortfolioManager:
         )
         self._init_db()
 
+    @property
+    def available_cash(self) -> float:
+        """True available purchasing power deducting collateralized short liability & margin hold."""
+        try:
+            short_liability = sum(
+                pos['shares'] * self.last_prices.get(t, pos.get('entry_price', 0.0))
+                for t, pos in self.short_positions.items()
+            )
+            margin_hold = short_liability * (1.0 + self.margin_requirement)
+            return max(0.0, self.cash - margin_hold)
+        except Exception:
+            return max(0.0, self.cash)
+
+    def calculate_equity(self, current_prices: Optional[Dict[str, float]] = None) -> float:
+        """Institutional MTM equity: Cash + Longs - Shorts with zero price fallback guard."""
+        if current_prices:
+            for k, v in current_prices.items():
+                if v and float(v) > 0:
+                    self.last_prices[k] = float(v)
+
+        long_value = 0.0
+        short_liability = 0.0
+        for ticker, shares in (self.holdings or {}).items():
+            if shares == 0:
+                continue
+            pos_short = self.short_positions.get(ticker, {})
+            fallback_price = float(pos_short.get('entry_price') or self.entry_prices.get(ticker, 0.0) or 0.0)
+            price = float(self.last_prices.get(ticker, fallback_price) or fallback_price)
+            if shares > 0:
+                long_value += shares * price
+            else:
+                short_liability += abs(shares) * price
+
+        return round(self.cash + long_value - short_liability, 2)
+
+    def fill_order(self, ticker: str, action: str, shares: float, fill_price: float):
+        """Execute order fill adhering to institutional margin and ledger rules."""
+        act = action.upper()
+        sh = abs(float(shares))
+        px = float(fill_price)
+        if px > 0:
+            self.last_prices[ticker] = px
+
+        if act == "BUY":
+            self.cash -= sh * px
+            curr_h = self.holdings.get(ticker, 0.0)
+            old_entry = self.entry_prices.get(ticker, px)
+            new_h = curr_h + sh
+            if new_h > 0:
+                self.entry_prices[ticker] = ((curr_h * old_entry) + (sh * px)) / new_h if curr_h > 0 else px
+            self.holdings[ticker] = new_h
+        elif act == "SELL":
+            self.cash += sh * px
+            new_h = self.holdings.get(ticker, 0.0) - sh
+            self.holdings[ticker] = 0.0 if abs(new_h) < 1e-9 else new_h
+            if abs(self.holdings[ticker]) < 1e-9:
+                self.entry_prices[ticker] = 0.0
+        elif act == "SHORT":
+            self.cash += sh * px
+            curr_pos = self.short_positions.get(ticker, {"shares": 0.0, "entry_price": px})
+            tot_sh = curr_pos["shares"] + sh
+            avg_ep = ((curr_pos["shares"] * curr_pos["entry_price"]) + (sh * px)) / tot_sh if tot_sh > 0 else px
+            self.short_positions[ticker] = {"shares": tot_sh, "entry_price": avg_ep}
+            self.entry_prices[ticker] = avg_ep
+            self.holdings[ticker] = self.holdings.get(ticker, 0.0) - sh
+        elif act == "COVER":
+            self.cash -= sh * px
+            curr_pos = self.short_positions.get(ticker, {"shares": sh, "entry_price": px})
+            rem_sh = curr_pos["shares"] - sh
+            if rem_sh > 1e-9:
+                self.short_positions[ticker]["shares"] = rem_sh
+            else:
+                self.short_positions.pop(ticker, None)
+            new_h = self.holdings.get(ticker, 0.0) + sh
+            self.holdings[ticker] = 0.0 if abs(new_h) < 1e-9 else new_h
+            if abs(self.holdings[ticker]) < 1e-9:
+                self.entry_prices[ticker] = 0.0
+
+    def fetch_dataframe(self, query: str, params=None) -> pd.DataFrame:
+        try:
+            with self.pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(query, params or ())
+                    rows = cur.fetchall()
+                    if not rows:
+                        return pd.DataFrame()
+                    return pd.DataFrame(rows)
+        except Exception as e:
+            logger.warning(f"⚠️ fetch_dataframe error: {e}")
+            return pd.DataFrame()
+
+    def record_news_sentiment(self, records: list[dict]) -> bool:
+        if not records:
+            return True
+        try:
+            with self.pool.connection() as conn:
+                with conn.cursor() as cur:
+                    params = [
+                        (
+                            r.get("timestamp", datetime.now(timezone.utc).isoformat()),
+                            str(r.get("symbol", "SPY")),
+                            float(r.get("score", 0.0) or 0.0),
+                            str(r.get("bull_thesis", "")),
+                            str(r.get("bear_thesis", "")),
+                            str(r.get("arbiter_reasoning", "")),
+                            float(r.get("confidence", 1.0) or 1.0),
+                        )
+                        for r in records
+                    ]
+                    cur.executemany("""
+                        INSERT INTO news_sentiment_log 
+                        (timestamp, symbol, score, bull_thesis, bear_thesis, arbiter_reasoning, confidence)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s);
+                    """, params)
+                    conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to record news sentiment: {e}")
+            return False
+
+    def get_latest_news_sentiment(self, limit: int = 10) -> pd.DataFrame:
+        try:
+            query = """
+                SELECT timestamp, symbol, score, bull_thesis, bear_thesis, arbiter_reasoning, confidence
+                FROM news_sentiment_log
+                ORDER BY timestamp DESC
+                LIMIT %s;
+            """
+            return self.fetch_dataframe(query, (limit,))
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to get latest news sentiment: {e}")
+            return pd.DataFrame()
+
     def _init_db(self):
-        with self.pool.connection() as conn:
-            with conn.cursor() as cur:
-                try:
-                    cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
-                except Exception as e:
-                    logger.warning(f"TimescaleDB extension load note: {e}")
+        try:
+            with self.pool.connection(timeout=2.0) as conn:
+                with conn.cursor() as cur:
+                    try:
+                        cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
+                    except Exception as e:
+                        logger.warning(f"TimescaleDB extension load note: {e}")
 
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_accounts (
-                        agent_id VARCHAR(64) PRIMARY KEY,
+                        agent_id TEXT PRIMARY KEY,
                         cash DOUBLE PRECISION NOT NULL,
                         is_active BOOLEAN DEFAULT TRUE,
                         updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
@@ -620,7 +762,7 @@ class CrossAssetPortfolioManager:
 
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_holdings (
-                        agent_id VARCHAR(64),
+                        agent_id TEXT,
                         ticker VARCHAR(16),
                         amount DOUBLE PRECISION NOT NULL,
                         entry_price DOUBLE PRECISION DEFAULT 0.0,
@@ -633,7 +775,7 @@ class CrossAssetPortfolioManager:
                     CREATE TABLE IF NOT EXISTS trade_logs (
                         id BIGSERIAL PRIMARY KEY,
                         timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-                        agent_id VARCHAR(64) NOT NULL,
+                        agent_id TEXT NOT NULL,
                         ticker VARCHAR(16) NOT NULL,
                         action VARCHAR(32) NOT NULL,
                         shares DOUBLE PRECISION NOT NULL,
@@ -648,7 +790,9 @@ class CrossAssetPortfolioManager:
                     cur.execute("""
                         ALTER TABLE trade_logs ALTER COLUMN action TYPE VARCHAR(32);
                         ALTER TABLE trade_logs ALTER COLUMN reason TYPE VARCHAR(64);
-                        ALTER TABLE trade_logs ALTER COLUMN agent_id TYPE VARCHAR(64);
+                        ALTER TABLE trade_logs ALTER COLUMN agent_id TYPE TEXT;
+                        ALTER TABLE agent_accounts ALTER COLUMN agent_id TYPE TEXT;
+                        ALTER TABLE agent_holdings ALTER COLUMN agent_id TYPE TEXT;
                     """)
                 except Exception as e:
                     logger.debug(f"Column resize migration notice: {e}")
@@ -669,7 +813,7 @@ class CrossAssetPortfolioManager:
                     CREATE TABLE IF NOT EXISTS dividend_logs (
                         id BIGSERIAL PRIMARY KEY,
                         timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-                        agent_id VARCHAR(64) NOT NULL,
+                        agent_id TEXT NOT NULL,
                         ticker VARCHAR(16) NOT NULL,
                         action VARCHAR(16) NOT NULL,
                         shares DOUBLE PRECISION NOT NULL,
@@ -677,6 +821,11 @@ class CrossAssetPortfolioManager:
                         total_amount DOUBLE PRECISION NOT NULL
                     );
                 """)
+
+                try:
+                    cur.execute("ALTER TABLE dividend_logs ALTER COLUMN agent_id TYPE TEXT;")
+                except Exception as e:
+                    logger.debug(f"dividend_logs migration notice: {e}")
 
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS macro_regime (
@@ -691,12 +840,17 @@ class CrossAssetPortfolioManager:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_snapshots (
                         timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        agent_id VARCHAR(64) NOT NULL,
+                        agent_id TEXT NOT NULL,
                         equity DOUBLE PRECISION NOT NULL,
                         cash DOUBLE PRECISION NOT NULL,
                         pnl_pct DOUBLE PRECISION NOT NULL
                     );
                 """)
+
+                try:
+                    cur.execute("ALTER TABLE agent_snapshots ALTER COLUMN agent_id TYPE TEXT;")
+                except Exception as e:
+                    logger.debug(f"agent_snapshots migration notice: {e}")
 
                 try:
                     cur.execute("""
@@ -712,6 +866,11 @@ class CrossAssetPortfolioManager:
                 """)
 
                 cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_snapshots_time_agent 
+                    ON agent_snapshots (timestamp DESC, agent_id);
+                """)
+
+                cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_div_schedule_ex_date
                     ON dividend_schedule (ex_date);
                 """)
@@ -719,7 +878,7 @@ class CrossAssetPortfolioManager:
                 # Evolved genome persistence so traits/personas survive restarts
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_genomes (
-                        agent_id VARCHAR(64) PRIMARY KEY,
+                        agent_id TEXT PRIMARY KEY,
                         persona_prompt TEXT,
                         lineage_root VARCHAR(64),
                         generation INTEGER DEFAULT 1,
@@ -733,7 +892,39 @@ class CrossAssetPortfolioManager:
                     );
                 """)
 
+                try:
+                    cur.execute("ALTER TABLE agent_genomes ALTER COLUMN agent_id TYPE TEXT;")
+                except Exception as e:
+                    logger.debug(f"agent_genomes migration notice: {e}")
+
+                # News sentiment persistence table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS news_sentiment_log (
+                        timestamp TIMESTAMPTZ NOT NULL,
+                        symbol TEXT,
+                        score DOUBLE PRECISION,
+                        bull_thesis TEXT,
+                        bear_thesis TEXT,
+                        arbiter_reasoning TEXT,
+                        confidence DOUBLE PRECISION
+                    );
+                """)
+
+                try:
+                    cur.execute("""
+                        SELECT create_hypertable('news_sentiment_log', 'timestamp', if_not_exists => TRUE);
+                    """)
+                except Exception as e:
+                    logger.warning(f"news_sentiment_log hypertable notice: {e}")
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_news_sentiment_time_symbol
+                    ON news_sentiment_log (timestamp DESC, symbol);
+                """)
+
                 conn.commit()
+        except Exception as e:
+            logger.warning(f"⚠️ TimescaleDB connection/init notice (offline mode): {e}")
 
     def register_agent(self, agent_id: str):
         with self.pool.connection() as conn:

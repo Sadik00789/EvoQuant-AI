@@ -420,9 +420,7 @@ def _apply_target_book(agent, target_weights: Dict[str, float], prices: Dict[str
     """Move the virtual book to the target signed weights, returning executed trades."""
     trades: List[tuple] = []
     try:
-        equity = risk_engine.calculate_total_equity(
-            agent.cash, agent.holdings, getattr(agent, "entry_prices", {}), prices
-        )
+        equity = agent.calculate_equity(prices)
     except Exception:
         return trades
     if equity <= 0:
@@ -441,18 +439,42 @@ def _apply_target_book(agent, target_weights: Dict[str, float], prices: Dict[str
         if abs(delta) * px < MIN_TRADE_NOTIONAL and not (have != 0.0 and abs(want) < 1e-9):
             continue
 
-        agent.cash += (have - want) * px
+        # Position flip: SHORT to LONG
+        if have < 0 and want > 0:
+            cover_sh = abs(have)
+            agent.fill_order(tk, "COVER", cover_sh, px)
+            db.update_agent_cash(agent.agent_id, agent.cash)
+            db.update_agent_holding(agent.agent_id, tk, agent.holdings.get(tk, 0.0), agent.entry_prices.get(tk, 0.0))
+            db.log_trade(agent.agent_id, tk, "COVER", cover_sh, px, 0.0, reason="FLIP_COVER")
+            trades.append((tk, "COVER", cover_sh, px))
 
-        old_entry = float(agent.entry_prices.get(tk, px) or px)
-        if abs(want) < 1e-9:
-            agent.entry_prices[tk] = 0.0
-        elif abs(have) < 1e-9 or ((have > 0) != (want > 0)):
-            agent.entry_prices[tk] = px
-        elif abs(want) > abs(have):
-            agent.entry_prices[tk] = ((abs(have) * old_entry) + (abs(delta) * px)) / abs(want)
-        # else: reducing — keep existing entry price
+            buy_sh = want
+            buy_dollars = min(buy_sh * px, agent.available_cash)
+            if buy_dollars >= MIN_TRADE_NOTIONAL:
+                actual_buy_sh = buy_dollars / px
+                agent.fill_order(tk, "BUY", actual_buy_sh, px)
+                db.update_agent_cash(agent.agent_id, agent.cash)
+                db.update_agent_holding(agent.agent_id, tk, agent.holdings.get(tk, 0.0), agent.entry_prices.get(tk, 0.0))
+                db.log_trade(agent.agent_id, tk, "BUY", actual_buy_sh, px, abs(float(w)), reason="RISK_PARITY_ALLOCATION")
+                trades.append((tk, "BUY", actual_buy_sh, px))
+            continue
 
-        agent.holdings[tk] = 0.0 if abs(want) < 1e-9 else want
+        # Position flip: LONG to SHORT
+        if have > 0 and want < 0:
+            sell_sh = have
+            agent.fill_order(tk, "SELL", sell_sh, px)
+            db.update_agent_cash(agent.agent_id, agent.cash)
+            db.update_agent_holding(agent.agent_id, tk, agent.holdings.get(tk, 0.0), agent.entry_prices.get(tk, 0.0))
+            db.log_trade(agent.agent_id, tk, "SELL", sell_sh, px, 0.0, reason="FLIP_SELL")
+            trades.append((tk, "SELL", sell_sh, px))
+
+            short_sh = abs(want)
+            agent.fill_order(tk, "SHORT", short_sh, px)
+            db.update_agent_cash(agent.agent_id, agent.cash)
+            db.update_agent_holding(agent.agent_id, tk, agent.holdings.get(tk, 0.0), agent.entry_prices.get(tk, 0.0))
+            db.log_trade(agent.agent_id, tk, "SHORT", short_sh, px, abs(float(w)), reason="RISK_PARITY_ALLOCATION")
+            trades.append((tk, "SHORT", short_sh, px))
+            continue
 
         if have >= 0 and delta > 0:
             action = "BUY"
@@ -462,6 +484,16 @@ def _apply_target_book(agent, target_weights: Dict[str, float], prices: Dict[str
             action = "SHORT"
         else:
             action = "COVER"
+
+        # Constrain long allocation to available purchasing power
+        if action == "BUY":
+            allocated_dollars = delta * px
+            max_buy_dollars = min(allocated_dollars, agent.available_cash)
+            if max_buy_dollars < MIN_TRADE_NOTIONAL:
+                continue
+            delta = max_buy_dollars / px
+
+        agent.fill_order(tk, action, abs(delta), px)
 
         db.update_agent_cash(agent.agent_id, agent.cash)
         db.update_agent_holding(agent.agent_id, tk, agent.holdings.get(tk, 0.0), agent.entry_prices.get(tk, 0.0))
@@ -499,12 +531,7 @@ async def liquidate_all_to_cash(
                 adv = float(market_state.get(tk, {}).get("adv", 1000000.0) or 1000000.0)
                 action = "SELL" if shares > 0 else "COVER"
                 exec_price = risk_engine.calculate_execution_price(current_price, abs(shares), adv, action)
-                if shares > 0:
-                    agent.cash += shares * exec_price
-                else:
-                    agent.cash -= abs(shares) * exec_price
-                agent.holdings[tk] = 0.0
-                agent.entry_prices[tk] = 0.0
+                agent.fill_order(tk, action, abs(shares), exec_price)
                 db.update_agent_cash(agent.agent_id, agent.cash)
                 db.update_agent_holding(agent.agent_id, tk, 0.0, 0.0)
                 db.log_trade(agent.agent_id, tk, action, abs(shares), exec_price, 0.0, reason=reason)
@@ -579,6 +606,15 @@ async def run_consumer():
 
         for agent in swarm_mgr.population:
             agent.tenure_ticks = getattr(agent, "tenure_ticks", 0) + 1
+            agent.last_prices.update(prices)
+            eq = agent.calculate_equity(prices)
+            base_cap = agent.initial_capital if getattr(agent, "initial_capital", 0.0) > 0 else 100000.0
+            pnl = ((eq - base_cap) / base_cap) * 100.0
+            agent.equity = eq
+            agent.pnl_pct = pnl
+            if not agent.equity_history or agent.equity_history[-1] != eq:
+                agent.equity_history.append(eq)
+            db.log_snapshot(agent.agent_id, eq, agent.cash, pnl)
 
         logger.info(f"\n==================== 🔔 WINDOW #{tick_counter} ({window}) ====================")
 
@@ -663,12 +699,7 @@ async def run_consumer():
 
                 action = "SELL" if shares > 0 else "COVER"
                 exec_price = risk_engine.calculate_execution_price(current_price, abs(shares), adv, action)
-                if shares > 0:
-                    agent.cash += shares * exec_price
-                else:
-                    agent.cash -= abs(shares) * exec_price
-                agent.holdings[tk] = 0.0
-                agent.entry_prices[tk] = 0.0
+                agent.fill_order(tk, action, abs(shares), exec_price)
                 reason = "HARD_STOP_LOSS" if exit_signal == "STOP_LOSS" else "HARD_TAKE_PROFIT"
                 db.update_agent_cash(agent.agent_id, agent.cash)
                 db.update_agent_holding(agent.agent_id, tk, 0.0, 0.0)
@@ -758,9 +789,7 @@ async def run_consumer():
 
             # Update mark-to-market equity for telemetry.
             try:
-                current_equity = float(
-                    risk_engine.calculate_total_equity(agent.cash, agent.holdings, getattr(agent, "entry_prices", {}), prices)
-                )
+                current_equity = float(agent.calculate_equity(prices))
             except Exception:
                 current_equity = agent.cash
             agent.equity_history.append(current_equity)

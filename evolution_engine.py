@@ -67,6 +67,9 @@ class AgentGenome:
     technical_weight: float = 0.45
     stop_loss_pct: float = 0.025
     take_profit_pct: float = 0.050
+    short_positions: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    margin_requirement: float = 0.50
+    last_prices: Dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self):
         # Backfill lineage for legacy agents constructed without explicit root
@@ -94,6 +97,93 @@ class AgentGenome:
             self.take_profit_pct = float(np.clip(float(self.take_profit_pct), 0.030, 0.090))
         except Exception:
             pass
+
+        # Auto-populate short positions from holdings if negative
+        try:
+            for tk, qty in list((self.holdings or {}).items()):
+                if qty < 0 and tk not in self.short_positions:
+                    ep = float(self.entry_prices.get(tk, 0.0) or 0.0)
+                    self.short_positions[tk] = {"shares": abs(float(qty)), "entry_price": ep}
+        except Exception:
+            pass
+
+    @property
+    def available_cash(self) -> float:
+        """True available purchasing power deducting collateralized short liability & margin hold."""
+        try:
+            short_liability = sum(
+                pos['shares'] * self.last_prices.get(t, pos.get('entry_price', 0.0))
+                for t, pos in self.short_positions.items()
+            )
+            margin_hold = short_liability * (1.0 + self.margin_requirement)
+            return max(0.0, self.cash - margin_hold)
+        except Exception:
+            return max(0.0, self.cash)
+
+    def calculate_equity(self, current_prices: Optional[Dict[str, float]] = None) -> float:
+        """Institutional MTM equity: Cash + Longs - Shorts with zero price fallback guard."""
+        if current_prices:
+            for k, v in current_prices.items():
+                if v and float(v) > 0:
+                    self.last_prices[k] = float(v)
+
+        long_value = 0.0
+        short_liability = 0.0
+        for ticker, shares in (self.holdings or {}).items():
+            if shares == 0:
+                continue
+            pos_short = self.short_positions.get(ticker, {})
+            fallback_price = float(pos_short.get('entry_price') or self.entry_prices.get(ticker, 0.0) or 0.0)
+            price = float(self.last_prices.get(ticker, fallback_price) or fallback_price)
+            if shares > 0:
+                long_value += shares * price
+            else:
+                short_liability += abs(shares) * price
+
+        return round(self.cash + long_value - short_liability, 2)
+
+    def fill_order(self, ticker: str, action: str, shares: float, fill_price: float):
+        """Execute order fill adhering to institutional margin and ledger rules."""
+        act = action.upper()
+        sh = abs(float(shares))
+        px = float(fill_price)
+        if px > 0:
+            self.last_prices[ticker] = px
+
+        if act == "BUY":
+            self.cash -= sh * px
+            curr_h = self.holdings.get(ticker, 0.0)
+            old_entry = self.entry_prices.get(ticker, px)
+            new_h = curr_h + sh
+            if new_h > 0:
+                self.entry_prices[ticker] = ((curr_h * old_entry) + (sh * px)) / new_h if curr_h > 0 else px
+            self.holdings[ticker] = new_h
+        elif act == "SELL":
+            self.cash += sh * px
+            new_h = self.holdings.get(ticker, 0.0) - sh
+            self.holdings[ticker] = 0.0 if abs(new_h) < 1e-9 else new_h
+            if abs(self.holdings[ticker]) < 1e-9:
+                self.entry_prices[ticker] = 0.0
+        elif act == "SHORT":
+            self.cash += sh * px
+            curr_pos = self.short_positions.get(ticker, {"shares": 0.0, "entry_price": px})
+            tot_sh = curr_pos["shares"] + sh
+            avg_ep = ((curr_pos["shares"] * curr_pos["entry_price"]) + (sh * px)) / tot_sh if tot_sh > 0 else px
+            self.short_positions[ticker] = {"shares": tot_sh, "entry_price": avg_ep}
+            self.entry_prices[ticker] = avg_ep
+            self.holdings[ticker] = self.holdings.get(ticker, 0.0) - sh
+        elif act == "COVER":
+            self.cash -= sh * px
+            curr_pos = self.short_positions.get(ticker, {"shares": sh, "entry_price": px})
+            rem_sh = curr_pos["shares"] - sh
+            if rem_sh > 1e-9:
+                self.short_positions[ticker]["shares"] = rem_sh
+            else:
+                self.short_positions.pop(ticker, None)
+            new_h = self.holdings.get(ticker, 0.0) + sh
+            self.holdings[ticker] = 0.0 if abs(new_h) < 1e-9 else new_h
+            if abs(self.holdings[ticker]) < 1e-9:
+                self.entry_prices[ticker] = 0.0
 
     def max_drawdown(self) -> float:
         """Peak-to-trough max drawdown in [0,1)."""

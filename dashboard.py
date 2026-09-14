@@ -1,5 +1,8 @@
 import os
+import json
+import numpy as np
 import pandas as pd
+import redis
 import sqlalchemy
 import plotly.express as px
 import plotly.graph_objects as go
@@ -289,9 +292,31 @@ POSTGRES_DB = os.getenv("POSTGRES_DB", "evoquant_db")
 
 POSTGRES_URL = f"postgresql+psycopg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
 
+def is_running_in_streamlit() -> bool:
+    try:
+        from streamlit.runtime import exists
+        return bool(exists())
+    except Exception:
+        return False
+
 @st.cache_resource
 def get_db_engine():
-    return sqlalchemy.create_engine(POSTGRES_URL, pool_size=5, max_overflow=10)
+    return sqlalchemy.create_engine(
+        POSTGRES_URL,
+        pool_size=5,
+        max_overflow=10,
+        connect_args={"connect_timeout": 2}
+    )
+
+@st.cache_resource
+def get_redis_client():
+    return redis.Redis(
+        host=os.getenv("REDIS_HOST", "redis"),
+        port=int(os.getenv("REDIS_PORT", 6379)),
+        password=os.getenv("REDIS_PASSWORD", "") or None,
+        decode_responses=True,
+        socket_timeout=2.0
+    )
 
 @st.cache_data(ttl=2)
 def load_snapshots() -> pd.DataFrame:
@@ -361,6 +386,49 @@ def load_dividend_schedule() -> pd.DataFrame:
         return pd.read_sql_query("SELECT * FROM dividend_schedule ORDER BY ex_date ASC", engine)
     except Exception:
         return pd.DataFrame()
+
+@st.cache_data(ttl=5)
+def load_news_reasoning_data() -> list:
+    records: list = []
+    # 1. Query Redis for latest and historical debate reasoning
+    try:
+        r = get_redis_client()
+        if r is not None:
+            latest_raw = r.get("market:news_reasoning:latest")
+            if latest_raw:
+                try:
+                    parsed = json.loads(latest_raw)
+                    if isinstance(parsed, dict):
+                        records.append(parsed)
+                except Exception:
+                    pass
+            history_raw = r.lrange("market:news_reasoning:history", 0, 9)
+            if history_raw:
+                for item in history_raw:
+                    try:
+                        p = json.loads(item)
+                        if isinstance(p, dict) and p not in records:
+                            records.append(p)
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    # 2. Fallback to TimescaleDB news_sentiment_log if Redis has no records
+    if not records:
+        try:
+            import db_manager
+            df = db_manager.get_latest_news_sentiment(limit=10)
+            if not df.empty:
+                for _, row in df.iterrows():
+                    d = dict(row)
+                    if "timestamp" in d and hasattr(d["timestamp"], "isoformat"):
+                        d["timestamp"] = d["timestamp"].isoformat()
+                    records.append(d)
+        except Exception:
+            pass
+
+    return records
 
 # ==========================================
 # 3. SIDEBAR CONTROLS
@@ -459,9 +527,64 @@ def render_kpi_metrics():
     if not df_macro.empty:
         st.info(f"📰 **Latest News RAG Reasoning:** {df_macro['summary_reasoning'].iloc[0]}")
 
-render_kpi_metrics()
-
 st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
+
+# --- NEWS SENTIMENT & LLM ADVERSARIAL DEBATE FRAGMENT ---
+@st.fragment(run_every=refresh_interval)
+def render_news_debate_section():
+    records = load_news_reasoning_data()
+    st.markdown("<p class='section-title'>🧠 LLM Adversarial Market Debate & Sentiment Radar</p>", unsafe_allow_html=True)
+    st.markdown("<p class='section-subtitle'>Real-time Bull vs Bear theses arbitrated by Google AI Studio against 15m price action</p>", unsafe_allow_html=True)
+
+    if not records:
+        st.info("🕒 Awaiting next 15-minute LLM market debate cycle...")
+        return
+
+    table_rows = []
+    for rec in records:
+        score = float(rec.get("score", 0.0) or 0.0)
+        multiplier = float(np.clip(1.0 + (score * 0.3), 0.5, 1.5))
+        table_rows.append({
+            "timestamp": rec.get("timestamp", "-"),
+            "symbol": rec.get("symbol", "SPY"),
+            "score": score,
+            "confidence": float(rec.get("confidence", 0.8) or 0.8),
+            "multiplier": multiplier,
+        })
+    df_debates = pd.DataFrame(table_rows)
+    if "timestamp" in df_debates.columns:
+        df_debates["timestamp"] = pd.to_datetime(df_debates["timestamp"])
+
+    st.dataframe(
+        df_debates,
+        column_config={
+            "timestamp": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm"),
+            "symbol": st.column_config.TextColumn("Symbol"),
+            "score": st.column_config.NumberColumn("Consensus Score", format="%+.2f"),
+            "confidence": st.column_config.NumberColumn("Confidence", format="%.2f"),
+            "multiplier": st.column_config.NumberColumn("Regime Multiplier", format="%.2fx"),
+        },
+        use_container_width=True,
+        hide_index=True
+    )
+
+    for idx, rec in enumerate(records[:5]):
+        sym = rec.get("symbol", "SPY")
+        score = float(rec.get("score", 0.0) or 0.0)
+        multiplier = float(np.clip(1.0 + (score * 0.3), 0.5, 1.5))
+        ts_str = str(rec.get("timestamp", ""))[:19].replace("T", " ")
+        sentiment_label = "🟢 Bullish" if score > 0.1 else ("🔴 Bearish" if score < -0.1 else "⚪ Neutral")
+
+        with st.expander(f"**{sym}** | Score: `{score:+.2f}` ({sentiment_label}) | Scale: `{multiplier:.2f}x` | *{ts_str}*", expanded=(idx == 0)):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"**🟢 Bull Thesis:**")
+                st.markdown(f"> {rec.get('bull_thesis', 'Bullish thesis pending.')}")
+            with c2:
+                st.markdown(f"**🔴 Bear Thesis:**")
+                st.markdown(f"> {rec.get('bear_thesis', 'Bearish thesis pending.')}")
+            st.markdown(f"**🧠 Arbiter Synthesis & Market Multiplier:** `{multiplier:.2f}x`")
+            st.info(f"{rec.get('arbiter_reasoning', 'Arbiter consensus reasoning pending.')}")
 
 # --- ROW 1: EQUITY CURVES & LIVE LEADERBOARD FRAGMENT ---
 @st.fragment(run_every=refresh_interval)
@@ -533,41 +656,8 @@ def render_row_1():
             height=350
         )
 
-render_row_1()
 
-# Collapsible toggle/view for historical / culled agents
-with st.expander("💀 View Historical & Culled Agent Archive", expanded=False):
-    df_snapshots_all = load_snapshots()
-    if not df_snapshots_all.empty:
-        latest_all = df_snapshots_all.sort_values('timestamp').groupby('agent_id').last().reset_index()
-        culled_df = latest_all[latest_all['equity'] <= 0][['agent_id', 'equity', 'cash', 'pnl_pct']].sort_values('agent_id')
-        if not culled_df.empty:
-            st.dataframe(
-                culled_df,
-                column_config={
-                    "agent_id": st.column_config.TextColumn("Agent ID (Culled)"),
-                    "equity": st.column_config.NumberColumn("Terminal Equity", format="$%.2f"),
-                    "cash": st.column_config.NumberColumn("Terminal Cash", format="$%.2f"),
-                    "pnl_pct": st.column_config.NumberColumn("Terminal PnL %", format="%+.2f%%"),
-                },
-                use_container_width=True,
-                hide_index=True
-            )
-        else:
-            st.info("No culled or liquidated agents in current epoch history.")
-    else:
-        st.info("No snapshot telemetry found.")
-
-st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
-
-# --- ROW 2: AGENT PORTFOLIO INSPECTOR ---
-st.markdown("<p class='section-title'>🔍 Agent Position & Allocation Inspector</p>", unsafe_allow_html=True)
-st.markdown("<p class='section-subtitle'>Drill into any agent's live book (Long & Short Positions)</p>", unsafe_allow_html=True)
-
-df_active_init = load_active_snapshots() if not show_culled else load_snapshots()
-agents_list = df_active_init['agent_id'].unique().tolist() if not df_active_init.empty else ["Agent_Alpha", "Agent_Beta", "Agent_Gamma", "Agent_Delta", "Agent_Epsilon"]
-selected_agent = st.selectbox("Select Agent Persona to Inspect:", agents_list)
-
+# --- ROW 2: AGENT PORTFOLIO INSPECTOR FRAGMENT ---
 @st.fragment(run_every=refresh_interval)
 def render_row_2(agent_id):
     df_holdings = load_holdings()
@@ -643,9 +733,6 @@ def render_row_2(agent_id):
     else:
         st.info(f"💡 `{agent_id}` has no active stock positions registered across the swarm.")
 
-render_row_2(selected_agent)
-
-st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
 
 # --- ROW 3: DIVIDEND ACTIVITY & SCHEDULE LEDGER FRAGMENT ---
 @st.fragment(run_every=refresh_interval)
@@ -694,67 +781,119 @@ def render_row_3():
         else:
             st.info("No upcoming ex-dividend dates registered.")
 
-render_row_3()
 
-st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
+# --- ROW 4: MASTER TRADE AUDIT LOG FRAGMENT ---
+@st.fragment(run_every=refresh_interval)
+def render_row_4(sel_agents, sel_actions, sel_reasons):
+    df_trades = load_trades()
+    if df_trades.empty:
+        st.info("No trade logs recorded in `TimescaleDB` yet.")
+        return
 
-# --- ROW 4: MASTER TRADE AUDIT LOG ---
-st.markdown("<p class='section-title'>📜 Master Execution Trade Audit Log</p>", unsafe_allow_html=True)
-st.markdown("<p class='section-subtitle'>Full execution history across the swarm, filterable by agent, action, and reason</p>", unsafe_allow_html=True)
+    filtered_df = df_trades[
+        (df_trades['agent_id'].isin(sel_agents)) &
+        (df_trades['action'].isin(sel_actions))
+    ].copy()
 
-df_trades_init = load_trades()
-if not df_trades_init.empty:
-    f_col1, f_col2, f_col3 = st.columns(3)
+    if "reason" in df_trades.columns:
+        filtered_df = filtered_df[filtered_df['reason'].isin(sel_reasons)]
 
-    default_agents = df_trades_init['agent_id'].unique().tolist() if 'agent_id' in df_trades_init.columns else []
-    default_actions = df_trades_init['action'].unique().tolist() if 'action' in df_trades_init.columns else []
-    reasons_list = df_trades_init['reason'].unique().tolist() if "reason" in df_trades_init.columns else ["ALLOCATION"]
+    cols_to_show = ['timestamp', 'agent_id', 'action', 'ticker', 'shares', 'price', 'allocation_pct']
+    if "reason" in df_trades.columns:
+        cols_to_show.append('reason')
 
-    with f_col1:
-        selected_agents_filter = st.multiselect("Filter Agents:", options=default_agents, default=default_agents)
-    with f_col2:
-        selected_actions_filter = st.multiselect("Filter Order Type:", options=default_actions, default=default_actions)
-    with f_col3:
-        selected_reasons_filter = st.multiselect("Filter Execution Reason:", options=reasons_list, default=reasons_list)
+    display_df = filtered_df[cols_to_show].copy()
+    display_df['allocation_pct'] = display_df['allocation_pct'] * 100.0
 
-    @st.fragment(run_every=refresh_interval)
-    def render_row_4(sel_agents, sel_actions, sel_reasons):
-        df_trades = load_trades()
-        if df_trades.empty:
-            st.info("No trade logs recorded in `TimescaleDB` yet.")
-            return
+    st.dataframe(
+        display_df,
+        column_config={
+            "timestamp": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm:ss"),
+            "agent_id": st.column_config.TextColumn("Agent"),
+            "action": st.column_config.TextColumn("Action"),
+            "ticker": st.column_config.TextColumn("Ticker"),
+            "shares": st.column_config.NumberColumn("Shares", format="%.2f"),
+            "price": st.column_config.NumberColumn("Exec Price", format="$%.2f"),
+            "allocation_pct": st.column_config.NumberColumn("Alloc %", format="%.1f%%"),
+            "reason": st.column_config.TextColumn("Execution Reason"),
+        },
+        use_container_width=True,
+        hide_index=True
+    )
 
-        filtered_df = df_trades[
-            (df_trades['agent_id'].isin(sel_agents)) &
-            (df_trades['action'].isin(sel_actions))
-        ].copy()
 
-        if "reason" in df_trades.columns:
-            filtered_df = filtered_df[filtered_df['reason'].isin(sel_reasons)]
+def render_dashboard():
+    render_kpi_metrics()
+    st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
+    render_news_debate_section()
+    st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
+    render_row_1()
 
-        cols_to_show = ['timestamp', 'agent_id', 'action', 'ticker', 'shares', 'price', 'allocation_pct']
-        if "reason" in df_trades.columns:
-            cols_to_show.append('reason')
+    # Collapsible toggle/view for historical / culled agents
+    with st.expander("💀 View Historical & Culled Agent Archive", expanded=False):
+        df_snapshots_all = load_snapshots()
+        if not df_snapshots_all.empty:
+            latest_all = df_snapshots_all.sort_values('timestamp').groupby('agent_id').last().reset_index()
+            culled_df = latest_all[latest_all['equity'] <= 0][['agent_id', 'equity', 'cash', 'pnl_pct']].sort_values('agent_id')
+            if not culled_df.empty:
+                st.dataframe(
+                    culled_df,
+                    column_config={
+                        "agent_id": st.column_config.TextColumn("Agent ID (Culled)"),
+                        "equity": st.column_config.NumberColumn("Terminal Equity", format="$%.2f"),
+                        "cash": st.column_config.NumberColumn("Terminal Cash", format="$%.2f"),
+                        "pnl_pct": st.column_config.NumberColumn("Terminal PnL %", format="%+.2f%%"),
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.info("No culled or liquidated agents in current epoch history.")
+        else:
+            st.info("No snapshot telemetry found.")
 
-        display_df = filtered_df[cols_to_show].copy()
-        display_df['allocation_pct'] = display_df['allocation_pct'] * 100.0
+    st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
 
-        st.dataframe(
-            display_df,
-            column_config={
-                "timestamp": st.column_config.DatetimeColumn("Timestamp", format="YYYY-MM-DD HH:mm:ss"),
-                "agent_id": st.column_config.TextColumn("Agent"),
-                "action": st.column_config.TextColumn("Action"),
-                "ticker": st.column_config.TextColumn("Ticker"),
-                "shares": st.column_config.NumberColumn("Shares", format="%.2f"),
-                "price": st.column_config.NumberColumn("Exec Price", format="$%.2f"),
-                "allocation_pct": st.column_config.NumberColumn("Alloc %", format="%.1f%%"),
-                "reason": st.column_config.TextColumn("Execution Reason"),
-            },
-            use_container_width=True,
-            hide_index=True
-        )
+    # --- ROW 2: AGENT PORTFOLIO INSPECTOR ---
+    st.markdown("<p class='section-title'>🔍 Agent Position & Allocation Inspector</p>", unsafe_allow_html=True)
+    st.markdown("<p class='section-subtitle'>Drill into any agent's live book (Long & Short Positions)</p>", unsafe_allow_html=True)
 
-    render_row_4(selected_agents_filter, selected_actions_filter, selected_reasons_filter)
-else:
-    st.info("No trade logs recorded in `TimescaleDB` yet.")
+    df_active_init = load_active_snapshots() if not show_culled else load_snapshots()
+    agents_list = df_active_init['agent_id'].unique().tolist() if not df_active_init.empty else ["Agent_Alpha", "Agent_Beta", "Agent_Gamma", "Agent_Delta", "Agent_Epsilon"]
+    selected_agent = st.selectbox("Select Agent Persona to Inspect:", agents_list)
+    render_row_2(selected_agent)
+
+    st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
+
+    # --- ROW 3: DIVIDEND ACTIVITY & SCHEDULE LEDGER ---
+    render_row_3()
+
+    st.markdown("<hr class='app-divider'>", unsafe_allow_html=True)
+
+    # --- ROW 4: MASTER TRADE AUDIT LOG ---
+    st.markdown("<p class='section-title'>📜 Master Execution Trade Audit Log</p>", unsafe_allow_html=True)
+    st.markdown("<p class='section-subtitle'>Full execution history across the swarm, filterable by agent, action, and reason</p>", unsafe_allow_html=True)
+
+    df_trades_init = load_trades()
+    if not df_trades_init.empty:
+        f_col1, f_col2, f_col3 = st.columns(3)
+
+        default_agents = df_trades_init['agent_id'].unique().tolist() if 'agent_id' in df_trades_init.columns else []
+        default_actions = df_trades_init['action'].unique().tolist() if 'action' in df_trades_init.columns else []
+        reasons_list = df_trades_init['reason'].unique().tolist() if "reason" in df_trades_init.columns else ["ALLOCATION"]
+
+        with f_col1:
+            selected_agents_filter = st.multiselect("Filter Agents:", options=default_agents, default=default_agents)
+        with f_col2:
+            selected_actions_filter = st.multiselect("Filter Order Type:", options=default_actions, default=default_actions)
+        with f_col3:
+            selected_reasons_filter = st.multiselect("Filter Execution Reason:", options=reasons_list, default=reasons_list)
+
+        render_row_4(selected_agents_filter, selected_actions_filter, selected_reasons_filter)
+    else:
+        st.info("No trade logs recorded in `TimescaleDB` yet.")
+
+
+if is_running_in_streamlit() or __name__ == "__main__":
+    render_dashboard()
+

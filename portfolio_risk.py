@@ -25,6 +25,8 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
+from engine import CrossAssetPortfolioManager
+
 logger = logging.getLogger("PortfolioRisk")
 
 # Ticker -> sector, covering the traded universe and defensive instruments.
