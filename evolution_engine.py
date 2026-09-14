@@ -471,7 +471,6 @@ Ensure the prompt instructs the agent to evaluate technical theses and output tr
 Return ONLY a valid JSON object: {{"new_prompt": "string"}}
 """
 
-        url = config.gemini_chat_url(config.GOOGLE_API_BASE_URL)
         # Preserve legacy semantics: an explicitly-supplied empty string means
         # "offline"; only fall back to the environment when api_key is None.
         api_key = self.api_key if self.api_key is not None else (
@@ -483,10 +482,8 @@ Return ONLY a valid JSON object: {{"new_prompt": "string"}}
         if not api_key:
             mutated_prompt = f"{parent.persona_prompt} (Mutated: {mutation_trait})"
         else:
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
+            # Native Google auth is via the ?key= query param in the URL.
+            headers = {"Content-Type": "application/json"}
 
             models = [config.GEMINI_MODEL]
             if config.GEMINI_FALLBACK_MODEL and config.GEMINI_FALLBACK_MODEL not in models:
@@ -494,7 +491,7 @@ Return ONLY a valid JSON object: {{"new_prompt": "string"}}
 
             max_retries = 3
             backoff_factor = 2.0
-            fallback_status = (404, 500, 502, 503, 504)
+            fallback_status = (400, 404, 500, 502, 503, 504)
             request_timeout = httpx.Timeout(
                 timeout=float(config.GEMINI_TIMEOUT_SECONDS),
                 connect=float(config.GEMINI_CONNECT_TIMEOUT_SECONDS),
@@ -502,12 +499,17 @@ Return ONLY a valid JSON object: {{"new_prompt": "string"}}
 
             async with httpx.AsyncClient(timeout=request_timeout) as client:
                 for model in models:
+                    url = config.gemini_generate_url(model, api_key)
                     payload = {
-                        "model": model,
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.3,
-                        "max_tokens": 1024,
-                        "response_format": {"type": "json_object"}
+                        "contents": [
+                            {
+                                "parts": [{"text": prompt}]
+                            }
+                        ],
+                        "generationConfig": {
+                            "temperature": 0.3,
+                            "maxOutputTokens": 1024,
+                        },
                     }
                     resolved = False
                     for attempt in range(max_retries):
@@ -528,7 +530,11 @@ Return ONLY a valid JSON object: {{"new_prompt": "string"}}
 
                             resp.raise_for_status()
                             data = resp.json()
-                            content = data['choices'][0]['message']['content'] or ""
+                            candidates = data.get("candidates", [])
+                            if not candidates:
+                                logger.warning(f"⚠️ No candidate content from '{model}' during mutation: {data}")
+                                break
+                            content = config.gemini_extract_text(candidates)
 
                             # Strip markdown formatting
                             cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", content).strip()
@@ -556,7 +562,7 @@ Return ONLY a valid JSON object: {{"new_prompt": "string"}}
                             logger.warning(f"⚠️ HTTP error {code} during mutation: {body}")
                             if code in fallback_status:
                                 break
-                            if code in (400, 401, 403):
+                            if code in (401, 403):
                                 break
                             if attempt == max_retries - 1:
                                 break

@@ -296,10 +296,10 @@ class DualModelTradingSwarm:
         role_tag: str = "LLM"
     ) -> Any:
         """
-        Google AI Studio call with the centralized model id, extended timeout and
-        automatic fallback model on 500/502/503/504 (unroutable) or 404 (missing).
+        Native Google AI Studio `generateContent` call with the code-hardcoded
+        model id, extended timeout and automatic fallback model on
+        400/404/500/502/503/504.
         """
-        url = config.gemini_chat_url(config.GOOGLE_API_BASE_URL)
         api_key = (
             self.api_key
             or config.GEMINI_API_KEY
@@ -310,10 +310,8 @@ class DualModelTradingSwarm:
         if not api_key:
             raise ValueError("Gemini API key is not set in environment variables (GEMINI_API_KEY or GOOGLE_API_KEY).")
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
+        # Native Google auth is via the ?key= query param in the URL.
+        headers = {"Content-Type": "application/json"}
 
         request_timeout = httpx.Timeout(
             timeout=float(config.GEMINI_TIMEOUT_SECONDS),
@@ -326,19 +324,25 @@ class DualModelTradingSwarm:
 
         max_retries = 3
         backoff_factor = 2.0
-        fallback_status = (404, 500, 502, 503, 504)
+        fallback_status = (400, 404, 500, 502, 503, 504)
         last_error: Optional[Exception] = None
 
+        # Native generateContent has no separate system role for Gemma, so the
+        # system prompt is prepended to the user turn.
+        combined_prompt = f"{sys_prompt}\n\n{user_input}"
+
         for model in models:
+            url = config.gemini_generate_url(model, api_key)
             payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_input}
+                "contents": [
+                    {
+                        "parts": [{"text": combined_prompt}]
+                    }
                 ],
-                "temperature": 0.1,
-                "max_tokens": 4096,
-                "response_format": {"type": "json_object"}
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": 4096,
+                },
             }
 
             for attempt in range(max_retries):
@@ -360,7 +364,16 @@ class DualModelTradingSwarm:
 
                     resp.raise_for_status()
                     data = resp.json()
-                    raw_content = data['choices'][0]['message']['content']
+                    candidates = data.get("candidates", [])
+                    if not candidates:
+                        last_error = ValueError(f"No candidate content returned: {data}")
+                        logger.warning(f"⚠️ No candidate content for [{role_tag}] from '{model}'; trying next model.")
+                        break
+                    raw_content = config.gemini_extract_text(candidates)
+                    if not raw_content:
+                        last_error = RuntimeError(f"empty completion from '{model}'")
+                        logger.warning(f"⚠️ Empty completion for [{role_tag}] from '{model}'; trying next model.")
+                        break
                     cleaned_content = clean_llm_json_string(raw_content)
 
                     validated_output = model_class.model_validate_json(cleaned_content)
@@ -375,7 +388,7 @@ class DualModelTradingSwarm:
                         break
                     body = hse.response.text if hse.response is not None else str(hse)
                     logger.warning(f"⚠️ HTTP status error {code} for [{role_tag}]: {body}")
-                    if code in (400, 401, 403):
+                    if code in (401, 403):
                         raise
                     if attempt == max_retries - 1:
                         break

@@ -61,15 +61,21 @@ def mock_redis(monkeypatch):
 
 @pytest.fixture
 def mock_httpx_client(monkeypatch):
-    """Mock fixture for httpx.AsyncClient."""
+    """Mock fixture for httpx.AsyncClient (native Google generateContent schema)."""
     mock_client = MagicMock()
     mock_client.__aenter__.return_value = mock_client
     mock_client.__aexit__.return_value = None
     mock_resp = MagicMock()
     mock_resp.status_code = 200
     mock_resp.json.return_value = {
-        "choices": [
-            {"message": {"content": '{"new_prompt": "Mutated strategy prompt with risk controls"}'}}
+        "candidates": [
+            {
+                "content": {
+                    "parts": [{"text": '{"new_prompt": "Mutated strategy prompt with risk controls"}'}],
+                    "role": "model",
+                },
+                "finishReason": "STOP",
+            }
         ]
     }
     mock_client.post = AsyncMock(return_value=mock_resp)

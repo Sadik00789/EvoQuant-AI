@@ -182,7 +182,8 @@ class NewsSentimentAgent:
     On HTTP 429 or parsing failure, falls back to previous cached scores or 0.0 neutral.
     """
     # Model-level failures that should trigger an automatic fallback-model retry.
-    _MODEL_FALLBACK_STATUS = frozenset({404, 500, 502, 503, 504})
+    # 400 is included because Gemma rejects some params that Gemini accepts.
+    _MODEL_FALLBACK_STATUS = frozenset({400, 404, 500, 502, 503, 504})
 
     def __init__(self, api_key: str = None, cache_ttl: float = 1200.0):
         self.api_key = (
@@ -197,11 +198,9 @@ class NewsSentimentAgent:
             "https://feeds.content.dowjones.io/public/rss/mw_topstories",
             "https://news.google.com/rss/search?q=stock+market+economy&hl=en-US&gl=US&ceid=US:en"
         ]
-        # Model id is read dynamically from the environment (via config) so the
-        # deployment can be re-pointed without a code change.
+        # Model ids are hardcoded in config.py (NOT read from the environment).
         self.model = config.GEMINI_MODEL
         self.fallback_model = config.GEMINI_FALLBACK_MODEL
-        self.api_url = config.gemini_chat_url(config.GOOGLE_API_BASE_URL)
         self.timeout = httpx.Timeout(
             timeout=float(config.GEMINI_TIMEOUT_SECONDS),
             connect=float(config.GEMINI_CONNECT_TIMEOUT_SECONDS),
@@ -210,10 +209,10 @@ class NewsSentimentAgent:
         self.base_delay = 2.0
         self.backoff = 2.0
 
-    def _model_chain(self) -> list:
+    def _model_chain(self, primary: str = None) -> list:
         """Ordered list of model ids: primary first, then the fallback (deduped)."""
-        chain = [self.model]
-        fb = getattr(self, "fallback_model", None)
+        chain = [str(primary) if primary else (self.model or config.GEMINI_MODEL)]
+        fb = getattr(self, "fallback_model", None) or config.GEMINI_FALLBACK_MODEL
         if fb and fb not in chain:
             chain.append(fb)
         return chain
@@ -249,46 +248,60 @@ class NewsSentimentAgent:
     # ------------------------------------------------------------------
     # Low-level LLM caller with exponential backoff
     # ------------------------------------------------------------------
-    async def _call_gemini_text(self, prompt: str, temperature: float = 0.2, max_tokens: int = 2048) -> str:
+    async def _call_gemini_text(
+        self,
+        prompt: str,
+        temperature: float = 0.2,
+        max_tokens: int = 2048,
+        model: str = None,
+    ) -> str:
         """
-        Text completion against Google AI Studio's OpenAI-compatible endpoint.
+        Native Google AI Studio ``generateContent`` text completion.
 
         Hardening:
           * extended read timeout (default 90s) + short 15s connect so a dead
             endpoint fails fast without hanging the 15-minute tick loop;
-          * bearer-token auth from the environment;
+          * native ``?key=`` query-param authentication (no Authorization header);
           * retries with exponential backoff on 429 / transient transport errors;
           * automatic one-shot fallback to ``GEMINI_FALLBACK_MODEL`` when the
-            primary model returns 500/502/503/504 (unroutable) or 404 (missing).
+            primary model returns HTTP 400/404/500/502/503/504.
         Raises on terminal failure so callers can apply their own safe fallback.
         """
         api_key = (
             self.api_key
+            or config.GEMINI_API_KEY
             or os.getenv("GEMINI_API_KEY")
             or os.getenv("GOOGLE_API_KEY")
         )
         if not api_key:
             raise ValueError("Gemini API key is not set (GEMINI_API_KEY or GOOGLE_API_KEY).")
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        models = self._model_chain()
+
+        models = self._model_chain(model)
+        headers = {"Content-Type": "application/json"}
         last_error: Optional[Exception] = None
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            for model in models:
+            for current_model in models:
+                url = config.gemini_generate_url(current_model, api_key)
                 payload = {
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
+                    "contents": [
+                        {
+                            "parts": [{"text": prompt}]
+                        }
+                    ],
+                    "generationConfig": {
+                        "temperature": temperature,
+                        "maxOutputTokens": max_tokens,
+                    },
                 }
                 for attempt in range(self.max_retries):
                     try:
-                        resp = await client.post(self.api_url, json=payload, headers=headers)
+                        resp = await client.post(url, json=payload, headers=headers)
                         if resp.status_code == 429:
                             sleep_time = self.base_delay * (self.backoff ** attempt)
                             logger.warning(
-                                f"⚠️ [Rate Limit / 429] '{model}' debate call. Retrying in {sleep_time:.1f}s "
-                                f"(Attempt {attempt + 1}/{self.max_retries})..."
+                                f"⚠️ [Rate Limit / 429] '{current_model}' generateContent call. "
+                                f"Retrying in {sleep_time:.1f}s (Attempt {attempt + 1}/{self.max_retries})..."
                             )
                             if attempt == self.max_retries - 1:
                                 break
@@ -296,36 +309,40 @@ class NewsSentimentAgent:
                             continue
                         if resp.status_code in self._MODEL_FALLBACK_STATUS:
                             last_error = RuntimeError(
-                                f"model '{model}' returned HTTP {resp.status_code}"
+                                f"model '{current_model}' returned HTTP {resp.status_code}"
                             )
                             logger.warning(
-                                f"⚠️ Model '{model}' returned HTTP {resp.status_code} "
+                                f"⚠️ Model '{current_model}' returned HTTP {resp.status_code} "
                                 f"(unroutable/missing); retrying with fallback model."
                             )
                             break  # advance to the next model in the chain
                         resp.raise_for_status()
                         data = resp.json()
-                        choices = data.get("choices") or []
-                        content = ""
-                        if choices:
-                            content = (choices[0].get("message") or {}).get("content") or ""
-                        if not content:
-                            last_error = RuntimeError(f"empty completion from '{model}'")
-                            logger.warning(f"⚠️ Empty completion from '{model}'; trying next model.")
+                        candidates = data.get("candidates", [])
+                        if not candidates:
+                            last_error = ValueError(f"No candidate content returned: {data}")
+                            logger.warning(
+                                f"⚠️ No candidate content from '{current_model}'; trying next model."
+                            )
                             break
-                        return str(content)
+                        text = config.gemini_extract_text(candidates)
+                        if not text:
+                            last_error = RuntimeError(f"empty completion from '{current_model}'")
+                            logger.warning(f"⚠️ Empty completion from '{current_model}'; trying next model.")
+                            break
+                        return str(text)
                     except httpx.HTTPStatusError as hse:
                         code = hse.response.status_code if hse.response is not None else 0
                         last_error = hse
                         if code in self._MODEL_FALLBACK_STATUS:
                             logger.warning(
-                                f"⚠️ HTTP {code} for model '{model}'; retrying with fallback model."
+                                f"⚠️ HTTP {code} for model '{current_model}'; retrying with fallback model."
                             )
                             break  # advance to the next model in the chain
-                        if code in (400, 401, 403):
-                            logger.error(f"❌ HTTP {code} for model '{model}'; aborting (auth/bad request).")
+                        if code in (401, 403):
+                            logger.error(f"❌ HTTP {code} for model '{current_model}'; aborting (auth failure).")
                             raise
-                        logger.warning(f"⚠️ HTTP {code} during debate call (model='{model}'): {hse}")
+                        logger.warning(f"⚠️ HTTP {code} during debate call (model='{current_model}'): {hse}")
                         if attempt == self.max_retries - 1:
                             break
                         await asyncio.sleep(self.base_delay * (self.backoff ** attempt))
@@ -333,7 +350,7 @@ class NewsSentimentAgent:
                         last_error = te
                         logger.warning(
                             f"⚠️ Transport/timeout (attempt {attempt + 1}/{self.max_retries}, "
-                            f"model='{model}'): {type(te).__name__} - {te}"
+                            f"model='{current_model}'): {type(te).__name__} - {te}"
                         )
                         if attempt == self.max_retries - 1:
                             break
@@ -341,13 +358,13 @@ class NewsSentimentAgent:
                     except Exception as e:
                         last_error = e
                         logger.warning(
-                            f"⚠️ Debate call attempt failed (model='{model}'): {type(e).__name__} - {e}"
+                            f"⚠️ Debate call attempt failed (model='{current_model}'): {type(e).__name__} - {e}"
                         )
                         if attempt == self.max_retries - 1:
                             break
                         await asyncio.sleep(self.base_delay * (self.backoff ** attempt))
 
-        raise RuntimeError(f"Gemini debate call failed across models {models}: {last_error}")
+        raise RuntimeError(f"Gemini generateContent failed across models {models}: {last_error}")
 
     async def _call_gemini_json(
         self, prompt: str, temperature: float = 0.1, max_tokens: int = 1024

@@ -254,19 +254,42 @@ def test_dividend_guard_short_entry_allowed_accepts_optional_sizing():
     assert guard.short_entry_allowed("AAPL", current_time=datetime.now(timezone.utc)) is True
 
 
-def test_config_centralizes_gemini_settings_and_endpoint():
+def test_config_hardcodes_native_gemini_models_and_endpoint(monkeypatch):
     import config
 
-    assert config.GEMINI_MODEL, "GEMINI_MODEL must be resolved from the environment"
-    assert config.GEMINI_FALLBACK_MODEL, "GEMINI_FALLBACK_MODEL must be resolved"
-    assert config.settings.gemini_model == config.GEMINI_MODEL
+    # Model ids are defined in code, NOT sourced from the environment.
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    monkeypatch.delenv("GEMINI_FALLBACK_MODEL", raising=False)
+    monkeypatch.delenv("GOOGLE_API_BASE_URL", raising=False)
 
-    base = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    full = config.gemini_chat_url(base)
-    assert full.endswith("/chat/completions")
-    # A fully-qualified endpoint must not be double-suffixed.
-    assert config.gemini_chat_url(full) == full
-    assert config.settings.gemini_chat_url.endswith("/chat/completions")
+    assert config.GEMINI_MODEL == "gemma-4-31b-it"
+    assert config.GEMINI_FALLBACK_MODEL == "gemini-2.5-flash"
+    assert config.settings.gemini_model == "gemma-4-31b-it"
+    assert config.settings.gemini_fallback_model == "gemini-2.5-flash"
+
+    url = config.gemini_generate_url("gemma-4-31b-it", "KEY")
+    assert url == (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemma-4-31b-it:generateContent?key=KEY"
+    )
+    # A `models/` prefix is tolerated and stripped.
+    assert config.gemini_generate_url("models/gemini-2.5-flash", "K").startswith(
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.5-flash:generateContent"
+    )
+    # Settings-level helper defaults to the code-hardcoded primary model.
+    assert "gemma-4-31b-it:generateContent" in config.settings.gemini_generate_url()
+
+
+def _native_response(text):
+    return {
+        "candidates": [
+            {
+                "content": {"parts": [{"text": text}], "role": "model"},
+                "finishReason": "STOP",
+            }
+        ]
+    }
 
 
 class _FakeResponse:
@@ -287,7 +310,7 @@ class _FakeResponse:
             )
 
 
-def _make_fake_client(responses, seen_models):
+def _make_fake_client(responses, seen_urls, seen_payloads):
     class _FakeClient:
         def __init__(self, *args, **kwargs):
             pass
@@ -299,42 +322,47 @@ def _make_fake_client(responses, seen_models):
             return False
 
         async def post(self, url, json=None, headers=None, **kwargs):
-            seen_models.append((json or {}).get("model"))
+            seen_urls.append(url)
+            seen_payloads.append(json)
             code, payload = responses.pop(0)
             return _FakeResponse(code, payload)
 
     return _FakeClient
 
 
-def test_sentiment_llm_falls_back_on_500_and_404(monkeypatch):
+def test_sentiment_llm_falls_back_on_400_404_500(monkeypatch):
     import sentiment_agent as sa
 
-    for failure_code in (500, 404):
+    for failure_code in (400, 404, 500):
         agent = sa.NewsSentimentAgent(api_key="dummy")
         agent.model = f"primary-{failure_code}"
         agent.fallback_model = "fallback-model"
         agent.max_retries = 1
         responses = [
             (failure_code, {}),
-            (200, {"choices": [{"message": {"content": '{"AAPL": 0.3}'}}]}),
+            (200, _native_response('{"AAPL": 0.3}')),
         ]
-        seen_models: list = []
+        seen_urls: list = []
+        seen_payloads: list = []
         monkeypatch.setattr(
-            sa.httpx, "AsyncClient", _make_fake_client(responses, seen_models)
+            sa.httpx, "AsyncClient", _make_fake_client(responses, seen_urls, seen_payloads)
         )
         out = asyncio.run(agent._call_gemini_text("prompt"))
-        assert seen_models == [f"primary-{failure_code}", "fallback-model"]
+
+        assert f"primary-{failure_code}:generateContent" in seen_urls[0]
+        assert "fallback-model:generateContent" in seen_urls[1]
+        assert all(u.endswith("?key=dummy") for u in seen_urls)
         assert "AAPL" in out
+        # Native payload shape.
+        assert seen_payloads[0]["contents"][0]["parts"][0]["text"] == "prompt"
 
 
-def test_sentiment_llm_uses_90s_timeout_and_bearer_auth(monkeypatch):
+def test_sentiment_llm_native_payload_default_model_and_timeout(monkeypatch):
     import sentiment_agent as sa
 
     agent = sa.NewsSentimentAgent(api_key="secret-token")
     captured = {}
-    responses = [
-        (200, {"choices": [{"message": {"content": '{"NVDA": -0.4}'}}]})
-    ]
+    responses = [(200, _native_response('{"NVDA": -0.4}'))]
 
     class _Client:
         def __init__(self, *args, **kwargs):
@@ -347,16 +375,46 @@ def test_sentiment_llm_uses_90s_timeout_and_bearer_auth(monkeypatch):
             return False
 
         async def post(self, url, json=None, headers=None, **kwargs):
+            captured["url"] = url
             captured["headers"] = headers
-            captured["model"] = (json or {}).get("model")
+            captured["payload"] = json
             return _FakeResponse(responses[0][0], responses[0][1])
 
     monkeypatch.setattr(sa.httpx, "AsyncClient", _Client)
     out = asyncio.run(agent._call_gemini_text("prompt"))
 
     assert "NVDA" in out
-    assert captured["headers"]["Authorization"] == "Bearer secret-token"
-    assert captured["model"] == agent.model
+    # Defaults to the code-hardcoded Gemma model (no env var consulted).
+    assert "gemma-4-31b-it:generateContent" in captured["url"]
+    # Native auth is via the ?key= query param, so no Authorization header.
+    assert captured["url"].endswith("?key=secret-token")
+    assert "Authorization" not in captured["headers"]
+    assert captured["headers"]["Content-Type"] == "application/json"
+    # Native request body.
+    assert captured["payload"]["contents"][0]["parts"][0]["text"] == "prompt"
+    assert captured["payload"]["generationConfig"]["maxOutputTokens"] == 2048
     timeout = captured["timeout"]
     assert float(timeout.read) >= 90.0
     assert float(timeout.connect) <= 15.0
+
+
+def test_gemini_extract_text_skips_thought_parts():
+    import config
+
+    candidates = [
+        {
+            "content": {
+                "parts": [
+                    {"text": "internal reasoning", "thought": True},
+                    {"text": '{"AAPL": 0.5}'},
+                ],
+                "role": "model",
+            },
+            "finishReason": "STOP",
+        }
+    ]
+    assert config.gemini_extract_text(candidates) == '{"AAPL": 0.5}'
+    # Falls back to the first part when everything is a thought part.
+    only_thought = [{"content": {"parts": [{"text": "reasoning", "thought": True}]}}]
+    assert config.gemini_extract_text(only_thought) == "reasoning"
+    assert config.gemini_extract_text([]) == ""

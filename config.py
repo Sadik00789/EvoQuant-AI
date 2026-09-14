@@ -13,6 +13,12 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from dotenv import load_dotenv
+
+# Load .env as early as possible so the module-level LLM constants below are
+# populated regardless of which entrypoint imported config first.
+load_dotenv()
+
 
 def _env_str(name: str, default: str) -> str:
     val = os.getenv(name)
@@ -43,41 +49,69 @@ def _env_bool(name: str, default: bool) -> bool:
 # ----------------------------------------------------------------------
 # Google AI Studio (Gemini / Gemma) LLM configuration.
 #
-# Centralized here so every caller (sentiment debate, engine debate, genome
-# mutation) reads the SAME model id and endpoint. The model id is sourced
-# dynamically from the environment; a fallback model is used automatically
-# whenever the primary model is unroutable (HTTP 500) or not found (HTTP 404).
+# The model identifiers are defined directly IN CODE (not sourced from the
+# environment) so the only LLM secret a deployment needs is GEMINI_API_KEY.
+# Every caller (sentiment debate, engine debate, genome mutation) talks to
+# Google AI Studio's NATIVE `generateContent` REST endpoint rather than the
+# OpenAI compatibility bridge.
 # ----------------------------------------------------------------------
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemma-4-31b-it")
-GEMINI_FALLBACK_MODEL: str = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
-GOOGLE_API_BASE_URL: str = os.getenv(
-    "GOOGLE_API_BASE_URL",
-    "https://generativelanguage.googleapis.com/v1beta/openai/",
-)
+GEMINI_MODEL: str = "gemma-4-31b-it"
+GEMINI_FALLBACK_MODEL: str = "gemini-2.5-flash"
+
+# Native Google AI Studio REST base (the model path is appended per request).
+GOOGLE_API_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # HTTP budget for large batched debate prompts. Connect stays short so a dead
 # endpoint fails fast; read is generous enough to survive long generations.
 GEMINI_TIMEOUT_SECONDS: float = _env_float("GEMINI_TIMEOUT_SECONDS", 90.0)
 GEMINI_CONNECT_TIMEOUT_SECONDS: float = _env_float("GEMINI_CONNECT_TIMEOUT_SECONDS", 15.0)
 
-# Endpoint path appended to the OpenAI-compatible base.
-_GEMINI_CHAT_PATH = "chat/completions"
 
+def gemini_generate_url(model: str = GEMINI_MODEL, api_key: str = "") -> str:
+    """Build the native Google AI Studio `generateContent` REST URL.
 
-def gemini_chat_url(base_url: str = None) -> str:
-    """Build the full chat-completions URL from the configured base.
-
-    Tolerates users supplying either the OpenAI-compatible base
-    (`.../v1beta/openai/`) or the fully-qualified endpoint.
+    Authentication is supplied through the native ``?key=`` query parameter
+    (not an ``Authorization`` header). A ``models/`` prefix on ``model`` is
+    tolerated and stripped.
     """
-    base = (base_url or GOOGLE_API_BASE_URL or "").strip()
+    clean_model = str(model or GEMINI_MODEL).strip()
+    if clean_model.startswith("models/"):
+        clean_model = clean_model[len("models/"):]
+    base = (GOOGLE_API_BASE_URL or "").rstrip("/")
     if not base:
-        base = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    base = base.rstrip("/")
-    if base.endswith(_GEMINI_CHAT_PATH):
-        return base
-    return f"{base}/{_GEMINI_CHAT_PATH}"
+        base = "https://generativelanguage.googleapis.com/v1beta/models"
+    key = api_key or os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+    url = f"{base}/{clean_model}:generateContent"
+    return f"{url}?key={key}" if key else url
+
+
+def gemini_extract_text(candidates: list) -> str:
+    """Extract the final answer text from a native ``candidates`` list.
+
+    Native Gemma/Gemini responses may include reasoning parts flagged with
+    ``"thought": true``. Those are skipped so callers receive the actual answer
+    rather than chain-of-thought. Falls back to the first part's ``text`` when
+    every part is flagged as a thought.
+    """
+    try:
+        if not candidates:
+            return ""
+        parts = (candidates[0].get("content") or {}).get("parts") or []
+        chunks = []
+        for part in parts:
+            if not isinstance(part, dict) or part.get("thought"):
+                continue
+            chunk = part.get("text") or ""
+            if chunk:
+                chunks.append(str(chunk))
+        if chunks:
+            return "\n".join(chunks)
+        if parts and isinstance(parts[0], dict):
+            return str(parts[0].get("text") or "")
+    except Exception:
+        pass
+    return ""
 
 
 # Symbols used purely as benchmarks / macro context and never traded directly.
@@ -146,13 +180,17 @@ class Settings:
     headlines_enabled: bool = True
     regime_scaler_enabled: bool = True
 
-    # --- LLM / Google AI Studio ---
+    # --- LLM / Google AI Studio (model ids hardcoded, NOT env-driven) ---
     gemini_api_key: str = ""
-    gemini_model: str = "gemma-4-31b-it"
-    gemini_fallback_model: str = "gemini-2.5-flash"
-    google_api_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    gemini_model: str = GEMINI_MODEL
+    gemini_fallback_model: str = GEMINI_FALLBACK_MODEL
+    google_api_base_url: str = GOOGLE_API_BASE_URL
     gemini_timeout_seconds: float = 90.0
     gemini_connect_timeout_seconds: float = 15.0
+
+    def gemini_generate_url(self, model: str = None, api_key: str = "") -> str:
+        """Instance-level native generateContent URL using this Settings' values."""
+        return gemini_generate_url(model or self.gemini_model, api_key or self.gemini_api_key)
 
     @property
     def universe_is_configured(self) -> bool:
@@ -209,18 +247,15 @@ class Settings:
             headlines_enabled=_env_bool("HEADLINES_ENABLED", True),
             regime_scaler_enabled=_env_bool("REGIME_SCALER_ENABLED", True),
             gemini_api_key=GEMINI_API_KEY,
-            gemini_model=_env_str("GEMINI_MODEL", GEMINI_MODEL),
-            gemini_fallback_model=_env_str("GEMINI_FALLBACK_MODEL", GEMINI_FALLBACK_MODEL),
-            google_api_base_url=_env_str("GOOGLE_API_BASE_URL", GOOGLE_API_BASE_URL),
+            # Model ids are code-defined constants; env cannot override them.
+            gemini_model=GEMINI_MODEL,
+            gemini_fallback_model=GEMINI_FALLBACK_MODEL,
+            google_api_base_url=GOOGLE_API_BASE_URL,
             gemini_timeout_seconds=_env_float("GEMINI_TIMEOUT_SECONDS", GEMINI_TIMEOUT_SECONDS),
             gemini_connect_timeout_seconds=_env_float(
                 "GEMINI_CONNECT_TIMEOUT_SECONDS", GEMINI_CONNECT_TIMEOUT_SECONDS
             ),
         )
-
-    @property
-    def gemini_chat_url(self) -> str:
-        return gemini_chat_url(self.google_api_base_url)
 
 
 settings = Settings.from_env()
