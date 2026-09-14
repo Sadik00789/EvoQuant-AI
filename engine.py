@@ -10,6 +10,7 @@ import config
 import numpy as np
 import pandas as pd
 import requests
+from contextlib import contextmanager
 from typing import Literal, Dict, Union, Any, List, Optional
 from pydantic import BaseModel, Field, ValidationError
 from psycopg_pool import ConnectionPool
@@ -577,6 +578,7 @@ class CrossAssetPortfolioManager:
         initial_capital: float = 100000.0,
         max_position_cap: float = 0.05,
         margin_requirement: float = 0.50,
+        conn: Any = None,
     ):
         self.host = host or os.getenv("POSTGRES_HOST", "localhost")
         self.port = int(port or os.getenv("POSTGRES_PORT", 5432))
@@ -593,15 +595,29 @@ class CrossAssetPortfolioManager:
         self.last_prices: Dict[str, float] = {}
         self.entry_prices: Dict[str, float] = {}
 
-        conninfo = f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.dbname}"
-
-        self.pool = ConnectionPool(
-            conninfo=conninfo,
-            min_size=min_pool_size,
-            max_size=max_pool_size,
-            kwargs={"row_factory": dict_row}
-        )
+        self.conn = conn
+        if self.conn is None:
+            conninfo = f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.dbname}"
+            self.pool = ConnectionPool(
+                conninfo=conninfo,
+                min_size=min_pool_size,
+                max_size=max_pool_size,
+                kwargs={"row_factory": dict_row}
+            )
+        else:
+            self.pool = None
         self._init_db()
+
+    @contextmanager
+    def _connection(self, timeout: float = 2.0):
+        """Unified connection accessor supporting explicit conn and connection pool."""
+        if getattr(self, "conn", None) is not None:
+            yield self.conn
+        elif getattr(self, "pool", None) is not None:
+            with self.pool.connection(timeout=timeout) as conn:
+                yield conn
+        else:
+            raise ConnectionError("No database connection or connection pool available.")
 
     @property
     def available_cash(self) -> float:
@@ -683,7 +699,7 @@ class CrossAssetPortfolioManager:
 
     def fetch_dataframe(self, query: str, params=None) -> pd.DataFrame:
         try:
-            with self.pool.connection() as conn:
+            with self._connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(query, params or ())
                     rows = cur.fetchall()
@@ -698,7 +714,7 @@ class CrossAssetPortfolioManager:
         if not records:
             return True
         try:
-            with self.pool.connection() as conn:
+            with self._connection() as conn:
                 with conn.cursor() as cur:
                     params = [
                         (
@@ -737,29 +753,91 @@ class CrossAssetPortfolioManager:
             return pd.DataFrame()
 
     def _init_db(self):
-        try:
-            with self.pool.connection(timeout=2.0) as conn:
-                with conn.cursor() as cur:
-                    try:
-                        cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
-                    except Exception as e:
-                        logger.warning(f"TimescaleDB extension load note: {e}")
+        conn = getattr(self, "conn", None)
+        conn_ctx = None
+        if conn is None:
+            if getattr(self, "pool", None) is None:
+                return
+            try:
+                conn_ctx = self.pool.connection(timeout=2.0)
+                conn = conn_ctx.__enter__()
+            except Exception as e:
+                logger.warning(f"⚠️ TimescaleDB connection/init notice (offline mode): {e}")
+                return
 
+        try:
+            # 1. TimescaleDB extension in its own transaction (non-fatal if absent/unsupported)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;")
+                conn.commit()
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                logger.warning(f"TimescaleDB extension load note: {e}")
+
+            # 2. Base tables creation in a unified, clean transaction
+            with conn.cursor() as cur:
+                # 1. Agent Accounts Table
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_accounts (
                         agent_id TEXT PRIMARY KEY,
                         cash DOUBLE PRECISION NOT NULL,
+                        equity DOUBLE PRECISION NOT NULL DEFAULT 100000.0,
+                        pnl_pct DOUBLE PRECISION DEFAULT 0.0,
                         is_active BOOLEAN DEFAULT TRUE,
-                        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
                     );
                 """)
 
-                # Auto-migrate is_active column in existing databases
-                try:
-                    cur.execute("ALTER TABLE agent_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;")
-                except Exception as e:
-                    logger.debug(f"is_active migration notice: {e}")
+                # 2. Agent Snapshots Table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS agent_snapshots (
+                        timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        agent_id TEXT NOT NULL,
+                        equity DOUBLE PRECISION NOT NULL,
+                        cash DOUBLE PRECISION NOT NULL,
+                        pnl_pct DOUBLE PRECISION DEFAULT 0.0,
+                        drawdown DOUBLE PRECISION DEFAULT 0.0,
+                        sharpe DOUBLE PRECISION DEFAULT 0.0
+                    );
+                """)
 
+                # 3. Trade Logs Table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS trade_logs (
+                        id BIGSERIAL,
+                        timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        agent_id TEXT NOT NULL,
+                        ticker VARCHAR(16) NOT NULL DEFAULT 'SPY',
+                        action VARCHAR(32) NOT NULL DEFAULT 'BUY',
+                        shares DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                        price DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                        allocation_pct DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                        reason VARCHAR(64) DEFAULT 'ALLOCATION',
+                        symbol TEXT,
+                        side TEXT,
+                        cost DOUBLE PRECISION DEFAULT 0.0,
+                        realized_pnl DOUBLE PRECISION DEFAULT 0.0
+                    );
+                """)
+
+                # 4. News Sentiment Log Table
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS news_sentiment_log (
+                        timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        symbol TEXT,
+                        score DOUBLE PRECISION,
+                        bull_thesis TEXT,
+                        bear_thesis TEXT,
+                        arbiter_reasoning TEXT,
+                        confidence DOUBLE PRECISION
+                    );
+                """)
+
+                # 5. Agent Holdings Table
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_holdings (
                         agent_id TEXT,
@@ -771,32 +849,7 @@ class CrossAssetPortfolioManager:
                     );
                 """)
 
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS trade_logs (
-                        id BIGSERIAL PRIMARY KEY,
-                        timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-                        agent_id TEXT NOT NULL,
-                        ticker VARCHAR(16) NOT NULL,
-                        action VARCHAR(32) NOT NULL,
-                        shares DOUBLE PRECISION NOT NULL,
-                        price DOUBLE PRECISION NOT NULL,
-                        allocation_pct DOUBLE PRECISION NOT NULL,
-                        reason VARCHAR(64) DEFAULT 'ALLOCATION'
-                    );
-                """)
-
-                # Auto-migrate table columns in existing databases to prevent truncation errors
-                try:
-                    cur.execute("""
-                        ALTER TABLE trade_logs ALTER COLUMN action TYPE VARCHAR(32);
-                        ALTER TABLE trade_logs ALTER COLUMN reason TYPE VARCHAR(64);
-                        ALTER TABLE trade_logs ALTER COLUMN agent_id TYPE TEXT;
-                        ALTER TABLE agent_accounts ALTER COLUMN agent_id TYPE TEXT;
-                        ALTER TABLE agent_holdings ALTER COLUMN agent_id TYPE TEXT;
-                    """)
-                except Exception as e:
-                    logger.debug(f"Column resize migration notice: {e}")
-
+                # 6. Dividend Schedule & Logs
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS dividend_schedule (
                         id BIGSERIAL PRIMARY KEY,
@@ -822,11 +875,7 @@ class CrossAssetPortfolioManager:
                     );
                 """)
 
-                try:
-                    cur.execute("ALTER TABLE dividend_logs ALTER COLUMN agent_id TYPE TEXT;")
-                except Exception as e:
-                    logger.debug(f"dividend_logs migration notice: {e}")
-
+                # 7. Macro Regime & Agent Genomes
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS macro_regime (
                         id BIGSERIAL PRIMARY KEY,
@@ -837,45 +886,6 @@ class CrossAssetPortfolioManager:
                     );
                 """)
 
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS agent_snapshots (
-                        timestamp TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        agent_id TEXT NOT NULL,
-                        equity DOUBLE PRECISION NOT NULL,
-                        cash DOUBLE PRECISION NOT NULL,
-                        pnl_pct DOUBLE PRECISION NOT NULL
-                    );
-                """)
-
-                try:
-                    cur.execute("ALTER TABLE agent_snapshots ALTER COLUMN agent_id TYPE TEXT;")
-                except Exception as e:
-                    logger.debug(f"agent_snapshots migration notice: {e}")
-
-                try:
-                    cur.execute("""
-                        SELECT create_hypertable('agent_snapshots', 'timestamp', if_not_exists => TRUE);
-                    """)
-                    logger.info("✅ TimescaleDB Hypertable active for [agent_snapshots]")
-                except Exception as e:
-                    logger.warning(f"Hypertable notice: {e}")
-
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_snapshots_agent_time 
-                    ON agent_snapshots (agent_id, timestamp DESC);
-                """)
-
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_snapshots_time_agent 
-                    ON agent_snapshots (timestamp DESC, agent_id);
-                """)
-
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_div_schedule_ex_date
-                    ON dividend_schedule (ex_date);
-                """)
-
-                # Evolved genome persistence so traits/personas survive restarts
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS agent_genomes (
                         agent_id TEXT PRIMARY KEY,
@@ -891,60 +901,136 @@ class CrossAssetPortfolioManager:
                         updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
+            # Commit after table creation
+            conn.commit()
 
+            # 3. TimescaleDB hypertables (isolated so normal PostgreSQL operation succeeds)
+            for ht_sql in [
+                "SELECT create_hypertable('agent_snapshots', 'timestamp', if_not_exists => TRUE);",
+                "SELECT create_hypertable('trade_logs', 'timestamp', if_not_exists => TRUE);",
+                "SELECT create_hypertable('news_sentiment_log', 'timestamp', if_not_exists => TRUE);",
+            ]:
                 try:
-                    cur.execute("ALTER TABLE agent_genomes ALTER COLUMN agent_id TYPE TEXT;")
+                    with conn.cursor() as cur:
+                        cur.execute(ht_sql)
+                    conn.commit()
                 except Exception as e:
-                    logger.debug(f"agent_genomes migration notice: {e}")
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    logger.warning(f"Hypertable creation notice: {e}")
 
-                # News sentiment persistence table
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS news_sentiment_log (
-                        timestamp TIMESTAMPTZ NOT NULL,
-                        symbol TEXT,
-                        score DOUBLE PRECISION,
-                        bull_thesis TEXT,
-                        bear_thesis TEXT,
-                        arbiter_reasoning TEXT,
-                        confidence DOUBLE PRECISION
-                    );
-                """)
-
+            # 4. Indexes (isolated transactions)
+            indexes = [
+                "CREATE INDEX IF NOT EXISTS idx_agent_snapshots_time_id ON agent_snapshots (timestamp DESC, agent_id);",
+                "CREATE INDEX IF NOT EXISTS idx_snapshots_agent_time ON agent_snapshots (agent_id, timestamp DESC);",
+                "CREATE INDEX IF NOT EXISTS idx_news_sentiment_time_symbol ON news_sentiment_log (timestamp DESC, symbol);",
+                "CREATE INDEX IF NOT EXISTS idx_div_schedule_ex_date ON dividend_schedule (ex_date);",
+            ]
+            for idx_sql in indexes:
                 try:
-                    cur.execute("""
-                        SELECT create_hypertable('news_sentiment_log', 'timestamp', if_not_exists => TRUE);
-                    """)
+                    with conn.cursor() as cur:
+                        cur.execute(idx_sql)
+                    conn.commit()
                 except Exception as e:
-                    logger.warning(f"news_sentiment_log hypertable notice: {e}")
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    logger.warning(f"Index creation notice: {e}")
 
-                cur.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_news_sentiment_time_symbol
-                    ON news_sentiment_log (timestamp DESC, symbol);
-                """)
+            # 5. Non-breaking type migrations wrapped in isolated sub-transactions
+            for tbl in ["agent_snapshots", "trade_logs", "agent_genomes", "dividend_logs", "agent_accounts", "agent_holdings"]:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(f"ALTER TABLE {tbl} ALTER COLUMN agent_id TYPE TEXT;")
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
 
-                conn.commit()
+            for migration in [
+                "ALTER TABLE agent_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;",
+                "ALTER TABLE agent_accounts ADD COLUMN IF NOT EXISTS equity DOUBLE PRECISION NOT NULL DEFAULT 100000.0;",
+                "ALTER TABLE agent_accounts ADD COLUMN IF NOT EXISTS pnl_pct DOUBLE PRECISION DEFAULT 0.0;",
+                "ALTER TABLE trade_logs ALTER COLUMN action TYPE VARCHAR(32);",
+                "ALTER TABLE trade_logs ALTER COLUMN reason TYPE VARCHAR(64);",
+            ]:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(migration)
+                    conn.commit()
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+
+            logger.info("✅ All TimescaleDB tables, hypertables, and indexes initialized successfully.")
         except Exception as e:
-            logger.warning(f"⚠️ TimescaleDB connection/init notice (offline mode): {e}")
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            logger.error(f"❌ Critical TimescaleDB init failure: {e}", exc_info=True)
+            raise e
+        finally:
+            if conn_ctx is not None:
+                try:
+                    conn_ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
 
-    def register_agent(self, agent_id: str):
-        with self.pool.connection() as conn:
+    def register_agent(
+        self,
+        agent_id: str,
+        cash: Optional[float] = None,
+        equity: Optional[float] = None,
+        pnl_pct: Optional[float] = None,
+    ):
+        initial_c = float(self.initial_capital)
+        initial_eq = float(initial_c)
+        initial_pnl = 0.0
+
+        with self._connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO agent_accounts (agent_id, cash, is_active)
-                    VALUES (%s, %s, TRUE)
-                    ON CONFLICT (agent_id) DO UPDATE SET is_active = TRUE;
-                """, (agent_id, self.initial_capital))
-                conn.commit()
+                if cash is None and equity is None:
+                    cur.execute("""
+                        INSERT INTO agent_accounts (agent_id, cash, equity, pnl_pct, is_active, updated_at)
+                        VALUES (%s, %s, %s, %s, TRUE, NOW())
+                        ON CONFLICT (agent_id) DO UPDATE SET
+                            is_active = TRUE,
+                            updated_at = NOW();
+                    """, (agent_id, initial_c, initial_eq, initial_pnl))
+                else:
+                    c = float(initial_c if cash is None else cash)
+                    eq = float(c if equity is None else equity)
+                    pnl = float(0.0 if pnl_pct is None else pnl_pct)
+                    cur.execute("""
+                        INSERT INTO agent_accounts (agent_id, cash, equity, pnl_pct, is_active, updated_at)
+                        VALUES (%s, %s, %s, %s, TRUE, NOW())
+                        ON CONFLICT (agent_id) DO UPDATE SET
+                            cash = EXCLUDED.cash,
+                            equity = EXCLUDED.equity,
+                            pnl_pct = EXCLUDED.pnl_pct,
+                            is_active = TRUE,
+                            updated_at = NOW();
+                    """, (agent_id, c, eq, pnl))
+            conn.commit()
 
     def get_agent_cash(self, agent_id: str) -> float:
-        with self.pool.connection() as conn:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT cash FROM agent_accounts WHERE agent_id = %s;", (agent_id,))
                 row = cur.fetchone()
                 return float(row['cash']) if row else self.initial_capital
 
     def update_agent_cash(self, agent_id: str, new_cash: float):
-        with self.pool.connection() as conn:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO agent_accounts (agent_id, cash, is_active, updated_at)
@@ -956,14 +1042,14 @@ class CrossAssetPortfolioManager:
 
     def get_total_swarm_capital(self) -> float:
         """Calculates aggregate active cash capital strictly across active agents in the swarm."""
-        with self.pool.connection() as conn:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT COALESCE(SUM(cash), 0.0) as total_cash FROM agent_accounts WHERE is_active = TRUE;")
                 row = cur.fetchone()
                 return float(row['total_cash']) if row else 0.0
 
     def get_agent_holdings(self, agent_id: str) -> Dict[str, float]:
-        with self.pool.connection() as conn:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT ticker, amount FROM agent_holdings 
@@ -973,7 +1059,7 @@ class CrossAssetPortfolioManager:
                 return {row['ticker']: float(row['amount']) for row in rows}
 
     def update_agent_holding(self, agent_id: str, ticker: str, amount: float, entry_price: float = 0.0):
-        with self.pool.connection() as conn:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO agent_holdings (agent_id, ticker, amount, entry_price, updated_at)
@@ -1002,7 +1088,7 @@ class CrossAssetPortfolioManager:
             logger.warning("⚠️ No recipient agents specified for capital reallocation.")
             return
 
-        with self.pool.connection() as conn:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 # 1. Fetch loser's current cash balance
                 cur.execute("SELECT cash FROM agent_accounts WHERE agent_id = %s;", (loser_agent_id,))
@@ -1093,7 +1179,7 @@ class CrossAssetPortfolioManager:
                 conn.commit()
 
     def process_daily_dividends(self, current_date_str: str):
-        with self.pool.connection() as conn:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT ticker, amount_per_share 
@@ -1153,7 +1239,7 @@ class CrossAssetPortfolioManager:
 
     def log_trade(self, agent_id: str, ticker: str, action: str, shares: float, price: float, pct: float, reason: str = 'ALLOCATION'):
         clamped_pct = min(pct, self.max_position_cap)
-        with self.pool.connection() as conn:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO trade_logs (agent_id, ticker, action, shares, price, allocation_pct, reason)
@@ -1162,7 +1248,7 @@ class CrossAssetPortfolioManager:
                 conn.commit()
 
     def log_snapshot(self, agent_id: str, equity: float, cash: float, pnl_pct: float):
-        with self.pool.connection() as conn:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO agent_snapshots (agent_id, equity, cash, pnl_pct)
@@ -1171,7 +1257,7 @@ class CrossAssetPortfolioManager:
                 conn.commit()
 
     def log_macro_regime(self, sentiment_score: float, risk_multiplier: float, reasoning: str):
-        with self.pool.connection() as conn:
+        with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO macro_regime (sentiment_score, risk_multiplier, summary_reasoning)
@@ -1182,7 +1268,7 @@ class CrossAssetPortfolioManager:
     def save_agent_genome(self, agent):
         """Persist an agent's evolved traits and persona (upsert)."""
         try:
-            with self.pool.connection() as conn:
+            with self._connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
                         INSERT INTO agent_genomes (
@@ -1221,7 +1307,7 @@ class CrossAssetPortfolioManager:
         """Return {agent_id: trait dict} for all persisted genomes."""
         out: dict = {}
         try:
-            df = self.db.fetch_dataframe("SELECT * FROM agent_genomes;")
+            df = self.fetch_dataframe("SELECT * FROM agent_genomes;")
             if df is None or df.empty:
                 return out
             for _, row in df.iterrows():
@@ -1231,6 +1317,7 @@ class CrossAssetPortfolioManager:
         return out
 
     def close(self):
-        self.pool.close()
+        if getattr(self, "pool", None) is not None:
+            self.pool.close()
 
 PostgresPortfolioManager = CrossAssetPortfolioManager

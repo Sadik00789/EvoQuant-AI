@@ -42,7 +42,7 @@ class DatabaseManager(CrossAssetPortfolioManager):
         if not records:
             return True
         try:
-            with self.pool.connection() as conn:
+            with self._connection() as conn:
                 with conn.cursor() as cur:
                     params = [
                         (

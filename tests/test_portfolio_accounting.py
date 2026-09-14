@@ -214,3 +214,103 @@ def test_cross_asset_portfolio_manager_margin_parity():
 
         # Zero price fallback guard
         assert pm.calculate_equity({}) == 100000.0
+
+
+def test_db_init_cursor_scoping_and_table_creation():
+    """Verify that _init_db properly scopes cursor and creates agent_accounts and related tables."""
+    executed_statements = []
+
+    mock_cursor = MagicMock()
+    def mock_execute(sql, params=None):
+        executed_statements.append(sql.strip())
+    mock_cursor.execute.side_effect = mock_execute
+
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.cursor.return_value.__exit__.return_value = None
+
+    pm = CrossAssetPortfolioManager(conn=mock_conn)
+
+    # Verify agent_accounts table creation was executed
+    agent_accounts_created = any("CREATE TABLE IF NOT EXISTS agent_accounts" in s for s in executed_statements)
+    agent_snapshots_created = any("CREATE TABLE IF NOT EXISTS agent_snapshots" in s for s in executed_statements)
+    trade_logs_created = any("CREATE TABLE IF NOT EXISTS trade_logs" in s for s in executed_statements)
+    news_sentiment_created = any("CREATE TABLE IF NOT EXISTS news_sentiment_log" in s for s in executed_statements)
+
+    assert agent_accounts_created, "agent_accounts table creation SQL was not executed"
+    assert agent_snapshots_created, "agent_snapshots table creation SQL was not executed"
+    assert trade_logs_created, "trade_logs table creation SQL was not executed"
+    assert news_sentiment_created, "news_sentiment_log table creation SQL was not executed"
+
+    # Verify connection was committed
+    assert mock_conn.commit.called, "conn.commit was not called after creating tables"
+
+
+def test_db_init_extension_failure_resilience():
+    """Verify that if CREATE EXTENSION fails, _init_db recovers via rollback and still creates base tables."""
+    executed_statements = []
+
+    mock_cursor = MagicMock()
+    def mock_execute(sql, params=None):
+        if "CREATE EXTENSION" in sql:
+            raise Exception("extension timescaledb not available")
+        executed_statements.append(sql.strip())
+
+    mock_cursor.execute.side_effect = mock_execute
+
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.cursor.return_value.__exit__.return_value = None
+
+    # Should not raise exception even when extension load fails
+    pm = CrossAssetPortfolioManager(conn=mock_conn)
+
+    # Base tables must still be executed and committed
+    assert any("CREATE TABLE IF NOT EXISTS agent_accounts" in s for s in executed_statements)
+    assert mock_conn.rollback.called, "conn.rollback was not called when extension failed"
+    assert mock_conn.commit.called, "conn.commit was not called for base tables"
+
+
+def test_register_agent_upsert_behavior():
+    """Verify register_agent performs upsert on agent_accounts and commits."""
+    executed_statements = []
+
+    mock_cursor = MagicMock()
+    def mock_execute(sql, params=None):
+        executed_statements.append((sql.strip(), params))
+
+    mock_cursor.execute.side_effect = mock_execute
+
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.cursor.return_value.__exit__.return_value = None
+
+    pm = CrossAssetPortfolioManager(conn=mock_conn)
+    executed_statements.clear()
+    mock_conn.commit.reset_mock()
+
+    # 1. Default registration without explicit cash/equity
+    pm.register_agent("Agent_Test_Alpha")
+
+    assert len(executed_statements) == 1
+    sql, params = executed_statements[0]
+    assert "INSERT INTO agent_accounts" in sql
+    assert "is_active = TRUE" in sql
+    assert params[0] == "Agent_Test_Alpha"
+    assert params[1] == 100000.0  # default initial capital
+    assert mock_conn.commit.called
+
+    # 2. Registration with explicit cash and equity
+    executed_statements.clear()
+    mock_conn.commit.reset_mock()
+    pm.register_agent("Agent_Test_Beta", cash=125000.0, equity=130000.0, pnl_pct=25.0)
+
+    assert len(executed_statements) == 1
+    sql, params = executed_statements[0]
+    assert "cash = EXCLUDED.cash" in sql
+    assert params[0] == "Agent_Test_Beta"
+    assert params[1] == 125000.0
+    assert params[2] == 130000.0
+    assert params[3] == 25.0
+    assert mock_conn.commit.called
+
