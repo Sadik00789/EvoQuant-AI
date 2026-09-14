@@ -5,6 +5,8 @@ import math
 import logging
 import asyncio
 import httpx
+
+import config
 import numpy as np
 import pandas as pd
 import requests
@@ -293,8 +295,17 @@ class DualModelTradingSwarm:
         model_class: Any,
         role_tag: str = "LLM"
     ) -> Any:
-        url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        api_key = self.api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        """
+        Google AI Studio call with the centralized model id, extended timeout and
+        automatic fallback model on 500/502/503/504 (unroutable) or 404 (missing).
+        """
+        url = config.gemini_chat_url(config.GOOGLE_API_BASE_URL)
+        api_key = (
+            self.api_key
+            or config.GEMINI_API_KEY
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+        )
 
         if not api_key:
             raise ValueError("Gemini API key is not set in environment variables (GEMINI_API_KEY or GOOGLE_API_KEY).")
@@ -304,58 +315,85 @@ class DualModelTradingSwarm:
             "Content-Type": "application/json"
         }
 
-        payload = {
-            "model": "gemma-4-31b-it",
-            "messages": [
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_input}
-            ],
-            "temperature": 0.1,
-            "max_tokens": 4096,
-            "response_format": {"type": "json_object"}
-        }
+        request_timeout = httpx.Timeout(
+            timeout=float(config.GEMINI_TIMEOUT_SECONDS),
+            connect=float(config.GEMINI_CONNECT_TIMEOUT_SECONDS),
+        )
+
+        models = [config.GEMINI_MODEL]
+        if config.GEMINI_FALLBACK_MODEL and config.GEMINI_FALLBACK_MODEL not in models:
+            models.append(config.GEMINI_FALLBACK_MODEL)
 
         max_retries = 3
         backoff_factor = 2.0
+        fallback_status = (404, 500, 502, 503, 504)
+        last_error: Optional[Exception] = None
 
-        for attempt in range(max_retries):
-            try:
-                resp = await client.post(url, json=payload, headers=headers, timeout=120.0)
+        for model in models:
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_input}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 4096,
+                "response_format": {"type": "json_object"}
+            }
 
-                if resp.status_code == 429:
-                    sleep_time = backoff_factor ** (attempt + 1)
-                    logger.warning(f"⚠️ [Rate Limit / 429] encountered for [{role_tag}] on Gemma 4 31B. Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
-                    await asyncio.sleep(sleep_time)
-                    continue
+            for attempt in range(max_retries):
+                try:
+                    resp = await client.post(url, json=payload, headers=headers, timeout=request_timeout)
 
-                resp.raise_for_status()
-                data = resp.json()
-                raw_content = data['choices'][0]['message']['content']
-                cleaned_content = clean_llm_json_string(raw_content)
+                    if resp.status_code == 429:
+                        sleep_time = backoff_factor ** (attempt + 1)
+                        logger.warning(f"⚠️ [Rate Limit / 429] encountered for [{role_tag}] on '{model}'. Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
+                        if attempt == max_retries - 1:
+                            break
+                        await asyncio.sleep(sleep_time)
+                        continue
 
-                validated_output = model_class.model_validate_json(cleaned_content)
-                logger.info(f"✅ [{role_tag}] Evaluated successfully via [Google AI Studio - Gemma 4 31B]")
-                return validated_output
+                    if resp.status_code in fallback_status:
+                        last_error = RuntimeError(f"model '{model}' returned HTTP {resp.status_code}")
+                        logger.warning(f"⚠️ Model '{model}' returned HTTP {resp.status_code} for [{role_tag}]; retrying with fallback model.")
+                        break
 
-            except httpx.HTTPStatusError as hse:
-                logger.warning(f"⚠️ HTTP status error {hse.response.status_code} for [{role_tag}]: {hse.response.text}")
-                if hse.response.status_code in (400, 401, 403, 404):
-                    raise
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(backoff_factor ** (attempt + 1))
-            except ValidationError as ve:
-                logger.warning(f"⚠️ Validation error on [{role_tag}]: {ve}. Retrying...")
-                if attempt == max_retries - 1:
-                    raise
-            except Exception as e:
-                err_msg = str(e) if str(e) else type(e).__name__
-                logger.warning(f"⚠️ [{role_tag}] Provider failed: {err_msg}. Retrying in {backoff_factor ** (attempt + 1)}s...")
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(backoff_factor ** (attempt + 1))
+                    resp.raise_for_status()
+                    data = resp.json()
+                    raw_content = data['choices'][0]['message']['content']
+                    cleaned_content = clean_llm_json_string(raw_content)
 
-        raise RuntimeError(f"Gemma 4 31B failed or rate-limited for [{role_tag}] after {max_retries} attempts.")
+                    validated_output = model_class.model_validate_json(cleaned_content)
+                    logger.info(f"✅ [{role_tag}] Evaluated successfully via Google AI Studio ('{model}').")
+                    return validated_output
+
+                except httpx.HTTPStatusError as hse:
+                    code = hse.response.status_code if hse.response is not None else 0
+                    last_error = hse
+                    if code in fallback_status:
+                        logger.warning(f"⚠️ HTTP {code} for model '{model}' [{role_tag}]; retrying with fallback model.")
+                        break
+                    body = hse.response.text if hse.response is not None else str(hse)
+                    logger.warning(f"⚠️ HTTP status error {code} for [{role_tag}]: {body}")
+                    if code in (400, 401, 403):
+                        raise
+                    if attempt == max_retries - 1:
+                        break
+                    await asyncio.sleep(backoff_factor ** (attempt + 1))
+                except ValidationError as ve:
+                    last_error = ve
+                    logger.warning(f"⚠️ Validation error on [{role_tag}]: {ve}. Retrying...")
+                    if attempt == max_retries - 1:
+                        break
+                except Exception as e:
+                    last_error = e
+                    err_msg = str(e) if str(e) else type(e).__name__
+                    logger.warning(f"⚠️ [{role_tag}] Provider failed: {err_msg}. Retrying in {backoff_factor ** (attempt + 1)}s...")
+                    if attempt == max_retries - 1:
+                        break
+                    await asyncio.sleep(backoff_factor ** (attempt + 1))
+
+        raise RuntimeError(f"LLM failed or rate-limited for [{role_tag}] across models {models} after {max_retries} attempts: {last_error}")
 
     async def _generate_bull_case(
         self, client: httpx.AsyncClient, strategy_input: str, persona: str

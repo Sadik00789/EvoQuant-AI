@@ -726,7 +726,11 @@ async def run_consumer():
             # Dividend / short-cost adjustments.
             for tk in list(signals.keys()):
                 qty = float(agent.holdings.get(tk, 0.0) or 0.0)
-                if directions.get(tk) == "SHORT" and qty >= 0 and not dividend_guard.short_entry_allowed(tk):
+                # Pass the prospective sizing explicitly (keyword) so the guard
+                # never depends on an implicit positional default.
+                if directions.get(tk) == "SHORT" and qty >= 0 and not dividend_guard.short_entry_allowed(
+                    tk, shares=abs(qty), current_time=datetime.fromtimestamp(current_timestamp, tz=timezone.utc)
+                ):
                     directions[tk] = "HOLD"
                     convictions[tk] = 0.0
                 elif qty > 0 and dividend_guard.should_flatten_long(tk):
@@ -815,47 +819,91 @@ async def run_consumer():
     group = settings.redis_group
     consumer_name = settings.redis_consumer
 
+    # Short poll interval (ms) instead of a long block: the loop wakes up often
+    # enough to observe new 15-minute windows while the socket stays alive.
+    POLL_BLOCK_MS = 2000
+    POLL_BATCH = 10
+
+    async def _route_to_dlq(client, msg_id, raw_fields, error):
+        """Dead-letter a genuinely unrecoverable (malformed) stream message."""
+        metrics.increment("dlq.routed")
+        try:
+            await client.xadd(
+                settings.redis_dlq,
+                {"error": str(error), "src_id": str(msg_id), "payload": str(raw_fields)[:4000]},
+                maxlen=1000,
+            )
+        except Exception as dlq_err:
+            logger.warning(f"⚠️ Failed to route {msg_id} to DLQ: {dlq_err}")
+
+    async def _decode_payload(fields):
+        """Extract the JSON payload string from a stream entry, bytes-safe."""
+        raw = None
+        if isinstance(fields, dict):
+            raw = fields.get("payload")
+            if raw is None:
+                raw = fields.get(b"payload")
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="replace")
+        return raw
+
     while True:
         try:
+            # socket_timeout=None is the key fix: the default 60s read timeout
+            # expired while idle-waiting between 15-minute candles, tearing the
+            # connection down. Connect timeout + keepalive keep reconnects sane.
             r = redis.Redis(
-                host=REDIS_HOST, port=REDIS_PORT, decode_responses=True,
+                host=REDIS_HOST,
+                port=REDIS_PORT,
                 password=(settings.redis_password or None),
+                decode_responses=True,
+                socket_timeout=None,
+                socket_connect_timeout=15.0,
+                socket_keepalive=True,
+                health_check_interval=30,
+                retry_on_timeout=True,
             )
             try:
                 await r.xgroup_create(stream, group, id="$", mkstream=True)
             except Exception:
-                pass
+                pass  # BUSYGROUP: the consumer group already exists.
 
             logger.info(f"📥 Consuming Redis Stream '{stream}' as group '{group}' / '{consumer_name}'.")
             while True:
                 resp = await r.xreadgroup(
-                    group, consumer_name, {stream: ">"}, count=1, block=15000
+                    group, consumer_name, {stream: ">"}, count=POLL_BATCH, block=POLL_BLOCK_MS
                 )
                 if not resp:
                     continue
                 for _stream_name, messages in resp:
                     for msg_id, fields in messages:
+                        # --- Parse stage: genuine unrecoverable failures -> DLQ ---
                         try:
-                            raw = fields.get("payload") if isinstance(fields, dict) else None
+                            raw = await _decode_payload(fields)
                             market_state = json.loads(raw) if raw else None
-                            if not market_state:
-                                await r.xack(stream, group, msg_id)
-                                continue
+                            if not isinstance(market_state, dict) or not market_state:
+                                raise ValueError("empty or non-object payload")
+                        except Exception as parse_err:
+                            logger.error(
+                                f"❌ Malformed stream payload ({msg_id}): {parse_err}. Routing to DLQ."
+                            )
+                            await _route_to_dlq(r, msg_id, fields, parse_err)
+                            await r.xack(stream, group, msg_id)
+                            continue
+
+                        # --- Processing stage: log + ack transient faults (no DLQ loop) ---
+                        try:
                             await process_tick(market_state)
                             await r.xack(stream, group, msg_id)
-                        except Exception as e:
-                            metrics.increment("dlq.routed")
-                            logger.error(f"❌ Tick processing failed ({msg_id}): {e}. Routing to DLQ.")
-                            try:
-                                await r.xadd(
-                                    settings.redis_dlq,
-                                    {"error": str(e), "src_id": msg_id, "payload": str(fields)[:4000]},
-                                    maxlen=1000,
-                                )
-                            except Exception:
-                                pass
+                        except Exception as proc_err:
+                            metrics.increment("windows.failed")
+                            logger.error(
+                                f"❌ Tick processing failed ({msg_id}): {proc_err}. "
+                                f"Acknowledging to avoid a DLQ rejection loop."
+                            )
                             await r.xack(stream, group, msg_id)
         except Exception as e:
+            metrics.increment("redis.reconnects")
             logger.error(f"❌ Redis stream connection lost: {e}. Reconnecting in 5s...")
             await asyncio.sleep(5.0)
 

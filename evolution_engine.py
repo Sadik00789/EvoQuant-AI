@@ -9,6 +9,8 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
+import config
+
 logger = logging.getLogger("EvolutionEngine")
 
 
@@ -469,8 +471,12 @@ Ensure the prompt instructs the agent to evaluate technical theses and output tr
 Return ONLY a valid JSON object: {{"new_prompt": "string"}}
 """
 
-        url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        api_key = self.api_key if self.api_key is not None else (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+        url = config.gemini_chat_url(config.GOOGLE_API_BASE_URL)
+        # Preserve legacy semantics: an explicitly-supplied empty string means
+        # "offline"; only fall back to the environment when api_key is None.
+        api_key = self.api_key if self.api_key is not None else (
+            config.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        )
 
         mutated_prompt = parent.persona_prompt
 
@@ -482,63 +488,86 @@ Return ONLY a valid JSON object: {{"new_prompt": "string"}}
                 "Content-Type": "application/json"
             }
 
-            payload = {
-                "model": "gemma-4-31b-it",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 1024,
-                "response_format": {"type": "json_object"}
-            }
+            models = [config.GEMINI_MODEL]
+            if config.GEMINI_FALLBACK_MODEL and config.GEMINI_FALLBACK_MODEL not in models:
+                models.append(config.GEMINI_FALLBACK_MODEL)
 
             max_retries = 3
             backoff_factor = 2.0
+            fallback_status = (404, 500, 502, 503, 504)
+            request_timeout = httpx.Timeout(
+                timeout=float(config.GEMINI_TIMEOUT_SECONDS),
+                connect=float(config.GEMINI_CONNECT_TIMEOUT_SECONDS),
+            )
 
-            async with httpx.AsyncClient() as client:
-                for attempt in range(max_retries):
-                    try:
-                        resp = await client.post(url, json=payload, headers=headers, timeout=20.0)
-
-                        if resp.status_code == 429:
-                            sleep_time = backoff_factor ** (attempt + 1)
-                            logger.warning(f"⚠️ [Rate Limit / 429] during genome mutation. Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
-                            await asyncio.sleep(sleep_time)
-                            continue
-
-                        resp.raise_for_status()
-                        data = resp.json()
-                        content = data['choices'][0]['message']['content'] or ""
-                        
-                        # Strip markdown formatting
-                        cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", content).strip()
-                        
-                        parsed = {}
+            async with httpx.AsyncClient(timeout=request_timeout) as client:
+                for model in models:
+                    payload = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.3,
+                        "max_tokens": 1024,
+                        "response_format": {"type": "json_object"}
+                    }
+                    resolved = False
+                    for attempt in range(max_retries):
                         try:
-                            parsed = json.loads(cleaned)
-                        except Exception:
-                            # Robust fallback search for new_prompt inside the response
-                            match = re.search(r'\{[\s\S]*"new_prompt"\s*:\s*"([^"]+)"[\s\S]*\}', content)
-                            if match:
-                                parsed = {"new_prompt": match.group(1)}
+                            resp = await client.post(url, json=payload, headers=headers)
 
-                        if "new_prompt" in parsed and parsed["new_prompt"]:
-                            mutated_prompt = parsed["new_prompt"]
-                            logger.info("✅ Genome successfully mutated via [Google AI Studio - Gemma 4 31B]")
-                            break
-                        else:
-                            logger.warning(f"⚠️ Empty or unparseable prompt response: {content[:100]}")
+                            if resp.status_code == 429:
+                                sleep_time = backoff_factor ** (attempt + 1)
+                                logger.warning(f"⚠️ [Rate Limit / 429] during genome mutation on '{model}'. Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
+                                if attempt == max_retries - 1:
+                                    break
+                                await asyncio.sleep(sleep_time)
+                                continue
 
-                    except httpx.HTTPStatusError as hse:
-                        logger.warning(f"⚠️ HTTP error {hse.response.status_code} during mutation: {hse.response.text}")
-                        if hse.response.status_code in (400, 401, 403, 404):
-                            break
-                        if attempt == max_retries - 1:
-                            break
-                        await asyncio.sleep(backoff_factor ** (attempt + 1))
-                    except Exception as e:
-                        logger.warning(f"⚠️ Mutation attempt failed: {e}")
-                        if attempt == max_retries - 1:
-                            break
-                        await asyncio.sleep(backoff_factor ** (attempt + 1))
+                            if resp.status_code in fallback_status:
+                                logger.warning(f"⚠️ Model '{model}' returned HTTP {resp.status_code} during mutation; retrying with fallback model.")
+                                break
+
+                            resp.raise_for_status()
+                            data = resp.json()
+                            content = data['choices'][0]['message']['content'] or ""
+
+                            # Strip markdown formatting
+                            cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", content).strip()
+
+                            parsed = {}
+                            try:
+                                parsed = json.loads(cleaned)
+                            except Exception:
+                                # Robust fallback search for new_prompt inside the response
+                                match = re.search(r'\{[\s\S]*"new_prompt"\s*:\s*"([^"]+)"[\s\S]*\}', content)
+                                if match:
+                                    parsed = {"new_prompt": match.group(1)}
+
+                            if "new_prompt" in parsed and parsed["new_prompt"]:
+                                mutated_prompt = parsed["new_prompt"]
+                                logger.info(f"✅ Genome successfully mutated via Google AI Studio ('{model}').")
+                                resolved = True
+                                break
+                            else:
+                                logger.warning(f"⚠️ Empty or unparseable prompt response: {content[:100]}")
+
+                        except httpx.HTTPStatusError as hse:
+                            code = hse.response.status_code if hse.response is not None else 0
+                            body = hse.response.text if hse.response is not None else str(hse)
+                            logger.warning(f"⚠️ HTTP error {code} during mutation: {body}")
+                            if code in fallback_status:
+                                break
+                            if code in (400, 401, 403):
+                                break
+                            if attempt == max_retries - 1:
+                                break
+                            await asyncio.sleep(backoff_factor ** (attempt + 1))
+                        except Exception as e:
+                            logger.warning(f"⚠️ Mutation attempt failed: {e}")
+                            if attempt == max_retries - 1:
+                                break
+                            await asyncio.sleep(backoff_factor ** (attempt + 1))
+                    if resolved:
+                        break
 
         # Monotonic Unique ID Generation using current generation, parent tag, offspring index, and UUID hash
         base_parent_name = re.sub(r'^Gen\d+_', '', parent.agent_id)

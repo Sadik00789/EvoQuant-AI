@@ -90,10 +90,27 @@ class DividendGuard:
         except Exception:
             return 0.0
 
-    def short_entry_allowed(self, ticker: str, shares: float, today: Optional[date] = None) -> bool:
+    def short_entry_allowed(
+        self,
+        ticker: str,
+        shares: float = 0.0,
+        today: Optional[date] = None,
+        current_time: Optional[datetime] = None,
+    ) -> bool:
         """
         Block opening a short when the expected dividend liability is likely to
         exceed typical near-term edge; conservative default: never open a new
         short on the day before an ex-dividend date.
+
+        `shares` and `current_time` are accepted for caller ergonomics and are
+        fully optional so symbol-eligibility checks that do not yet know the
+        exact sizing (e.g. pre-allocation screening in `swarm_consumer`) cannot
+        raise a ``TypeError``. When `today` is omitted it is derived from
+        `current_time` (or the current UTC date).
         """
+        if today is None and current_time is not None:
+            try:
+                today = current_time.date()
+            except Exception:
+                today = None
         return self.ex_dividend_within(ticker, days=1, today=today) <= 0.0

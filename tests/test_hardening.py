@@ -13,8 +13,9 @@ These are offline (no network, no DB, no broker) and exercise the new behavior:
 from __future__ import annotations
 
 import asyncio
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
+import httpx
 import numpy as np
 import pandas as pd
 import pytest
@@ -237,3 +238,125 @@ def test_news_fetcher_enrich_is_offline_and_populates_headlines():
     assert "beats estimates" in out["AAPL"]["headlines"]
     assert "Macro:" in out["AAPL"]["headlines"]
     assert out["MSFT"]["headlines"]
+
+
+# ==========================================================================
+# Regression: DLQ TypeError fix, LLM fallback wiring, config centralization
+# ==========================================================================
+def test_dividend_guard_short_entry_allowed_accepts_optional_sizing():
+    """short_entry_allowed must not raise when sizing/timestamp are omitted."""
+    guard = DividendGuard(db=None)
+    # No calendar -> shorting permitted; must not raise a missing-argument TypeError.
+    assert guard.short_entry_allowed("AAPL") in (True, False)
+    assert guard.short_entry_allowed("AAPL", shares=0.0) is True
+    assert guard.short_entry_allowed("AAPL", shares=25.0) is True
+    # current_time-only path is accepted and does not raise.
+    assert guard.short_entry_allowed("AAPL", current_time=datetime.now(timezone.utc)) is True
+
+
+def test_config_centralizes_gemini_settings_and_endpoint():
+    import config
+
+    assert config.GEMINI_MODEL, "GEMINI_MODEL must be resolved from the environment"
+    assert config.GEMINI_FALLBACK_MODEL, "GEMINI_FALLBACK_MODEL must be resolved"
+    assert config.settings.gemini_model == config.GEMINI_MODEL
+
+    base = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    full = config.gemini_chat_url(base)
+    assert full.endswith("/chat/completions")
+    # A fully-qualified endpoint must not be double-suffixed.
+    assert config.gemini_chat_url(full) == full
+    assert config.settings.gemini_chat_url.endswith("/chat/completions")
+
+
+class _FakeResponse:
+    def __init__(self, status_code, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"HTTP {self.status_code}",
+                request=httpx.Request("POST", "https://example.invalid"),
+                response=self,
+            )
+
+
+def _make_fake_client(responses, seen_models):
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None, headers=None, **kwargs):
+            seen_models.append((json or {}).get("model"))
+            code, payload = responses.pop(0)
+            return _FakeResponse(code, payload)
+
+    return _FakeClient
+
+
+def test_sentiment_llm_falls_back_on_500_and_404(monkeypatch):
+    import sentiment_agent as sa
+
+    for failure_code in (500, 404):
+        agent = sa.NewsSentimentAgent(api_key="dummy")
+        agent.model = f"primary-{failure_code}"
+        agent.fallback_model = "fallback-model"
+        agent.max_retries = 1
+        responses = [
+            (failure_code, {}),
+            (200, {"choices": [{"message": {"content": '{"AAPL": 0.3}'}}]}),
+        ]
+        seen_models: list = []
+        monkeypatch.setattr(
+            sa.httpx, "AsyncClient", _make_fake_client(responses, seen_models)
+        )
+        out = asyncio.run(agent._call_gemini_text("prompt"))
+        assert seen_models == [f"primary-{failure_code}", "fallback-model"]
+        assert "AAPL" in out
+
+
+def test_sentiment_llm_uses_90s_timeout_and_bearer_auth(monkeypatch):
+    import sentiment_agent as sa
+
+    agent = sa.NewsSentimentAgent(api_key="secret-token")
+    captured = {}
+    responses = [
+        (200, {"choices": [{"message": {"content": '{"NVDA": -0.4}'}}]})
+    ]
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None, headers=None, **kwargs):
+            captured["headers"] = headers
+            captured["model"] = (json or {}).get("model")
+            return _FakeResponse(responses[0][0], responses[0][1])
+
+    monkeypatch.setattr(sa.httpx, "AsyncClient", _Client)
+    out = asyncio.run(agent._call_gemini_text("prompt"))
+
+    assert "NVDA" in out
+    assert captured["headers"]["Authorization"] == "Bearer secret-token"
+    assert captured["model"] == agent.model
+    timeout = captured["timeout"]
+    assert float(timeout.read) >= 90.0
+    assert float(timeout.connect) <= 15.0

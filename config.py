@@ -40,6 +40,46 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on", "y")
 
 
+# ----------------------------------------------------------------------
+# Google AI Studio (Gemini / Gemma) LLM configuration.
+#
+# Centralized here so every caller (sentiment debate, engine debate, genome
+# mutation) reads the SAME model id and endpoint. The model id is sourced
+# dynamically from the environment; a fallback model is used automatically
+# whenever the primary model is unroutable (HTTP 500) or not found (HTTP 404).
+# ----------------------------------------------------------------------
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemma-4-31b-it")
+GEMINI_FALLBACK_MODEL: str = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
+GOOGLE_API_BASE_URL: str = os.getenv(
+    "GOOGLE_API_BASE_URL",
+    "https://generativelanguage.googleapis.com/v1beta/openai/",
+)
+
+# HTTP budget for large batched debate prompts. Connect stays short so a dead
+# endpoint fails fast; read is generous enough to survive long generations.
+GEMINI_TIMEOUT_SECONDS: float = _env_float("GEMINI_TIMEOUT_SECONDS", 90.0)
+GEMINI_CONNECT_TIMEOUT_SECONDS: float = _env_float("GEMINI_CONNECT_TIMEOUT_SECONDS", 15.0)
+
+# Endpoint path appended to the OpenAI-compatible base.
+_GEMINI_CHAT_PATH = "chat/completions"
+
+
+def gemini_chat_url(base_url: str = None) -> str:
+    """Build the full chat-completions URL from the configured base.
+
+    Tolerates users supplying either the OpenAI-compatible base
+    (`.../v1beta/openai/`) or the fully-qualified endpoint.
+    """
+    base = (base_url or GOOGLE_API_BASE_URL or "").strip()
+    if not base:
+        base = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    base = base.rstrip("/")
+    if base.endswith(_GEMINI_CHAT_PATH):
+        return base
+    return f"{base}/{_GEMINI_CHAT_PATH}"
+
+
 # Symbols used purely as benchmarks / macro context and never traded directly.
 BENCHMARK_SYMBOLS: List[str] = ["SPY"]
 
@@ -106,6 +146,14 @@ class Settings:
     headlines_enabled: bool = True
     regime_scaler_enabled: bool = True
 
+    # --- LLM / Google AI Studio ---
+    gemini_api_key: str = ""
+    gemini_model: str = "gemma-4-31b-it"
+    gemini_fallback_model: str = "gemini-2.5-flash"
+    google_api_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    gemini_timeout_seconds: float = 90.0
+    gemini_connect_timeout_seconds: float = 15.0
+
     @property
     def universe_is_configured(self) -> bool:
         return True
@@ -160,7 +208,19 @@ class Settings:
             sentiment_enabled=_env_bool("SENTIMENT_ENABLED", True),
             headlines_enabled=_env_bool("HEADLINES_ENABLED", True),
             regime_scaler_enabled=_env_bool("REGIME_SCALER_ENABLED", True),
+            gemini_api_key=GEMINI_API_KEY,
+            gemini_model=_env_str("GEMINI_MODEL", GEMINI_MODEL),
+            gemini_fallback_model=_env_str("GEMINI_FALLBACK_MODEL", GEMINI_FALLBACK_MODEL),
+            google_api_base_url=_env_str("GOOGLE_API_BASE_URL", GOOGLE_API_BASE_URL),
+            gemini_timeout_seconds=_env_float("GEMINI_TIMEOUT_SECONDS", GEMINI_TIMEOUT_SECONDS),
+            gemini_connect_timeout_seconds=_env_float(
+                "GEMINI_CONNECT_TIMEOUT_SECONDS", GEMINI_CONNECT_TIMEOUT_SECONDS
+            ),
         )
+
+    @property
+    def gemini_chat_url(self) -> str:
+        return gemini_chat_url(self.google_api_base_url)
 
 
 settings = Settings.from_env()

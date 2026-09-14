@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import config
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("NewsSentimentAgent")
 
@@ -179,19 +181,42 @@ class NewsSentimentAgent:
     Resilience: exponential backoff (retries 3, delay 2.0s, backoff 2.0).
     On HTTP 429 or parsing failure, falls back to previous cached scores or 0.0 neutral.
     """
+    # Model-level failures that should trigger an automatic fallback-model retry.
+    _MODEL_FALLBACK_STATUS = frozenset({404, 500, 502, 503, 504})
+
     def __init__(self, api_key: str = None, cache_ttl: float = 1200.0):
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        self.api_key = (
+            api_key
+            or config.GEMINI_API_KEY
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+        )
         self.cache = SentimentCache(ttl_seconds=cache_ttl)
         self.rss_feeds = [
             "https://finance.yahoo.com/news/rssindex",
             "https://feeds.content.dowjones.io/public/rss/mw_topstories",
             "https://news.google.com/rss/search?q=stock+market+economy&hl=en-US&gl=US&ceid=US:en"
         ]
-        self.model = "gemma-4-31b-it"
-        self.api_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        # Model id is read dynamically from the environment (via config) so the
+        # deployment can be re-pointed without a code change.
+        self.model = config.GEMINI_MODEL
+        self.fallback_model = config.GEMINI_FALLBACK_MODEL
+        self.api_url = config.gemini_chat_url(config.GOOGLE_API_BASE_URL)
+        self.timeout = httpx.Timeout(
+            timeout=float(config.GEMINI_TIMEOUT_SECONDS),
+            connect=float(config.GEMINI_CONNECT_TIMEOUT_SECONDS),
+        )
         self.max_retries = 3
         self.base_delay = 2.0
         self.backoff = 2.0
+
+    def _model_chain(self) -> list:
+        """Ordered list of model ids: primary first, then the fallback (deduped)."""
+        chain = [self.model]
+        fb = getattr(self, "fallback_model", None)
+        if fb and fb not in chain:
+            chain.append(fb)
+        return chain
 
     # ------------------------------------------------------------------
     # Snapshot formatting
@@ -225,47 +250,121 @@ class NewsSentimentAgent:
     # Low-level LLM caller with exponential backoff
     # ------------------------------------------------------------------
     async def _call_gemini_text(self, prompt: str, temperature: float = 0.2, max_tokens: int = 2048) -> str:
-        """Single Gemini text call with retries on 429 / transient errors. Raises on final failure."""
-        api_key = self.api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        """
+        Text completion against Google AI Studio's OpenAI-compatible endpoint.
+
+        Hardening:
+          * extended read timeout (default 90s) + short 15s connect so a dead
+            endpoint fails fast without hanging the 15-minute tick loop;
+          * bearer-token auth from the environment;
+          * retries with exponential backoff on 429 / transient transport errors;
+          * automatic one-shot fallback to ``GEMINI_FALLBACK_MODEL`` when the
+            primary model returns 500/502/503/504 (unroutable) or 404 (missing).
+        Raises on terminal failure so callers can apply their own safe fallback.
+        """
+        api_key = (
+            self.api_key
+            or os.getenv("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+        )
         if not api_key:
             raise ValueError("Gemini API key is not set (GEMINI_API_KEY or GOOGLE_API_KEY).")
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        async with httpx.AsyncClient() as client:
-            for attempt in range(self.max_retries):
-                try:
-                    resp = await client.post(self.api_url, json=payload, headers=headers, timeout=35.0)
-                    if resp.status_code == 429:
-                        sleep_time = self.base_delay * (self.backoff ** attempt)
+        models = self._model_chain()
+        last_error: Optional[Exception] = None
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            for model in models:
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+                for attempt in range(self.max_retries):
+                    try:
+                        resp = await client.post(self.api_url, json=payload, headers=headers)
+                        if resp.status_code == 429:
+                            sleep_time = self.base_delay * (self.backoff ** attempt)
+                            logger.warning(
+                                f"⚠️ [Rate Limit / 429] '{model}' debate call. Retrying in {sleep_time:.1f}s "
+                                f"(Attempt {attempt + 1}/{self.max_retries})..."
+                            )
+                            if attempt == self.max_retries - 1:
+                                break
+                            await asyncio.sleep(sleep_time)
+                            continue
+                        if resp.status_code in self._MODEL_FALLBACK_STATUS:
+                            last_error = RuntimeError(
+                                f"model '{model}' returned HTTP {resp.status_code}"
+                            )
+                            logger.warning(
+                                f"⚠️ Model '{model}' returned HTTP {resp.status_code} "
+                                f"(unroutable/missing); retrying with fallback model."
+                            )
+                            break  # advance to the next model in the chain
+                        resp.raise_for_status()
+                        data = resp.json()
+                        choices = data.get("choices") or []
+                        content = ""
+                        if choices:
+                            content = (choices[0].get("message") or {}).get("content") or ""
+                        if not content:
+                            last_error = RuntimeError(f"empty completion from '{model}'")
+                            logger.warning(f"⚠️ Empty completion from '{model}'; trying next model.")
+                            break
+                        return str(content)
+                    except httpx.HTTPStatusError as hse:
+                        code = hse.response.status_code if hse.response is not None else 0
+                        last_error = hse
+                        if code in self._MODEL_FALLBACK_STATUS:
+                            logger.warning(
+                                f"⚠️ HTTP {code} for model '{model}'; retrying with fallback model."
+                            )
+                            break  # advance to the next model in the chain
+                        if code in (400, 401, 403):
+                            logger.error(f"❌ HTTP {code} for model '{model}'; aborting (auth/bad request).")
+                            raise
+                        logger.warning(f"⚠️ HTTP {code} during debate call (model='{model}'): {hse}")
+                        if attempt == self.max_retries - 1:
+                            break
+                        await asyncio.sleep(self.base_delay * (self.backoff ** attempt))
+                    except (httpx.TimeoutException, httpx.TransportError) as te:
+                        last_error = te
                         logger.warning(
-                            f"⚠️ [Rate Limit / 429] debate call. Retrying in {sleep_time:.1f}s "
-                            f"(Attempt {attempt + 1}/{self.max_retries})..."
+                            f"⚠️ Transport/timeout (attempt {attempt + 1}/{self.max_retries}, "
+                            f"model='{model}'): {type(te).__name__} - {te}"
                         )
-                        await asyncio.sleep(sleep_time)
-                        continue
-                    resp.raise_for_status()
-                    data = resp.json()
-                    content = data["choices"][0]["message"]["content"] or ""
-                    return str(content)
-                except httpx.HTTPStatusError as hse:
-                    code = hse.response.status_code if hse.response is not None else 0
-                    logger.warning(f"⚠️ HTTP {code} during debate call: {hse}")
-                    if code in (400, 401, 403, 404):
-                        raise
-                    if attempt == self.max_retries - 1:
-                        raise
-                    await asyncio.sleep(self.base_delay * (self.backoff ** attempt))
-                except Exception as e:
-                    logger.warning(f"⚠️ Debate call attempt failed: {type(e).__name__} - {e}")
-                    if attempt == self.max_retries - 1:
-                        raise
-                    await asyncio.sleep(self.base_delay * (self.backoff ** attempt))
-        raise RuntimeError("Gemini debate call failed after retries.")
+                        if attempt == self.max_retries - 1:
+                            break
+                        await asyncio.sleep(self.base_delay * (self.backoff ** attempt))
+                    except Exception as e:
+                        last_error = e
+                        logger.warning(
+                            f"⚠️ Debate call attempt failed (model='{model}'): {type(e).__name__} - {e}"
+                        )
+                        if attempt == self.max_retries - 1:
+                            break
+                        await asyncio.sleep(self.base_delay * (self.backoff ** attempt))
+
+        raise RuntimeError(f"Gemini debate call failed across models {models}: {last_error}")
+
+    async def _call_gemini_json(
+        self, prompt: str, temperature: float = 0.1, max_tokens: int = 1024
+    ) -> Dict[str, Any]:
+        """Call the model chain and return the first valid JSON object in the reply."""
+        raw = await self._call_gemini_text(prompt, temperature=temperature, max_tokens=max_tokens)
+        cleaned = re.sub(r"<thought>[\s\S]*?</thought>", "", str(raw or "")).strip()
+        cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", cleaned).strip()
+        m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if not m:
+            m = re.search(r"\{.*\}", str(raw or ""), re.DOTALL)
+        if not m:
+            raise ValueError(f"No JSON object found in response: '{str(raw)[:120]}...'")
+        parsed = json.loads(m.group(0).strip())
+        if not isinstance(parsed, dict):
+            raise ValueError("LLM response JSON was not an object.")
+        return parsed
 
     # ------------------------------------------------------------------
     # Stage 1: Parallel Thesis Generation
@@ -546,13 +645,16 @@ Cover exactly these tickers: {", ".join(tickers)}"""
 
     async def analyze_macro_sentiment_async(self) -> Dict[str, Any]:
         """
-        Queries Google AI Studio (Gemma 4-31B) asynchronously to evaluate current financial headlines.
-        Includes automated rate-limit exception handling with exponential backoff and robust JSON cleaning.
+        Queries Google AI Studio asynchronously to evaluate current financial headlines.
+
+        Transport, retries, the dynamic model id and the 500/404 fallback model are
+        all delegated to the hardened `_call_gemini_text`/`_call_gemini_json` chain
+        (90s read timeout, 15s connect). Never raises: always returns a sanitized dict.
         """
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
             headlines_text = await self._fetch_rss_headlines_async(client, max_headlines=5)
 
-            prompt = f"""
+        prompt = f"""
 You are a Senior Macroeconomic Risk Analyst for a Quantitative Trading Swarm.
 Evaluate the following recent market headlines and determine the systemic market sentiment.
 
@@ -569,76 +671,19 @@ INSTRUCTIONS:
 }}
 """
 
-            url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-            api_key = self.api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        api_key = self.api_key or config.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            logger.error("❌ Gemini API key is not set in environment variables (GEMINI_API_KEY or GOOGLE_API_KEY).")
+            return self._neutral_fallback()
 
-            if not api_key:
-                logger.error("❌ Gemini API key is not set in environment variables (GEMINI_API_KEY or GOOGLE_API_KEY).")
-                return self._neutral_fallback()
-
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json"
-            }
-
-            payload = {
-                "model": "gemma-4-31b-it",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 1024,
-                "response_format": {"type": "json_object"}
-            }
-
-            max_retries = 3
-            backoff_factor = 2.0
-
-            for attempt in range(max_retries):
-                try:
-                    resp = await client.post(url, json=payload, headers=headers, timeout=35.0)
-
-                    if resp.status_code == 429:
-                        sleep_time = backoff_factor ** (attempt + 1)
-                        logger.warning(f"⚠️ [Rate Limit / 429] during news sentiment fetch. Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
-                        await asyncio.sleep(sleep_time)
-                        continue
-
-                    resp.raise_for_status()
-                    data = resp.json()
-                    raw_content = data['choices'][0]['message']['content'] or ""
-
-                    # 1. Strip internal thinking tags (<thought>...</thought>)
-                    cleaned_content = re.sub(r"<thought>[\s\S]*?</thought>", "", raw_content).strip()
-
-                    # 2. Strip Markdown code fences if present (```json ... ```)
-                    cleaned_content = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", cleaned_content).strip()
-
-                    # 3. Extract valid JSON object block {...} using re.DOTALL to strip conversational preambles/postambles
-                    json_match = re.search(r"\{.*\}", cleaned_content, re.DOTALL)
-                    if not json_match:
-                        json_match = re.search(r"\{.*\}", raw_content, re.DOTALL)
-
-                    if not json_match:
-                        raise ValueError(f"Could not locate JSON object pattern in response: '{raw_content[:80]}...'")
-
-                    cleaned_json_str = json_match.group(0).strip()
-                    parsed = json.loads(cleaned_json_str)
-
-                    logger.info("✅ News sentiment evaluated successfully via [Google AI Studio - Gemma 4 31B]")
-                    return self._sanitize_sentiment_output(parsed)
-
-                except httpx.HTTPStatusError as hse:
-                    logger.warning(f"⚠️ HTTP status error {hse.response.status_code} during sentiment fetch: {hse.response.text}")
-                    if hse.response.status_code in (400, 401, 403, 404):
-                        break
-                    if attempt == max_retries - 1:
-                        break
-                    await asyncio.sleep(backoff_factor ** (attempt + 1))
-                except Exception as e:
-                    logger.warning(f"⚠️ News sentiment fetch attempt failed: {type(e).__name__} - {e}")
-                    if attempt == max_retries - 1:
-                        break
-                    await asyncio.sleep(backoff_factor ** (attempt + 1))
-
+        try:
+            parsed = await self._call_gemini_json(prompt, temperature=0.1, max_tokens=1024)
+            logger.info("✅ News sentiment evaluated successfully via [Google AI Studio].")
+            return self._sanitize_sentiment_output(parsed)
+        except Exception as e:
+            logger.warning(
+                f"⚠️ News sentiment fetch failed: {type(e).__name__} - {e}. Applying neutral fallback."
+            )
             return self._neutral_fallback()
 
 
