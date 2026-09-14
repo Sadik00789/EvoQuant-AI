@@ -1030,7 +1030,7 @@ class CrossAssetPortfolioManager:
         """Return {agent_id: trait dict} for all persisted genomes."""
         out: dict = {}
         try:
-            df = self.fetch_dataframe("SELECT * FROM agent_genomes;")
+            df = self.db.fetch_dataframe("SELECT * FROM agent_genomes;")
             if df is None or df.empty:
                 return out
             for _, row in df.iterrows():
