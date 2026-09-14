@@ -590,16 +590,22 @@ Return ONLY a valid JSON object: {{"new_prompt": "string"}}
             async with httpx.AsyncClient(timeout=request_timeout) as client:
                 for model in models:
                     url = config.gemini_generate_url(model, api_key)
+                    gen_config: Dict[str, Any] = {
+                        "maxOutputTokens": 2048,
+                    }
+                    if "gemma" in str(model).lower() or "thinking" in str(model).lower():
+                        gen_config["thinkingConfig"] = {"includeThoughts": True}
+                        gen_config["temperature"] = 1.0
+                    else:
+                        gen_config["temperature"] = 0.3
+
                     payload = {
                         "contents": [
                             {
                                 "parts": [{"text": prompt}]
                             }
                         ],
-                        "generationConfig": {
-                            "temperature": 0.3,
-                            "maxOutputTokens": 1024,
-                        },
+                        "generationConfig": gen_config,
                     }
                     resolved = False
                     for attempt in range(max_retries):
@@ -615,8 +621,19 @@ Return ONLY a valid JSON object: {{"new_prompt": "string"}}
                                 continue
 
                             if resp.status_code in fallback_status:
-                                logger.warning(f"⚠️ Model '{model}' returned HTTP {resp.status_code} during mutation; retrying with fallback model.")
-                                break
+                                if model != models[-1]:
+                                    logger.warning(f"⚠️ Model '{model}' returned HTTP {resp.status_code} during mutation; retrying with fallback model.")
+                                    break
+                                elif resp.status_code in (500, 502, 503, 504):
+                                    sleep_time = backoff_factor ** (attempt + 1)
+                                    logger.warning(f"⚠️ Model '{model}' returned transient HTTP {resp.status_code} during mutation. Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
+                                    if attempt == max_retries - 1:
+                                        break
+                                    await asyncio.sleep(sleep_time)
+                                    continue
+                                else:
+                                    logger.warning(f"⚠️ Model '{model}' returned non-retryable HTTP {resp.status_code} during mutation.")
+                                    break
 
                             resp.raise_for_status()
                             data = resp.json()
@@ -651,7 +668,17 @@ Return ONLY a valid JSON object: {{"new_prompt": "string"}}
                             body = hse.response.text if hse.response is not None else str(hse)
                             logger.warning(f"⚠️ HTTP error {code} during mutation: {body}")
                             if code in fallback_status:
-                                break
+                                if model != models[-1]:
+                                    break
+                                elif code in (500, 502, 503, 504):
+                                    sleep_time = backoff_factor ** (attempt + 1)
+                                    logger.warning(f"⚠️ Transient HTTP {code} during mutation for '{model}'. Retrying in {sleep_time}s...")
+                                    if attempt == max_retries - 1:
+                                        break
+                                    await asyncio.sleep(sleep_time)
+                                    continue
+                                else:
+                                    break
                             if code in (401, 403):
                                 break
                             if attempt == max_retries - 1:

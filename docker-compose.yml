@@ -90,6 +90,8 @@ services:
       - ALPACA_BASE_URL=${ALPACA_BASE_URL:-https://paper-api.alpaca.markets}
       - ALPACA_SUBACCOUNTS=${ALPACA_SUBACCOUNTS}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_TIMEOUT_SECONDS=${GEMINI_TIMEOUT_SECONDS:-240}
+      - GEMINI_FALLBACK_MODEL=${GEMINI_FALLBACK_MODEL:-gemma-4-26b-a4b-it}
       # --- Risk / behavior controls ---
       - SHADOW_MODE=${SHADOW_MODE:-false}
       - SENTIMENT_ENABLED=${SENTIMENT_ENABLED:-true}

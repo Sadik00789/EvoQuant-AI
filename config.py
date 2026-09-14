@@ -57,14 +57,14 @@ def _env_bool(name: str, default: bool) -> bool:
 # ----------------------------------------------------------------------
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
 GEMINI_MODEL: str = "gemma-4-31b-it"
-GEMINI_FALLBACK_MODEL: str = "gemini-2.5-flash"
+GEMINI_FALLBACK_MODEL: str = os.getenv("GEMINI_FALLBACK_MODEL", "gemma-4-26b-a4b-it")
 
 # Native Google AI Studio REST base (the model path is appended per request).
 GOOGLE_API_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # HTTP budget for large batched debate prompts. Connect stays short so a dead
 # endpoint fails fast; read is generous enough to survive long generations.
-GEMINI_TIMEOUT_SECONDS: float = _env_float("GEMINI_TIMEOUT_SECONDS", 90.0)
+GEMINI_TIMEOUT_SECONDS: float = _env_float("GEMINI_TIMEOUT_SECONDS", 240.0)
 GEMINI_CONNECT_TIMEOUT_SECONDS: float = _env_float("GEMINI_CONNECT_TIMEOUT_SECONDS", 15.0)
 
 
@@ -185,7 +185,7 @@ class Settings:
     gemini_model: str = GEMINI_MODEL
     gemini_fallback_model: str = GEMINI_FALLBACK_MODEL
     google_api_base_url: str = GOOGLE_API_BASE_URL
-    gemini_timeout_seconds: float = 90.0
+    gemini_timeout_seconds: float = 240.0
     gemini_connect_timeout_seconds: float = 15.0
 
     def gemini_generate_url(self, model: str = None, api_key: str = "") -> str:

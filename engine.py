@@ -334,16 +334,22 @@ class DualModelTradingSwarm:
 
         for model in models:
             url = config.gemini_generate_url(model, api_key)
+            gen_config: Dict[str, Any] = {
+                "maxOutputTokens": 4096,
+            }
+            if "gemma" in str(model).lower() or "thinking" in str(model).lower():
+                gen_config["thinkingConfig"] = {"includeThoughts": True}
+                gen_config["temperature"] = 1.0
+            else:
+                gen_config["temperature"] = 0.1
+
             payload = {
                 "contents": [
                     {
                         "parts": [{"text": combined_prompt}]
                     }
                 ],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 4096,
-                },
+                "generationConfig": gen_config,
             }
 
             for attempt in range(max_retries):
@@ -360,8 +366,19 @@ class DualModelTradingSwarm:
 
                     if resp.status_code in fallback_status:
                         last_error = RuntimeError(f"model '{model}' returned HTTP {resp.status_code}")
-                        logger.warning(f"⚠️ Model '{model}' returned HTTP {resp.status_code} for [{role_tag}]; retrying with fallback model.")
-                        break
+                        if model != models[-1]:
+                            logger.warning(f"⚠️ Model '{model}' returned HTTP {resp.status_code} for [{role_tag}]; retrying with fallback model.")
+                            break
+                        elif resp.status_code in (500, 502, 503, 504):
+                            sleep_time = backoff_factor ** (attempt + 1)
+                            logger.warning(f"⚠️ Model '{model}' returned transient HTTP {resp.status_code} for [{role_tag}]. Retrying in {sleep_time}s (Attempt {attempt + 1}/{max_retries})...")
+                            if attempt == max_retries - 1:
+                                break
+                            await asyncio.sleep(sleep_time)
+                            continue
+                        else:
+                            logger.warning(f"⚠️ Model '{model}' returned non-retryable HTTP {resp.status_code} for [{role_tag}].")
+                            break
 
                     resp.raise_for_status()
                     data = resp.json()
@@ -385,8 +402,18 @@ class DualModelTradingSwarm:
                     code = hse.response.status_code if hse.response is not None else 0
                     last_error = hse
                     if code in fallback_status:
-                        logger.warning(f"⚠️ HTTP {code} for model '{model}' [{role_tag}]; retrying with fallback model.")
-                        break
+                        if model != models[-1]:
+                            logger.warning(f"⚠️ HTTP {code} for model '{model}' [{role_tag}]; retrying with fallback model.")
+                            break
+                        elif code in (500, 502, 503, 504):
+                            sleep_time = backoff_factor ** (attempt + 1)
+                            logger.warning(f"⚠️ Transient HTTP {code} for model '{model}' [{role_tag}]. Retrying in {sleep_time}s...")
+                            if attempt == max_retries - 1:
+                                break
+                            await asyncio.sleep(sleep_time)
+                            continue
+                        else:
+                            break
                     body = hse.response.text if hse.response is not None else str(hse)
                     logger.warning(f"⚠️ HTTP status error {code} for [{role_tag}]: {body}")
                     if code in (401, 403):

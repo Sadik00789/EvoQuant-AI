@@ -305,16 +305,24 @@ class NewsSentimentAgent:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             for current_model in models:
                 url = config.gemini_generate_url(current_model, api_key)
+                gen_config: Dict[str, Any] = {
+                    "maxOutputTokens": max_tokens,
+                }
+                # Gemma 4-31B is a native thinking model that requires includeThoughts
+                # and temperature=1.0. Low temperatures (<1.0) trigger Google API HTTP 500 errors.
+                if "gemma" in str(current_model).lower() or "thinking" in str(current_model).lower():
+                    gen_config["thinkingConfig"] = {"includeThoughts": True}
+                    gen_config["temperature"] = 1.0
+                else:
+                    gen_config["temperature"] = temperature
+
                 payload = {
                     "contents": [
                         {
                             "parts": [{"text": prompt}]
                         }
                     ],
-                    "generationConfig": {
-                        "temperature": temperature,
-                        "maxOutputTokens": max_tokens,
-                    },
+                    "generationConfig": gen_config,
                 }
                 for attempt in range(self.max_retries):
                     try:
@@ -330,14 +338,30 @@ class NewsSentimentAgent:
                             await asyncio.sleep(sleep_time)
                             continue
                         if resp.status_code in self._MODEL_FALLBACK_STATUS:
-                            last_error = RuntimeError(
-                                f"model '{current_model}' returned HTTP {resp.status_code}"
-                            )
-                            logger.warning(
-                                f"⚠️ Model '{current_model}' returned HTTP {resp.status_code} "
-                                f"(unroutable/missing); retrying with fallback model."
-                            )
-                            break  # advance to the next model in the chain
+                            has_next_model = (current_model != models[-1])
+                            if has_next_model:
+                                last_error = RuntimeError(
+                                    f"model '{current_model}' returned HTTP {resp.status_code}"
+                                )
+                                logger.warning(
+                                    f"⚠️ Model '{current_model}' returned HTTP {resp.status_code} "
+                                    f"(unroutable/missing); retrying with fallback model."
+                                )
+                                break  # advance to the next model in the chain
+                            elif resp.status_code in (500, 502, 503, 504):
+                                sleep_time = self.base_delay * (self.backoff ** attempt)
+                                logger.warning(
+                                    f"⚠️ Model '{current_model}' returned transient HTTP {resp.status_code}. "
+                                    f"Retrying in {sleep_time:.1f}s (Attempt {attempt + 1}/{self.max_retries})..."
+                                )
+                                if attempt == self.max_retries - 1:
+                                    last_error = RuntimeError(f"model '{current_model}' returned HTTP {resp.status_code}")
+                                    break
+                                await asyncio.sleep(sleep_time)
+                                continue
+                            else:
+                                last_error = RuntimeError(f"model '{current_model}' returned non-retryable HTTP {resp.status_code}")
+                                break
                         resp.raise_for_status()
                         data = resp.json()
                         candidates = data.get("candidates", [])
@@ -357,10 +381,24 @@ class NewsSentimentAgent:
                         code = hse.response.status_code if hse.response is not None else 0
                         last_error = hse
                         if code in self._MODEL_FALLBACK_STATUS:
-                            logger.warning(
-                                f"⚠️ HTTP {code} for model '{current_model}'; retrying with fallback model."
-                            )
-                            break  # advance to the next model in the chain
+                            has_next_model = (current_model != models[-1])
+                            if has_next_model:
+                                logger.warning(
+                                    f"⚠️ HTTP {code} for model '{current_model}'; retrying with fallback model."
+                                )
+                                break  # advance to the next model in the chain
+                            elif code in (500, 502, 503, 504):
+                                sleep_time = self.base_delay * (self.backoff ** attempt)
+                                logger.warning(
+                                    f"⚠️ Transient HTTP {code} for model '{current_model}'. "
+                                    f"Retrying in {sleep_time:.1f}s (Attempt {attempt + 1}/{self.max_retries})..."
+                                )
+                                if attempt == self.max_retries - 1:
+                                    break
+                                await asyncio.sleep(sleep_time)
+                                continue
+                            else:
+                                break
                         if code in (401, 403):
                             logger.error(f"❌ HTTP {code} for model '{current_model}'; aborting (auth failure).")
                             raise

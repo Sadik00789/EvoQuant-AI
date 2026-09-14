@@ -263,9 +263,9 @@ def test_config_hardcodes_native_gemini_models_and_endpoint(monkeypatch):
     monkeypatch.delenv("GOOGLE_API_BASE_URL", raising=False)
 
     assert config.GEMINI_MODEL == "gemma-4-31b-it"
-    assert config.GEMINI_FALLBACK_MODEL == "gemini-2.5-flash"
+    assert config.GEMINI_FALLBACK_MODEL == "gemma-4-26b-a4b-it"
     assert config.settings.gemini_model == "gemma-4-31b-it"
-    assert config.settings.gemini_fallback_model == "gemini-2.5-flash"
+    assert config.settings.gemini_fallback_model == "gemma-4-26b-a4b-it"
 
     url = config.gemini_generate_url("gemma-4-31b-it", "KEY")
     assert url == (
@@ -273,9 +273,9 @@ def test_config_hardcodes_native_gemini_models_and_endpoint(monkeypatch):
         "gemma-4-31b-it:generateContent?key=KEY"
     )
     # A `models/` prefix is tolerated and stripped.
-    assert config.gemini_generate_url("models/gemini-2.5-flash", "K").startswith(
+    assert config.gemini_generate_url("models/gemma-4-26b-a4b-it", "K").startswith(
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-2.5-flash:generateContent"
+        "gemma-4-26b-a4b-it:generateContent"
     )
     # Settings-level helper defaults to the code-hardcoded primary model.
     assert "gemma-4-31b-it:generateContent" in config.settings.gemini_generate_url()
@@ -393,6 +393,8 @@ def test_sentiment_llm_native_payload_default_model_and_timeout(monkeypatch):
     # Native request body.
     assert captured["payload"]["contents"][0]["parts"][0]["text"] == "prompt"
     assert captured["payload"]["generationConfig"]["maxOutputTokens"] == 2048
+    assert captured["payload"]["generationConfig"]["thinkingConfig"]["includeThoughts"] is True
+    assert captured["payload"]["generationConfig"]["temperature"] == 1.0
     timeout = captured["timeout"]
     assert float(timeout.read) >= 90.0
     assert float(timeout.connect) <= 15.0
