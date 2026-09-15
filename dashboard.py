@@ -390,6 +390,11 @@ def load_dividend_schedule() -> pd.DataFrame:
 @st.cache_data(ttl=5)
 def load_news_reasoning_data() -> list:
     records: list = []
+    seen: set = set()
+
+    def _record_key(rec: dict) -> tuple:
+        return (str(rec.get("symbol", "")), str(rec.get("timestamp", "")))
+
     # 1. Query Redis for latest and historical debate reasoning
     try:
         r = get_redis_client()
@@ -400,15 +405,23 @@ def load_news_reasoning_data() -> list:
                     parsed = json.loads(latest_raw)
                     if isinstance(parsed, dict):
                         records.append(parsed)
+                        seen.add(_record_key(parsed))
                 except Exception:
                     pass
-            history_raw = r.lrange("market:news_reasoning:history", 0, 9)
+            # Each debate window persists one record per ticker, so read deep
+            # enough to surface the entire latest batch rather than a slice.
+            history_raw = r.lrange("market:news_reasoning:history", 0, 49)
             if history_raw:
                 for item in history_raw:
                     try:
                         p = json.loads(item)
-                        if isinstance(p, dict) and p not in records:
-                            records.append(p)
+                        if not isinstance(p, dict):
+                            continue
+                        k = _record_key(p)
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                        records.append(p)
                     except Exception:
                         continue
     except Exception:

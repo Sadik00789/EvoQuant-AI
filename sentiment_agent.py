@@ -9,7 +9,7 @@ import httpx
 import feedparser
 import numpy as np
 import redis
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -511,33 +511,92 @@ Be skeptical and risk-focused, grounded in the provided price action."""
     # ------------------------------------------------------------------
     def _parse_arbiter_json(self, raw_content: str, tickers: list) -> Dict[str, float]:
         """
-        Strict JSON extraction for arbiter output.
+        Robust extraction of the arbiter's per-ticker consensus JSON.
+
+        Handles the Gemma failure modes observed in production:
+          * chain-of-thought wrapped in <thought>...</thought> or ```json fences;
+          * prose that echoes the prompt before/after the JSON payload;
+          * a partial object whose outer braces are missing while the
+            ``"TICKER": value`` pairs survive.
         Falls back safely to 0.0 neutral per ticker without raising.
         """
+        wanted = {str(tk).upper() for tk in tickers}
         try:
             if not raw_content:
                 raise ValueError("Empty arbiter response")
-            cleaned = re.sub(r"<thought>[\s\S]*?</thought>", "", raw_content).strip()
+            raw_str = str(raw_content)
+            cleaned = re.sub(r"<thought>[\s\S]*?</thought>", "", raw_str).strip()
             cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", cleaned).strip()
-            m = re.search(r"\{.*\}", cleaned, re.DOTALL)
-            if not m:
-                m = re.search(r"\{.*\}", raw_content, re.DOTALL)
-            if not m:
-                raise ValueError(f"No JSON object found in: '{raw_content[:120]}...'")
-            parsed = json.loads(m.group(0).strip())
+
+            parsed: Optional[dict] = None
+            m = re.search(r"\{.*\}", cleaned, re.DOTALL) or re.search(r"\{.*\}", raw_str, re.DOTALL)
+            if m:
+                try:
+                    candidate = json.loads(m.group(0).strip())
+                    if isinstance(candidate, dict):
+                        parsed = candidate
+                except Exception:
+                    parsed = None
+
+            # Salvage: recover "TICKER": value pairs even when the JSON braces are
+            # missing/malformed. Only symbols in the requested batch are accepted so
+            # unrelated prose numbers can never leak into the score map.
+            if not parsed:
+                salvaged: Dict[str, float] = {}
+                for sym, val in re.findall(
+                    r"([A-Za-z]{1,6})[\"']?\s*[:=]\s*(-?\d+(?:\.\d+)?)",
+                    cleaned or raw_str,
+                ):
+                    sym_u = sym.upper()
+                    if sym_u in wanted:
+                        try:
+                            salvaged[sym_u] = float(val)
+                        except Exception:
+                            continue
+                if salvaged:
+                    parsed = salvaged
+
+            if not parsed:
+                raise ValueError(f"No JSON object found in: '{raw_str[:120]}...'")
+
             out: Dict[str, float] = {}
             for tk in tickers:
+                key = str(tk).upper()
                 try:
-                    raw_v = parsed.get(tk, parsed.get(str(tk).upper(), 0.0))
+                    raw_v = parsed.get(key, parsed.get(str(tk), 0.0))
                     v = float(raw_v) if raw_v is not None else 0.0
-                    v = float(np.clip(v, -1.0, 1.0))
-                    out[str(tk).upper()] = round(v, 4)
+                    out[key] = round(float(np.clip(v, -1.0, 1.0)), 4)
                 except Exception:
-                    out[str(tk).upper()] = 0.0
+                    out[key] = 0.0
             return out
         except Exception as e:
             logger.warning(f"⚠️ Arbiter JSON parse failed ({e}); falling back to 0.0 neutral.")
             return {str(tk).upper(): 0.0 for tk in tickers}
+
+    @staticmethod
+    def _split_theses_by_ticker(text: str, tickers: list) -> Dict[str, str]:
+        """
+        Parse a bulleted ``- TICKER: thesis`` block into a per-ticker mapping.
+
+        Tolerant of the formatting drift LLMs produce (``*``/``•`` bullets, ``:``
+        or ``-`` separators, leading numbering). Lines whose ticker is not in the
+        requested batch are ignored so unrelated prose is never captured.
+        """
+        out: Dict[str, str] = {}
+        wanted = {str(tk).upper() for tk in tickers}
+        if not text:
+            return out
+        for line in str(text).splitlines():
+            m = re.match(
+                r"^\s*(?:[-*•]|\d+[.)]\s*)?\s*([A-Za-z]{1,6})\s*[:\-–—]\s*(.+)$",
+                line,
+            )
+            if not m:
+                continue
+            sym = m.group(1).upper()
+            if sym in wanted and sym not in out:
+                out[sym] = m.group(2).strip()
+        return out
 
     def _sanitize_scores(self, scores: Dict[str, Any], tickers: list) -> Dict[str, float]:
         out: Dict[str, float] = {}
@@ -573,14 +632,15 @@ BEAR THESES:
 TASK:
 Emit final consensus sentiment score per ticker between -1.0 (Strong Bearish) and +1.0 (Strong Bullish).
 Consider RSI14 extremes, 15m momentum sign, and which thesis better fits price action.
-STRICT OUTPUT: exclusively valid JSON, no preamble, no markdown, no explanation. Example:
+STRICT OUTPUT: respond with ONLY the JSON object — no preamble, no restating of
+these instructions, no markdown fences, no explanation. Example:
 {{
   "NVDA": 0.45,
   "AAPL": -0.20
 }}
 Cover exactly these tickers: {", ".join(tickers)}"""
         try:
-            raw = await self._call_gemini_text(prompt, temperature=0.1, max_tokens=2048)
+            raw = await self._call_gemini_text(prompt, temperature=0.1, max_tokens=4096)
             scores = self._parse_arbiter_json(raw, tickers)
             logger.info("✅ Arbiter consensus scored.")
             return scores
@@ -637,30 +697,54 @@ Cover exactly these tickers: {", ".join(tickers)}"""
 
         if persist:
             try:
-                top_sym = "SPY" if "SPY" in final else (tickers[0] if tickers else "SPY")
-                top_sc = float(final.get(top_sym, 0.0))
-                batch_payload = {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "symbol": top_sym,
-                    "score": top_sc,
-                    "bull_thesis": str(bull_theses)[:500],
-                    "bear_thesis": str(bear_theses)[:500],
-                    "arbiter_reasoning": f"Consensus score {top_sc:+.2f} scored across 20-stock adversarial debate.",
-                    "confidence": 0.85,
-                }
-                # Save latest & history to Redis
-                r = self.get_redis()
-                if r is not None:
-                    raw_json = json.dumps(batch_payload)
-                    r.set("market:news_reasoning:latest", raw_json, ex=7200)
-                    r.lpush("market:news_reasoning:history", raw_json)
-                    try:
-                        r.ltrim("market:news_reasoning:history", 0, 999)
-                    except Exception:
-                        pass
-                # Save batch to TimescaleDB
-                import db_manager
-                db_manager.record_news_sentiment([batch_payload])
+                ts_iso = datetime.now(timezone.utc).isoformat()
+                bull_map = self._split_theses_by_ticker(bull_theses, tickers)
+                bear_map = self._split_theses_by_ticker(bear_theses, tickers)
+
+                records: List[Dict[str, Any]] = []
+                for tk in tickers:
+                    key = str(tk).upper()
+                    sc = float(final.get(key, 0.0))
+                    records.append({
+                        "timestamp": ts_iso,
+                        "symbol": key,
+                        "score": sc,
+                        "bull_thesis": bull_map.get(
+                            key, f"Bull case for {key} from 15m momentum and RSI structure."
+                        ),
+                        "bear_thesis": bear_map.get(
+                            key, f"Bear case for {key} from distribution and overbought risk."
+                        ),
+                        "arbiter_reasoning": (
+                            f"Arbiter consensus {sc:+.2f} for {key} after weighing the bull and "
+                            f"bear theses against 15m price action."
+                        ),
+                        "confidence": 0.85,
+                    })
+
+                if records:
+                    # `latest` mirrors the SPY (or top-conviction) record so the
+                    # dashboard headline stays meaningful and dedupes cleanly against
+                    # the per-ticker history entries.
+                    latest_record = next(
+                        (rec for rec in records if rec["symbol"] == "SPY"), None
+                    ) or max(records, key=lambda rec: abs(float(rec.get("score", 0.0))))
+
+                    r = self.get_redis()
+                    if r is not None:
+                        r.set("market:news_reasoning:latest", json.dumps(latest_record), ex=7200)
+                        # LPUSH prepends, so push in reverse to leave the batch in
+                        # natural ticker order at the head of the history list.
+                        for rec in reversed(records):
+                            r.lpush("market:news_reasoning:history", json.dumps(rec))
+                        try:
+                            r.ltrim("market:news_reasoning:history", 0, 999)
+                        except Exception:
+                            pass
+
+                    # Persist the full per-ticker debate to TimescaleDB.
+                    import db_manager
+                    db_manager.record_news_sentiment(records)
             except Exception as persist_err:
                 logger.warning(f"⚠️ Non-blocking debate batch persistence note: {persist_err}")
 

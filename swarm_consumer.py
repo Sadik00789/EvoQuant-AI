@@ -649,7 +649,12 @@ async def run_consumer():
                 if settings.headlines_enabled:
                     async with httpx.AsyncClient() as nclient:
                         top_20_snapshot = await news_fetcher.enrich(top_20_snapshot, client=nclient)
-                debate_scores = await sentiment_agent.run_adversarial_batch(top_20_snapshot)
+                # persist=True mirrors the debate into Redis
+                # (market:news_reasoning:latest / :history) and TimescaleDB
+                # (news_sentiment_log) so the dashboard can render the reasoning.
+                debate_scores = await sentiment_agent.run_adversarial_batch(
+                    top_20_snapshot, persist=True
+                )
                 logger.info(f"🧠 [Debate] cached {len(debate_scores)} news-aware scores.")
             except Exception as e:
                 metrics.increment("debate.failures")
