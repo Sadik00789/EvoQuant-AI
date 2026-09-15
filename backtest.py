@@ -26,19 +26,27 @@ import yfinance as yf
 
 from portfolio_risk import canonical_allocate
 
+# Mirrors data_producer.UNIVERSE (must stay 1:1) plus the SPY benchmark.
 UNIVERSE = [
     "NVDA", "AMD", "AAPL", "MSFT", "TSLA", "META", "GOOGL", "AMZN", "NFLX", "INTC",
     "CRM", "ORCL", "ADBE", "AVGO", "TXN", "QCOM", "CSCO", "ACN", "IBM", "AMAT",
     "MU", "LRCX", "NOW", "PANW", "SNPS", "CDNS", "KLAC", "MCHP", "ADI", "ROP",
+    "ASML", "ARM", "MRVL", "NXPI", "ON", "WDAY", "SNOW", "DDOG", "CRWD", "ZS",
     "JPM", "V", "MA", "BAC", "WFC", "C", "GS", "MS", "AXP", "PYPL",
-    "BLK", "SCHW", "CB", "MMC", "PGR",
+    "BLK", "SCHW", "CB", "MMC", "PGR", "USB", "PNC", "TFC", "COF", "BNY",
+    "MET", "AIG", "ALL",
     "UNH", "JNJ", "PFE", "ABBV", "MRK", "TMO", "ABT", "AMGN", "LLY", "DHR",
-    "BMY", "GILD", "CVS", "CI", "ISRG",
+    "BMY", "GILD", "CVS", "CI", "ISRG", "MDT", "SYK", "BSX", "ZBH", "HUM",
+    "ELV", "HCA", "MCK",
     "PG", "HD", "DIS", "COST", "PEP", "KO", "WMT", "NKE", "MCD", "SBUX",
-    "LOW", "TJX", "TGT", "EL", "BKNG",
+    "LOW", "TJX", "TGT", "EL", "BKNG", "YUM", "CMG", "MAR", "ABNB", "ORLY",
+    "ROST", "KHC", "STZ",
     "HON", "UNP", "GE", "CAT", "BA", "DE", "LMT", "RTX", "ADP", "MMM",
+    "UPS", "FDX", "NOC", "GD", "EMR", "ETN", "ITW", "CSX",
     "XOM", "CVX", "COP", "SLB", "EOG", "NEE", "DUK", "SO", "T", "VZ",
-    "TMUS", "PLD", "AMT", "SPGI", "MDLZ", "SPY",
+    "TMUS", "PLD", "AMT", "SPGI", "MDLZ", "PSX", "VLO", "OKE", "KMI",
+    "LIN", "APD", "SHW", "FCX",
+    "SPY",
 ]
 
 

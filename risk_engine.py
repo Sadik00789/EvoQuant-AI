@@ -598,7 +598,18 @@ class AdvancedRiskEngine:
             return False
 
     def calculate_total_equity(self, cash: float, holdings: Dict[str, float], entry_prices: Dict[str, float], prices: Dict[str, float]) -> float:
-        """Mark-to-market symmetric equity: cash + longs(shares*price) + shorts(entry_val - current_val)."""
+        """Mark-to-market equity: cash + long_market_value - short_liability.
+
+        This is the SAME basis as ``AgentGenome.calculate_equity`` and
+        ``evaluate_margin_health``. Cash already includes short-sale proceeds, so
+        only the *current* short liability is subtracted. The previous formula added
+        ``|q| * entry`` back on top of that cash, double-counting every short and
+        inflating equity -- which poisoned the session-peak baseline and tripped the
+        circuit breaker on a phantom drawdown, liquidating the whole book to cash.
+
+        A missing / non-positive quote falls back to the entry price so a stale or
+        zero feed can never fabricate phantom equity.
+        """
         try:
             total = float(cash)
         except Exception:
@@ -608,14 +619,15 @@ class AdvancedRiskEngine:
                 q = float(qty)
                 if q == 0:
                     continue
-                px = float(prices.get(tk, (entry_prices or {}).get(tk, 0.0)) or 0.0)
+                entry = float((entry_prices or {}).get(tk, 0.0) or 0.0)
+                raw_px = float(prices.get(tk, 0.0) or 0.0)
+                px = raw_px if raw_px > 0 else entry
+                if px <= 0:
+                    continue
                 if q > 0:
                     total += q * px
                 else:
-                    entry = float((entry_prices or {}).get(tk, px) or px)
-                    total += abs(q) * entry - abs(q) * px
-                    # Note: cash already includes short proceeds; this yields cash + longs - short_liability + short_pnl symmetry
-                    # Equivalent to cash + long_val - short_liability when entry==proceeds basis, plus drift PnL
+                    total -= abs(q) * px
             except Exception:
                 continue
         return round(total, 2)

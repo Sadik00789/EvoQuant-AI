@@ -41,26 +41,33 @@ REDIS_HOST = settings.redis_host
 REDIS_PORT = settings.redis_port
 broker = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, password=(settings.redis_password or None))
 
-# Full 100-stock liquid US Mega/Large-Cap universe.
+# Full 150-stock liquid US Mega/Large-Cap universe.
 UNIVERSE = [
-    # Tech & Semiconductors (30)
+    # Tech & Semiconductors (40)
     "NVDA", "AMD", "AAPL", "MSFT", "TSLA", "META", "GOOGL", "AMZN", "NFLX", "INTC",
     "CRM", "ORCL", "ADBE", "AVGO", "TXN", "QCOM", "CSCO", "ACN", "IBM", "AMAT",
     "MU", "LRCX", "NOW", "PANW", "SNPS", "CDNS", "KLAC", "MCHP", "ADI", "ROP",
-    # Financials & Payments (15)
+    "ASML", "ARM", "MRVL", "NXPI", "ON", "WDAY", "SNOW", "DDOG", "CRWD", "ZS",
+    # Financials & Payments (23)
     "JPM", "V", "MA", "BAC", "WFC", "C", "GS", "MS", "AXP", "PYPL",
-    "BLK", "SCHW", "CB", "MMC", "PGR",
-    # Healthcare & Pharma (15)
+    "BLK", "SCHW", "CB", "MMC", "PGR", "USB", "PNC", "TFC", "COF", "BNY",
+    "MET", "AIG", "ALL",
+    # Healthcare & Pharma (23)
     "UNH", "JNJ", "PFE", "ABBV", "MRK", "TMO", "ABT", "AMGN", "LLY", "DHR",
-    "BMY", "GILD", "CVS", "CI", "ISRG",
-    # Consumer & Retail (15)
+    "BMY", "GILD", "CVS", "CI", "ISRG", "MDT", "SYK", "BSX", "ZBH", "HUM",
+    "ELV", "HCA", "MCK",
+    # Consumer & Retail (23)
     "PG", "HD", "DIS", "COST", "PEP", "KO", "WMT", "NKE", "MCD", "SBUX",
-    "LOW", "TJX", "TGT", "EL", "BKNG",
-    # Industrials & Aerospace (10)
+    "LOW", "TJX", "TGT", "EL", "BKNG", "YUM", "CMG", "MAR", "ABNB", "ORLY",
+    "ROST", "KHC", "STZ",
+    # Industrials & Aerospace (18)
     "HON", "UNP", "GE", "CAT", "BA", "DE", "LMT", "RTX", "ADP", "MMM",
-    # Energy, Utilities, Real Estate & Telecom (15)
+    "UPS", "FDX", "NOC", "GD", "EMR", "ETN", "ITW", "CSX",
+    # Energy, Utilities, Real Estate & Telecom (19)
     "XOM", "CVX", "COP", "SLB", "EOG", "NEE", "DUK", "SO", "T", "VZ",
-    "TMUS", "PLD", "AMT", "SPGI", "MDLZ",
+    "TMUS", "PLD", "AMT", "SPGI", "MDLZ", "PSX", "VLO", "OKE", "KMI",
+    # Materials (4)
+    "LIN", "APD", "SHW", "FCX",
 ]
 
 # Symbols emitted for potential trading (benchmarks excluded from trade targets).

@@ -786,10 +786,10 @@ def test_session_circuit_breaker():
     assert engine.should_allow_entry("Agent_Alpha", "NVDA", 99) is False
 
 # ------------------------------------------
-# 8. TOP-20 DYNAMIC SCREENER 100 TO 20
+# 8. TOP-20 DYNAMIC SCREENER (150 UNIVERSE -> 20)
 # ------------------------------------------
 
-def _make_100_snapshot():
+def _make_universe_snapshot():
     from data_producer import UNIVERSE
     snap = {}
     for i, tk in enumerate(UNIVERSE):
@@ -814,11 +814,11 @@ def _make_100_snapshot():
 
 
 def test_top_20_screener_selection():
-    """Feeds 100 mock snapshots and asserts exactly 20 highest-activity tickers filtered."""
+    """Feeds the full universe of mock snapshots and asserts exactly 20 highest-activity tickers filtered."""
     from sentiment_agent import select_top_20_candidates
     from data_producer import UNIVERSE
-    assert len(UNIVERSE) == 100, f"UNIVERSE must be 100, got {len(UNIVERSE)}"
-    snap = _make_100_snapshot()
+    assert len(UNIVERSE) == 150, f"UNIVERSE must be 150, got {len(UNIVERSE)}"
+    snap = _make_universe_snapshot()
     top20 = select_top_20_candidates(snap, top_n=20)
     assert len(top20) == 20, f"Expected 20, got {len(top20)}"
     # Highest activity = highest index (largest momentum x volume)
@@ -831,12 +831,13 @@ def test_top_20_screener_selection():
 
 
 def test_batched_debate_receives_only_20():
-    """Confirms LLM payload only contains 20 items even when producer provides 100."""
+    """Confirms LLM payload only contains 20 items even when the producer provides the full universe."""
     from sentiment_agent import NewsSentimentAgent, select_top_20_candidates
+    from data_producer import UNIVERSE
     async def _test():
         agent = NewsSentimentAgent(api_key="test_dummy_key")
-        snap100 = _make_100_snapshot()
-        assert len(snap100) == 100
+        snap100 = _make_universe_snapshot()
+        assert len(snap100) == len(UNIVERSE)
         top20 = select_top_20_candidates(snap100, top_n=20)
         assert len(top20) == 20
         seen_payload_size = {}
@@ -868,7 +869,7 @@ def test_unscreened_ticker_sentiment_fallback():
     from sentiment_agent import NewsSentimentAgent, select_top_20_candidates
     async def _test():
         agent = NewsSentimentAgent(api_key="test_dummy_key")
-        snap100 = _make_100_snapshot()
+        snap100 = _make_universe_snapshot()
         top20 = select_top_20_candidates(snap100, top_n=20)
         unscreened = [k for k in snap100.keys() if k not in top20][0]
         # Before debate, unscreened returns 0.0
@@ -889,7 +890,7 @@ def test_unscreened_ticker_sentiment_fallback():
         assert agent.cache.get_sentiment(unscreened) == 0.0
         screened_one = list(top20.keys())[0]
         assert agent.cache.get_sentiment(screened_one) == 0.5
-        # compute signals over 100: screened fused, unscreened pure technical no crash
+        # compute signals over the full universe: screened fused, unscreened pure technical no crash
         from swarm_consumer import compute_deterministic_signals
         from evolution_engine import EvolutionarySwarmManager
         mgr = EvolutionarySwarmManager(api_key="", population_size=2)
@@ -911,7 +912,7 @@ def test_unscreened_ticker_sentiment_fallback():
 def test_screener_retains_open_positions():
     """Tickers with active holdings are preserved in 20-stock batch even if activity is zero."""
     from sentiment_agent import select_top_20_candidates
-    snap = _make_100_snapshot()
+    snap = _make_universe_snapshot()
     # Force two held tickers to zero activity (flat momentum, zero volume)
     held = set(list(snap.keys())[:2])
     for tk in held:
@@ -1028,17 +1029,21 @@ def test_circuit_breaker_daily_reset():
 
 
 def test_short_position_equity_symmetry():
-    """5pct gain on short yields identical equity expansion as 5pct gain on long."""
+    """Long and short MTM equity share one basis (cash + longs - short_liability);
+    an equal-sized favorable move yields the same dollar profit for each."""
     eng = AdvancedRiskEngine()
-    # Long: 100 sh @100 -> 105 (+5pct)
-    long_eq = eng.calculate_total_equity(100000.0, {"AAPL": 100.0}, {"AAPL": 100.0}, {"AAPL": 105.0})
-    # Short: proceeds 100*100=10000 added to cash -> cash 110000, entry 100, current 95 (-5pct price = +5pct short)
-    short_eq = eng.calculate_total_equity(110000.0, {"AAPL": -100.0}, {"AAPL": 100.0}, {"AAPL": 95.0})
-    # Long equity: 100000 + 10500 = 110500
-    assert long_eq == 110500.0
-    # Short equity: 110000 + (10000-9500)=110500 symmetric
-    assert short_eq == 110500.0
-    assert long_eq == short_eq
+    # Long: 100 sh @ $100 held on a flat $10,000 cost basis, price -> $105
+    long_eq = eng.calculate_total_equity(0.0, {"AAPL": 100.0}, {"AAPL": 100.0}, {"AAPL": 105.0})
+    assert long_eq == 10500.0                          # 0 + 100 * 105
+    # Short: 100 sh @ $100 -> cash 200000 (100k capital + 100k proceeds), price -> $95
+    short_eq = eng.calculate_total_equity(200000.0, {"AAPL": -100.0}, {"AAPL": 100.0}, {"AAPL": 95.0})
+    assert short_eq == 190500.0                        # 200000 - 100 * 95
+    # Both earn exactly +$500 on the same 100-share +/-5% move (short proceeds already in cash)
+    assert (long_eq - 100 * 100.0) == 500.0
+    assert (short_eq - (200000.0 - 100 * 100.0)) == 500.0
+    # A missing / zero quote must not fabricate phantom equity from short proceeds
+    assert eng.calculate_total_equity(110000.0, {"AAPL": -100.0}, {"AAPL": 100.0}, {"AAPL": 0.0}) == 100000.0
+    assert eng.calculate_total_equity(110000.0, {"AAPL": -100.0}, {"AAPL": 100.0}, {}) == 100000.0
     # Margin requirement 1.5x
     assert eng.short_margin_requirement(100.0, 100.0, 1.50) == 15000.0
     assert eng.can_open_short(15000.0, 100.0, 100.0) is True

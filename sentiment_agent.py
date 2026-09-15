@@ -43,7 +43,7 @@ def _activity_score(entry: dict) -> float:
 
 
 def select_top_20_candidates(snapshots: dict, active_holdings=None, top_n: int = 20) -> dict:
-    """Orphan-free deterministic pre-LLM screener: rank 100 tickers by activity, retain open positions.
+    """Orphan-free deterministic pre-LLM screener: rank the full universe by activity, retain open positions.
 
     Guarantees zero held positions ever lose LLM coverage while keeping batch strictly at 20.
     Backward compatible: second positional arg may be legacy top_n int.
