@@ -525,6 +525,11 @@ Be skeptical and risk-focused, grounded in the provided price action."""
             if not raw_content:
                 raise ValueError("Empty arbiter response")
             raw_str = str(raw_content)
+            # Gemma frequently prefixes non-negative numbers with '+' (e.g. "+0.45").
+            # That is INVALID JSON, so json.loads rejects the entire object and the
+            # salvage regex below would silently drop every positive score to 0.0.
+            # Strip the leading '+' after any value delimiter before parsing.
+            raw_str = re.sub(r"([:,\[{]\s*)\+", r"\1", raw_str)
             cleaned = re.sub(r"<thought>[\s\S]*?</thought>", "", raw_str).strip()
             cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)\s*```", r"\1", cleaned).strip()
 
@@ -544,7 +549,7 @@ Be skeptical and risk-focused, grounded in the provided price action."""
             if not parsed:
                 salvaged: Dict[str, float] = {}
                 for sym, val in re.findall(
-                    r"([A-Za-z]{1,6})[\"']?\s*[:=]\s*(-?\d+(?:\.\d+)?)",
+                    r"([A-Za-z]{1,6})[\"']?\s*[:=]\s*([+-]?\d+(?:\.\d+)?)",
                     cleaned or raw_str,
                 ):
                     sym_u = sym.upper()

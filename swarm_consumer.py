@@ -60,6 +60,9 @@ COOLDOWN_BARS = settings.cooldown_bars
 SESSION_DRAWDOWN_PCT = settings.session_drawdown_pct
 SHADOW_MODE = settings.shadow_mode
 MIN_TRADE_NOTIONAL = 50.0
+# Refresh the macro news-RAG snapshot every N windows (~1 hour at 15m bars),
+# mirroring the pre-batched-debate cadence.
+MACRO_RAG_REFRESH_TICKS = 4
 
 risk_engine = AdvancedRiskEngine(
     target_volatility=settings.target_volatility,
@@ -560,6 +563,29 @@ def _seed_spy_history() -> List[float]:
 
 
 # ==========================================================================
+# Macro news RAG
+# ==========================================================================
+async def refresh_macro_rag(db) -> Dict[str, Any]:
+    """Fetch the macro news-RAG snapshot and persist it for the dashboard.
+
+    Writes a row into ``macro_regime`` (sentiment_score, risk_multiplier,
+    summary_reasoning) which feeds the dashboard's "Latest News RAG Reasoning"
+    banner and the Macro Risk Scale KPI. This feed was orphaned when the batched
+    debate landed, leaving both dashboard elements empty.
+    """
+    macro = await sentiment_agent.analyze_macro_sentiment_async()
+    macro_mult = float(macro.get("risk_multiplier", 1.0) or 1.0)
+    macro_reasoning = str(macro.get("summary_reasoning", "") or "")
+    db.log_macro_regime(
+        sentiment_score=float(macro.get("sentiment_score", 0.0) or 0.0),
+        risk_multiplier=macro_mult,
+        reasoning=macro_reasoning,
+    )
+    logger.info(f"📰 News RAG Multiplier: {macro_mult:.2f}x | {macro_reasoning}")
+    return macro
+
+
+# ==========================================================================
 # Main consumer
 # ==========================================================================
 async def run_consumer():
@@ -617,6 +643,17 @@ async def run_consumer():
             db.log_snapshot(agent.agent_id, eq, agent.cash, pnl)
 
         logger.info(f"\n==================== 🔔 WINDOW #{tick_counter} ({window}) ====================")
+
+        # --- Macro news RAG: market-situation text + macro risk multiplier ---
+        # Written on the first window and refreshed every MACRO_RAG_REFRESH_TICKS
+        # (~hourly) so the dashboard banner and Macro Risk Scale stay populated.
+        if settings.sentiment_enabled and (
+            tick_counter == 1 or tick_counter % MACRO_RAG_REFRESH_TICKS == 0
+        ):
+            try:
+                await refresh_macro_rag(db)
+            except Exception as e:
+                logger.warning(f"⚠️ Macro news RAG refresh failed on window #{tick_counter}: {e}")
 
         # --- Daily dividend processing ---
         today_str = window[:10]

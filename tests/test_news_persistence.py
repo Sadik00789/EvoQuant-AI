@@ -296,3 +296,57 @@ def test_dashboard_fallback_card_when_no_debates(monkeypatch):
     dashboard.render_news_debate_section()
 
     st_mock.info.assert_called_with("🕒 Awaiting next 15-minute LLM market debate cycle...")
+
+
+def test_arbiter_json_parses_leading_plus(monkeypatch):
+    """Regression: Gemma prefixes non-negative numbers with '+' (e.g. '+0.45'),
+    which is invalid JSON. json.loads rejected the whole object and the salvage
+    regex dropped every positive score to 0.0. All positives must now survive."""
+    agent = NewsSentimentAgent(api_key="test_key")
+    tickers = ["NVDA", "AAPL", "META", "SPY"]
+
+    json_with_plus = '{"NVDA": +0.45, "AAPL": -0.20, "META": +0.30, "SPY": +0.00}'
+    assert agent._parse_arbiter_json(json_with_plus, tickers) == {
+        "NVDA": 0.45, "AAPL": -0.2, "META": 0.3, "SPY": 0.0,
+    }
+
+    # Prose (no braces) with leading '+' must survive the salvage path too.
+    prose_with_plus = "NVDA: +0.45\nAAPL: -0.20\nMETA: +0.30\nSPY: +0.0"
+    assert agent._parse_arbiter_json(prose_with_plus, tickers) == {
+        "NVDA": 0.45, "AAPL": -0.2, "META": 0.3, "SPY": 0.0,
+    }
+
+    # Genuinely non-JSON responses still fall back to neutral 0.0.
+    assert agent._parse_arbiter_json("not json at all", tickers) == {t: 0.0 for t in tickers}
+
+
+def test_refresh_macro_rag_persists_to_db(monkeypatch):
+    """Regression: macro RAG must be written to macro_regime so the dashboard's
+    'Latest News RAG Reasoning' banner and Macro Risk Scale populate (the feed
+    was orphaned when the batched debate landed)."""
+    import swarm_consumer
+
+    captured = {}
+
+    async def fake_macro():
+        return {
+            "sentiment_score": 0.42,
+            "risk_multiplier": 1.13,
+            "summary_reasoning": "Dovish FOMC commentary and strong semiconductor earnings.",
+        }
+
+    class FakeDB:
+        def log_macro_regime(self, sentiment_score, risk_multiplier, reasoning):
+            captured["args"] = (sentiment_score, risk_multiplier, reasoning)
+
+    monkeypatch.setattr(
+        swarm_consumer.sentiment_agent, "analyze_macro_sentiment_async", fake_macro
+    )
+
+    asyncio.run(swarm_consumer.refresh_macro_rag(FakeDB()))
+
+    assert captured["args"] == (
+        0.42,
+        1.13,
+        "Dovish FOMC commentary and strong semiconductor earnings.",
+    )
